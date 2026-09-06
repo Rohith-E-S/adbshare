@@ -219,10 +219,10 @@ fn open_usb_pump(
                 loop {
                     match rx_from_app.try_recv() {
                         Ok(chunk) => {
-                            if handle_for_thread
-                                .write_bulk(out_ep, &chunk, write_timeout)
-                                .is_err()
+                            if let Err(e) =
+                                handle_for_thread.write_bulk(out_ep, &chunk, write_timeout)
                             {
+                                tracing::error!(error = ?e, "adb-usb-pump: write_bulk failed");
                                 break 'pump;
                             }
                         }
@@ -233,7 +233,13 @@ fn open_usb_pump(
 
                 // Read from device -> channel.
                 match handle_for_thread.read_bulk(in_ep, &mut buf, read_timeout) {
-                    Ok(0) => continue,
+                    Ok(0) => {
+                        // Zero-length transfer: log it and back off briefly so we
+                        // don't spin the pump thread in a tight loop.
+                        tracing::warn!("adb-usb-pump: zero-length bulk read");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
                     Ok(n) => {
                         let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
                         if tx_to_app.blocking_send(chunk).is_err() {
@@ -241,8 +247,10 @@ fn open_usb_pump(
                         }
                     }
                     Err(rusb::Error::Timeout) => {}
-                    Err(rusb::Error::Io) | Err(rusb::Error::Overflow) | Err(rusb::Error::Other) => break,
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "adb-usb-pump: read_bulk failed");
+                        break;
+                    }
                 }
             }
             drop(context_for_thread);
