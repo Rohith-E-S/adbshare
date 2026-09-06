@@ -535,8 +535,8 @@ impl AdbshareApp {
                             // re-highlighting a different row. Re-plugging the
                             // same device works via a normal sidebar click (or
                             // the auto-select below once nothing is selected).
-                            if let Some(sel) = selected {
-                                if !devices.iter().any(|d| d.serial == sel) {
+                            if let Some(ref sel) = selected {
+                                if !devices.iter().any(|d| &d.serial == sel) {
                                     *handles_dev_drain.selected_device.lock() = None;
                                     if !handles_dev_drain.browser.is_local_mode() {
                                         handles_dev_drain.browser.set_device(None);
@@ -921,21 +921,9 @@ fn handle_browser_event(
     rt: tokio::runtime::Handle,
     window: adw::ApplicationWindow,
 ) {
-    // Refresh the listing of `dir` on `device` after an operation.
-    fn refresh(
-        dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
-        rt: &tokio::runtime::Handle,
-        device: String,
-        dir: PathBuf,
-    ) {
-        let dir_tx = dir_tx.clone();
-        rt.spawn(async move {
-            let res = list_dir(&device, &dir.to_string_lossy()).await.map_err(|e| e.to_string());
-            let _ = dir_tx.send((device, dir, res)).await;
-        });
-    }
-
     // Refresh the local filesystem listing after an operation.
+    // (File operations chain their own refresh at the end of the task so
+    // the listing only updates once the change actually landed.)
     fn refresh_local(
         dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
         rt: &tokio::runtime::Handle,
@@ -1313,68 +1301,86 @@ fn handle_browser_event(
         BrowserEvent::NewFolder(name) => {
             let curr = handles.browser.current_path();
             if handles.browser.is_local_mode() {
-                let mut target = curr.clone();
+                let dir = curr.clone();
+                let mut target = curr;
                 target.push(&name);
                 let op_tx = op_tx.clone();
+                let dir_tx = dir_tx.clone();
+                // Refresh AFTER the mkdir completes (success or failure);
+                // refreshing in parallel races and usually wins, showing
+                // stale contents.
                 rt.spawn_blocking(move || {
                     if let Err(e) = std::fs::create_dir_all(&target) {
                         let _ = op_tx.try_send((None, Err(format!("mkdir: {e}"))));
                     }
+                    let res = list_local_dir(&dir);
+                    let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), dir, res));
                 });
-                refresh_local(dir_tx, &rt, curr);
                 return;
             }
             let Some(device) = handles.selected_device.lock().clone() else { return };
-            let mut target = handles.browser.current_path();
+            let dir = handles.browser.current_path();
+            let mut target = dir.clone();
             target.push(&name);
             let target_str = target.to_string_lossy().to_string();
+            let dir_str = dir.to_string_lossy().to_string();
             let op_tx = op_tx.clone();
             let device_for_op = device.clone();
+            let dir_tx = dir_tx.clone();
             rt.spawn(async move {
                 if let Err(e) = mkdir(&device_for_op, &target_str).await {
                     let _ = op_tx.send((None, Err(format!("mkdir {target_str}: {e}")))).await;
                 }
+                let res = list_dir(&device_for_op, &dir_str).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device_for_op, dir, res)).await;
             });
-            refresh(dir_tx, &rt, device, handles.browser.current_path());
         }
         BrowserEvent::Rename(entry, new_name) => {
             let curr = handles.browser.current_path();
             if handles.browser.is_local_mode() {
+                let dir = curr.clone();
                 let mut src = curr.clone(); src.push(&entry.name);
                 let mut dst = curr.clone(); dst.push(&new_name);
                 let op_tx = op_tx.clone();
+                let dir_tx = dir_tx.clone();
+                // Refresh AFTER the rename completes (success or failure).
                 rt.spawn_blocking(move || {
                     if let Err(e) = std::fs::rename(&src, &dst) {
                         let _ = op_tx.try_send((None, Err(format!("rename: {e}"))));
                     }
+                    let res = list_local_dir(&dir);
+                    let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), dir, res));
                 });
-                refresh_local(dir_tx, &rt, curr);
                 return;
             }
             let Some(device) = handles.selected_device.lock().clone() else { return };
-            let curr = handles.browser.current_path();
-            let mut src = curr.clone(); src.push(&entry.name);
-            let mut dst = curr.clone(); dst.push(&new_name);
+            let dir = handles.browser.current_path();
+            let mut src = dir.clone(); src.push(&entry.name);
+            let mut dst = dir.clone(); dst.push(&new_name);
             let src_str = src.to_string_lossy().to_string();
             let dst_str = dst.to_string_lossy().to_string();
             let op_tx = op_tx.clone();
             let device_for_op = device.clone();
+            let dir_tx = dir_tx.clone();
             rt.spawn(async move {
                 if let Err(e) = rename(&device_for_op, &src_str, &dst_str).await {
                     let _ = op_tx.send((None, Err(format!("rename {src_str}: {e}")))).await;
                 }
+                let res = list_dir(&device_for_op, &dir.to_string_lossy()).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device_for_op, dir, res)).await;
             });
-            refresh(dir_tx, &rt, device, curr);
         }
         BrowserEvent::Delete(entries) => {
             if entries.is_empty() { return; }
             let curr = handles.browser.current_path();
             if handles.browser.is_local_mode() {
                 let op_tx = op_tx.clone();
-                let curr_for_task = curr.clone();
+                let dir_tx = dir_tx.clone();
+                let dir = curr.clone();
+                // Refresh AFTER the deletes complete (success or failure).
                 rt.spawn_blocking(move || {
                     for e in entries {
-                        let target = curr_for_task.join(&e.name);
+                        let target = dir.join(&e.name);
                         let r = if e.is_dir {
                             std::fs::remove_dir_all(&target)
                         } else {
@@ -1384,23 +1390,26 @@ fn handle_browser_event(
                             let _ = op_tx.try_send((None, Err(format!("delete {}: {err}", e.name))));
                         }
                     }
+                    let res = list_local_dir(&dir);
+                    let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), dir, res));
                 });
-                refresh_local(dir_tx, &rt, curr);
                 return;
             }
             let Some(device) = handles.selected_device.lock().clone() else { return };
             let op_tx = op_tx.clone();
             let device_for_op = device.clone();
-            let curr_for_task = curr.clone();
+            let dir = curr.clone();
+            let dir_tx = dir_tx.clone();
             rt.spawn(async move {
                 for e in entries {
-                    let target = curr_for_task.join(&e.name).to_string_lossy().to_string();
+                    let target = dir.join(&e.name).to_string_lossy().to_string();
                     if let Err(err) = delete(&device_for_op, &target).await {
                         let _ = op_tx.try_send((None, Err(format!("delete {target}: {err}"))));
                     }
                 }
+                let res = list_dir(&device_for_op, &dir.to_string_lossy()).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device_for_op, dir, res)).await;
             });
-            refresh(dir_tx, &rt, device, curr);
         }
         BrowserEvent::OpenExternal(path) => {
             if handles.browser.is_local_mode() {
