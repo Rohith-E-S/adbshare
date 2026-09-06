@@ -244,17 +244,61 @@ impl UsbWatcher {
     fn new() -> Self { Self { state: PlMutex::new(Vec::new()) } }
 }
 
-const VENDOR_ANDROID: u16 = 0x18d1;
-const VENDOR_GOOGLE: u16 = 0x04e8;
+// Google's USB vendor ID (0x18d1). Samsung (0x04e8) is included because many
+// Galaxy devices expose the ADB interface under Samsung's own VID; a device
+// only counts as an ADB device if it also exposes an ADB interface (see
+// is_adb_device below).
+const VENDOR_GOOGLE: u16 = 0x18d1;
+const VENDOR_SAMSUNG: u16 = 0x04e8;
+
+// ADB interface class/subclass/protocol as used by adbd (vendor-specific
+// class 0xFF, subclass 0x42, protocol 0x01).
+const ADB_CLASS: u8 = 0xff;
+const ADB_SUBCLASS: u8 = 0x42;
+const ADB_PROTOCOL: u8 = 0x01;
+
+/// True if the device exposes an interface with the ADB class/subclass/protocol
+/// triple, rather than merely being made by a known vendor.
+fn is_adb_device(device: &rusb::Device<rusb::Context>) -> bool {
+    let Ok(desc) = device.device_descriptor() else { return false; };
+    if desc.vendor_id() != VENDOR_GOOGLE && desc.vendor_id() != VENDOR_SAMSUNG {
+        return false;
+    }
+    for cfg_idx in 0..desc.num_configurations() {
+        let Ok(cfg) = device.config_descriptor(cfg_idx) else { continue; };
+        for iface in cfg.interfaces() {
+            for iface_desc in iface.descriptors() {
+                if iface_desc.class_code() == ADB_CLASS
+                    && iface_desc.sub_class_code() == ADB_SUBCLASS
+                    && iface_desc.protocol_code() == ADB_PROTOCOL
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 impl WatcherImpl for UsbWatcher {
     fn poll(&self) -> Vec<WatchEvent> {
         use rusb::UsbContext;
         let Ok(context) = rusb::Context::new() else { return Vec::new() };
+        // A panic or error in enumeration used to either poison state or,
+        // worse, be swallowed by unwrap_or_default() upstream, silently
+        // killing the watcher. Log it and keep the previous device list.
+        let devices = match context.devices() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(?e, "usb device enumeration failed; keeping previous device set");
+                return Vec::new();
+            }
+        };
         let mut current = Vec::new();
-        for device in context.devices().unwrap().iter() {
-            let Ok(desc) = device.device_descriptor() else { continue; };
-            if desc.vendor_id() != VENDOR_ANDROID && desc.vendor_id() != VENDOR_GOOGLE { continue; }
+        for device in devices.iter() {
+            if !is_adb_device(&device) {
+                continue;
+            }
             let bus = device.bus_number();
             let addr = device.address();
             current.push(DeviceInfo {
