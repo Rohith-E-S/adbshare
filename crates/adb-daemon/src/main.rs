@@ -86,9 +86,43 @@ fn mountpoint_for(mount_base: &std::path::Path, serial: &str, no_fuse: bool) -> 
     }
 }
 
+/// Parse an `--adb-server` "host:port" spec. Handles bracketed IPv6 hosts
+/// like `[::1]:5037`, which a naive `split(':')` would shred. Falls back to
+/// the adb default port 5037 when no (valid) port is present.
+fn parse_adb_server(spec: &str) -> (String, u16) {
+    if let Some(rest) = spec.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5037);
+            return (host.to_string(), port);
+        }
+    }
+    match spec.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.parse().unwrap_or(5037)),
+        None => (spec.to_string(), 5037),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adb_server_parses_ipv4_and_default() {
+        assert_eq!(parse_adb_server("127.0.0.1:5037"), ("127.0.0.1".into(), 5037));
+        assert_eq!(parse_adb_server("127.0.0.1:5555"), ("127.0.0.1".into(), 5555));
+        assert_eq!(parse_adb_server("localhost"), ("localhost".into(), 5037));
+        assert_eq!(parse_adb_server("localhost:abc"), ("localhost".into(), 5037));
+    }
+
+    #[test]
+    fn adb_server_parses_bracketed_ipv6() {
+        assert_eq!(parse_adb_server("[::1]:5037"), ("::1".into(), 5037));
+        assert_eq!(parse_adb_server("[::1]:5555"), ("::1".into(), 5555));
+        assert_eq!(parse_adb_server("[fe80::1]"), ("fe80::1".into(), 5037));
+    }
 
     #[test]
     fn sanitize_keeps_safe_characters() {
@@ -150,10 +184,8 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(Mutex::new(State::default()));
     let (queue, mut queue_rx) = JobQueue::new(transfer_engine::DEFAULT_PARALLELISM);
-    let watcher = DeviceWatcher::from_adb_server(
-        &cli.adb_server.split(':').next().unwrap_or("127.0.0.1"),
-        cli.adb_server.split(':').nth(1).and_then(|s| s.parse().ok()).unwrap_or(5037),
-    );
+    let (adb_host, adb_port) = parse_adb_server(&cli.adb_server);
+    let watcher = DeviceWatcher::from_adb_server(&adb_host, adb_port);
     let mut events = watcher.subscribe();
     let state_clone = state.clone();
     let mount_base_clone = mount_base.clone();
