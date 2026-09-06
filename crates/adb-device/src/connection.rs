@@ -28,10 +28,13 @@ pub type RemoteId = u32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub LocalId, pub RemoteId);
 
-/// A pending WRTE for a specific local stream id.
-struct PendingWrite {
-    local: LocalId,
-    payload: Bytes,
+/// A request for the connection's writer task.
+enum WriteReq {
+    /// A complete protocol frame (OPEN, CLSE, OKAY, ...) to put on the wire
+    /// as-is.
+    Frame(Message),
+    /// Stream payload to be wrapped in a WRTE frame.
+    Data { local: LocalId, remote: RemoteId, payload: Bytes },
 }
 
 /// Open ADB stream. `AsyncRead + AsyncWrite` to the device-side endpoint.
@@ -39,7 +42,7 @@ pub struct Stream {
     id: StreamId,
     rx: mpsc::Receiver<Bytes>,
     incoming: Arc<PlMutex<Option<Bytes>>>,
-    write_tx: mpsc::Sender<PendingWrite>,
+    write_tx: mpsc::Sender<WriteReq>,
     close_tx: Option<oneshot::Sender<StreamId>>,
 }
 
@@ -88,7 +91,7 @@ impl AsyncWrite for Stream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let chunk = Bytes::copy_from_slice(buf);
         let len = chunk.len();
-        let msg = PendingWrite { local: self.id.0, payload: chunk };
+        let msg = WriteReq::Data { local: self.id.0, remote: self.id.1, payload: chunk };
         match self.write_tx.try_send(msg) {
             Ok(()) => Poll::Ready(Ok(len)),
             Err(mpsc::error::TrySendError::Full(_)) => Poll::Pending,
@@ -120,7 +123,7 @@ pub struct AdbConnection {
     next_local: Mutex<LocalId>,
     streams: Arc<PlMutex<HashMap<LocalId, mpsc::Sender<Bytes>>>>,
     pending_opens: Arc<PlMutex<HashMap<LocalId, oneshot::Sender<Result<StreamId>>>>>,
-    write_tx: mpsc::Sender<PendingWrite>,
+    write_tx: mpsc::Sender<WriteReq>,
     close_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -130,7 +133,7 @@ impl AdbConnection {
         reader: Arc<Mutex<Box<dyn AsyncRead + Send + Unpin>>>,
         writer: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     ) -> Result<Self> {
-        let (write_tx, mut write_rx) = mpsc::channel::<PendingWrite>(2048);
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteReq>(2048);
         let (close_tx, close_rx) = oneshot::channel::<()>();
         let streams: Arc<PlMutex<HashMap<LocalId, mpsc::Sender<Bytes>>>> =
             Arc::new(PlMutex::new(HashMap::new()));
@@ -197,8 +200,15 @@ impl AdbConnection {
                 tokio::select! {
                     _ = &mut close_rx => break,
                     maybe = write_rx.recv() => {
-                        let Some(p) = maybe else { break; };
-                        let frame = Message::new(Command::Write, p.local, 0, p.payload);
+                        let Some(req) = maybe else { break; };
+                        // WRTE frames carry the *device-side* (remote) id in
+                        // arg1 and our local id in arg0.
+                        let frame = match req {
+                            WriteReq::Frame(m) => m,
+                            WriteReq::Data { local, remote, payload } => {
+                                Message::new(Command::Write, local, remote, payload)
+                            }
+                        };
                         if writer.write_all(&frame.encode()).await.is_err() { break; }
                         if writer.flush().await.is_err() { break; }
                     }
@@ -239,7 +249,7 @@ impl AdbConnection {
             Bytes::copy_from_slice(dest.as_bytes()),
         );
         self.write_tx
-            .send(PendingWrite { local, payload: open.encode().freeze() })
+            .send(WriteReq::Frame(open))
             .await
             .map_err(|_| AdbError::Disconnected)?;
 
