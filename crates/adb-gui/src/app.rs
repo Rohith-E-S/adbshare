@@ -56,8 +56,9 @@ struct UiHandles {
     transfers_paused: parking_lot::Mutex<bool>,
 }
 
-/// Sidebar geometry: divider defaults to this and can be dragged narrower
-/// (min 200 via the pane's size request), never wider.
+/// Sidebar geometry: the divider defaults to this and can be dragged down to
+/// the sidebar's 240px minimum (its size request below). GTK exposes no
+/// maximum for the divider, so it can also be dragged wider.
 const SIDEBAR_DEFAULT_WIDTH: i32 = 248;
 
 pub struct AdbshareApp {
