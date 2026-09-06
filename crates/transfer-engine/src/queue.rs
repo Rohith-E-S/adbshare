@@ -101,10 +101,19 @@ impl JobQueue {
     /// is moved from `pending` into `in_flight` so it remains visible to
     /// `jobs_snapshot` while running. Callers must invoke `mark_done` when
     /// the job finishes.
+    ///
+    /// The capacity check and the move into `in_flight` happen atomically
+    /// under the `in_flight` lock, so concurrent dispatchers can never
+    /// exceed `parallelism`. Guards are acquired in the queue's global lock
+    /// order (`pending` -> `in_flight` -> `completed`, see `jobs_snapshot`).
     pub fn try_dispatch(&self) -> Option<Job> {
-        if !self.has_capacity() { return None; }
-        let job = self.next_pending()?;
-        self.in_flight.lock().push(job.clone());
+        let mut q = self.pending.lock();
+        let mut inflight = self.in_flight.lock();
+        if inflight.len() >= self.parallelism {
+            return None;
+        }
+        let job = q.pop_front()?;
+        inflight.push(job.clone());
         Some(job)
     }
 
@@ -195,5 +204,28 @@ mod tests {
             .expect("channel open");
         let b = queue.try_dispatch().expect("freed slot allows dispatch");
         assert_ne!(b.id, a_id);
+    }
+
+    #[test]
+    fn try_dispatch_never_exceeds_parallelism() {
+        let (queue, _rx) = JobQueue::new(2);
+        for i in 0..32 {
+            queue.submit(test_job(&format!("j{i}")));
+        }
+        let queue = queue.clone();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let q = Arc::clone(&queue);
+                std::thread::spawn(move || {
+                    let mut got = 0;
+                    while q.try_dispatch().is_some() { got += 1; }
+                    got
+                })
+            })
+            .collect();
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 2, "exactly `parallelism` jobs may be in flight");
+        assert_eq!(queue.snapshot().in_flight, 2);
+        assert_eq!(queue.snapshot().pending, 30);
     }
 }
