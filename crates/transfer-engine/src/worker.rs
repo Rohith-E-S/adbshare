@@ -42,7 +42,27 @@ impl Worker {
                 meta.len()
             }
             Direction::Pull => {
-                self.client.stat(job.source.to_str().unwrap()).await.map(|s| s.size).unwrap_or(0)
+                // The transfer loop below handles an unknown size correctly
+                // (it stops when the remote read comes back empty), so a
+                // transient stat failure must not fail the job — retry once,
+                // then proceed with total 0 and log a warning.
+                let path = job.source.to_str().unwrap_or("");
+                match self.client.stat(path).await {
+                    Ok(s) => s.size,
+                    Err(first) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        match self.client.stat(path).await {
+                            Ok(s) => s.size,
+                            Err(e) => {
+                                tracing::warn!(
+                                    job = job.id, error = %e, first_error = %first,
+                                    "stat failed for pull source; proceeding with unknown total size"
+                                );
+                                0
+                            }
+                        }
+                    }
+                }
             }
         };
         job.set_total(total);
