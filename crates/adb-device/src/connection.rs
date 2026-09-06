@@ -150,6 +150,8 @@ pub struct AdbConnection {
     pending_opens: Arc<PlMutex<HashMap<LocalId, oneshot::Sender<Result<StreamId>>>>>,
     write_tx: mpsc::Sender<WriteReq>,
     close_tx: Option<oneshot::Sender<()>>,
+    /// Signals the reader task to shut down; fired from `Drop`.
+    reader_close_tx: Option<oneshot::Sender<()>>,
 }
 
 impl AdbConnection {
@@ -167,14 +169,22 @@ impl AdbConnection {
         let streams_r = streams.clone();
         let pending_opens_r = pending_opens.clone();
         let write_tx_r = write_tx.clone();
+        let (reader_close_tx, mut reader_close_rx) = oneshot::channel::<()>();
 
         // Reader task: dispatch frames to per-stream channels; resolve OPEN replies.
         tokio::spawn(async move {
             let mut reader = reader.lock().await;
             loop {
                 let mut header = [0u8; Message::HEADER_LEN];
-                if reader.read_exact(&mut header).await.is_err() {
-                    break;
+                // The reader pins the transport's read half, so it must exit
+                // when the connection is dropped, not only on I/O errors.
+                tokio::select! {
+                    _ = &mut reader_close_rx => break,
+                    res = reader.read_exact(&mut header) => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
                 }
                 let len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
                 if len > MAX_PAYLOAD {
@@ -287,6 +297,7 @@ impl AdbConnection {
             pending_opens,
             write_tx,
             close_tx: Some(close_tx),
+            reader_close_tx: Some(reader_close_tx),
         })
     }
 
@@ -365,5 +376,20 @@ impl AdbConnection {
             write_tx: self.write_tx.clone(),
             close_tx: Some(close_tx),
         })
+    }
+}
+
+impl Drop for AdbConnection {
+    fn drop(&mut self) {
+        // Signal both background tasks. The writer also exits when the write
+        // queue closes, but the reader holds the transport's read half and
+        // would otherwise keep it pinned (and keep reading frames) forever
+        // after the connection is dropped.
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.reader_close_tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
