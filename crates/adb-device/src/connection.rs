@@ -37,6 +37,9 @@ enum WriteReq {
     Data { local: LocalId, remote: RemoteId, payload: Bytes },
 }
 
+/// How long to wait for the device's OKAY after sending OPEN.
+const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Open ADB stream. `AsyncRead + AsyncWrite` to the device-side endpoint.
 pub struct Stream {
     id: StreamId,
@@ -289,6 +292,13 @@ impl AdbConnection {
 
     pub fn serial(&self) -> &str { &self.serial }
 
+    /// Abort an in-flight open: drop the pending reply slot and the
+    /// pre-registered data channel for `local`.
+    fn abort_open(&self, local: LocalId) {
+        self.pending_opens.lock().remove(&local);
+        self.streams.lock().remove(&local);
+    }
+
     pub async fn open_stream(&self, dest: &str) -> Result<Stream> {
         let local = {
             let mut n = self.next_local.lock().await;
@@ -296,6 +306,13 @@ impl AdbConnection {
             *n
         };
         let (open_tx, open_rx) = oneshot::channel::<Result<StreamId>>();
+        let (data_tx, data_rx) = mpsc::channel::<Bytes>(256);
+
+        // Register the data channel *before* the OPEN goes out: the device
+        // may send WRTE immediately after its OKAY, and registering only
+        // after the reply is observed would drop that early data. If the
+        // open fails, abort_open() removes the entry again.
+        self.streams.lock().insert(local, data_tx);
         self.pending_opens.lock().insert(local, open_tx);
 
         // Send OPEN frame.
@@ -305,16 +322,28 @@ impl AdbConnection {
             0,
             Bytes::copy_from_slice(dest.as_bytes()),
         );
-        self.write_tx
-            .send(WriteReq::Frame(open))
-            .await
-            .map_err(|_| AdbError::Disconnected)?;
+        if self.write_tx.send(WriteReq::Frame(open)).await.is_err() {
+            self.abort_open(local);
+            return Err(AdbError::Disconnected);
+        }
 
-        let stream_id = open_rx.await.map_err(|_| AdbError::Disconnected)??;
-
-        let (data_tx, data_rx) = mpsc::channel::<Bytes>(256);
-        self.streams.lock().insert(local, data_tx);
-
+        let stream_id = match tokio::time::timeout(OPEN_TIMEOUT, open_rx).await {
+            Ok(Ok(Ok(id))) => id,
+            Ok(Ok(Err(e))) => {
+                self.abort_open(local);
+                return Err(e);
+            }
+            // Reply channel dropped: the reader task is gone.
+            Ok(Err(_)) => {
+                self.abort_open(local);
+                return Err(AdbError::Disconnected);
+            }
+            // Device never acknowledged the OPEN.
+            Err(_) => {
+                self.abort_open(local);
+                return Err(AdbError::Timeout);
+            }
+        };
         let (close_tx, mut close_rx) = oneshot::channel::<StreamId>();
         let streams_for_close = self.streams.clone();
         let write_tx_for_close = self.write_tx.clone();
