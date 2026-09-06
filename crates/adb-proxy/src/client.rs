@@ -169,6 +169,11 @@ impl ProxyConn {
             let mut rx = self.inner.read_rx.lock().await;
             rx.recv().await.ok_or(ProxyError::Closed)?
         };
+        if resp.is_empty() {
+            // A zero-length frame carries no status byte; indexing resp[0]
+            // would panic (and with panic=abort take the whole daemon down).
+            return Err(ProxyError::Invalid("empty response frame".into()));
+        }
         let status = Status::from_u8(resp[0]);
         let data = resp.slice(1..);
         if status != Status::Ok {
