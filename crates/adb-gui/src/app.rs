@@ -978,14 +978,16 @@ fn handle_browser_event(
         }
         BrowserEvent::PauseTransfer => {
             // Toggle: first click pauses every active job, next click resumes.
+            // Check for jobs FIRST: flipping the flag on an empty queue would
+            // invert the polarity of the next real click.
+            let ids = handles.active_jobs.lock().clone();
+            if ids.is_empty() { return; }
             let resume = {
                 let mut paused = handles.transfers_paused.lock();
                 let resume = *paused;
                 *paused = !resume;
                 resume
             };
-            let ids = handles.active_jobs.lock().clone();
-            if ids.is_empty() { return; }
             rt.spawn(async move {
                 for id in ids {
                     let r = if resume { resume_job(id).await } else { pause_job(id).await };
