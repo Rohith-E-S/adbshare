@@ -16,7 +16,7 @@
 //!
 //! Commands: A_SYNC, A_CNXN, A_OPEN, A_OKAY, A_CLSE, A_WRTE, A_AUTH.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 pub const ADB_VERSION: u32 = 0x01000000;
 
@@ -97,17 +97,34 @@ impl Message {
     }
 
     pub fn encode(&self) -> BytesMut {
+        // `encode` cannot change signature without breaking callers outside
+        // this crate; it now fails loudly instead of silently truncating a
+        // payload >4 GiB into a bogus 32-bit length. Prefer `try_encode` for
+        // fallible handling.
+        self.try_encode().expect("payload exceeds the 32-bit ADB data_length field")
+    }
+
+    /// Like [`Message::encode`], but returns an error instead of panicking
+    /// when the payload is too large for the 32-bit `data_length` header
+    /// field (`u32::try_from` instead of an `as u32` cast that silently
+    /// truncates).
+    pub fn try_encode(&self) -> crate::Result<BytesMut> {
+        let len = u32::try_from(self.payload.len()).map_err(|_| {
+            crate::AdbError::Protocol(format!(
+                "payload length {} exceeds the 32-bit ADB data_length field",
+                self.payload.len()
+            ))
+        })?;
         let mut buf = BytesMut::with_capacity(Self::HEADER_LEN + self.payload.len());
         buf.put_u32_le(self.command.as_u32());
         buf.put_u32_le(self.arg0);
         buf.put_u32_le(self.arg1);
-        let len = self.payload.len() as u32;
         buf.put_u32_le(len);
         let crc = data_checksum(&self.payload);
         buf.put_u32_le(crc);
         buf.put_u32_le(self.command.as_u32() ^ 0xFFFF_FFFF);
         buf.extend_from_slice(&self.payload);
-        buf
+        Ok(buf)
     }
 
     pub fn decode(header: &[u8; Self::HEADER_LEN], payload: Bytes) -> crate::Result<Self> {
@@ -118,7 +135,6 @@ impl Message {
         let data_length = u32::from_le_bytes([h[12], h[13], h[14], h[15]]);
         let data_crc = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
         let magic = u32::from_le_bytes([h[20], h[21], h[22], h[23]]);
-        let _ = h.get_u32_le();
 
         let command = Command::from_u32(command)
             .ok_or_else(|| crate::AdbError::InvalidResponse(format!("unknown command 0x{:08x}", command)))?;
@@ -166,6 +182,12 @@ mod tests {
         assert_eq!(data_checksum(b"hello"), 0x214);
         // "host:version" from the AOSP adb protocol doc.
         assert_eq!(data_checksum(b"host:version"), 1278);
+    }
+
+    #[test]
+    fn try_encode_matches_encode() {
+        let msg = Message::new(Command::Open, 7, 0, Bytes::from_static(b"shell:"));
+        assert_eq!(msg.try_encode().unwrap(), msg.encode());
     }
 
     #[test]
