@@ -39,6 +39,9 @@ pub enum ProxyError {
     #[error("connection pool exhausted")]
     PoolExhausted,
 
+    #[error("request timed out")]
+    Timeout,
+
     #[error("{0}")]
     Other(String),
 }
@@ -46,6 +49,10 @@ pub enum ProxyError {
 pub type Result<T> = std::result::Result<T, ProxyError>;
 
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+
+/// Upper bound for a single RPC round-trip. Without it a hung device proxy
+/// blocks FUSE ops (and transfers) forever.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A single TCP connection to the proxy. Cheap to clone (it's an Arc).
 #[derive(Clone)]
@@ -56,6 +63,13 @@ pub struct ProxyConn {
 impl ProxyConn {
     pub fn is_closed(&self) -> bool {
         *self.inner.closed.lock()
+    }
+
+    /// True once a request on this connection timed out: the peer may still
+    /// deliver a stale response that would desynchronize the next request,
+    /// so the connection must be discarded rather than pooled.
+    pub fn is_poisoned(&self) -> bool {
+        *self.inner.poisoned.lock()
     }
 }
 
@@ -69,6 +83,7 @@ struct ProxyConnInner {
     write_tx: mpsc::Sender<Bytes>,
     read_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
     closed: Arc<PlMutex<bool>>,
+    poisoned: Arc<PlMutex<bool>>,
     /// Serializes requests on this connection: each request must wait for
     /// the previous response before sending the next, because the protocol
     /// is strictly request/response with no IDs.
@@ -86,6 +101,7 @@ impl ProxyConn {
         let closed = Arc::new(PlMutex::new(false));
         let closed_w = closed.clone();
         let closed_r = closed.clone();
+        let poisoned = Arc::new(PlMutex::new(false));
 
         // Writer task: drains write_tx into the TCP socket.
         tokio::spawn(async move {
@@ -133,6 +149,7 @@ impl ProxyConn {
                 write_tx,
                 read_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
                 closed,
+                poisoned,
                 req_lock: tokio::sync::Mutex::new(()),
             }),
         })
@@ -148,11 +165,21 @@ impl ProxyConn {
     /// Send a pre-built frame and wait for its response. Used by Drop so the
     /// connection stays synchronized after a best-effort close.
     async fn send_frame_and_await(&self, frame: Bytes) -> Result<Bytes> {
-        if self.is_closed() { return Err(ProxyError::Closed); }
+        if self.is_closed() || self.is_poisoned() { return Err(ProxyError::Closed); }
         let _guard = self.inner.req_lock.lock().await;
-        self.inner.write_tx.send(frame).await.map_err(|_| ProxyError::Closed)?;
-        let mut rx = self.inner.read_rx.lock().await;
-        let resp = rx.recv().await.ok_or(ProxyError::Closed)?;
+        let recv = async {
+            self.inner.write_tx.send(frame).await.map_err(|_| ProxyError::Closed)?;
+            let mut rx = self.inner.read_rx.lock().await;
+            rx.recv().await.ok_or(ProxyError::Closed)
+        };
+        let resp = match tokio::time::timeout(REQUEST_TIMEOUT, recv).await {
+            Ok(resp) => resp?,
+            Err(_) => {
+                *self.inner.poisoned.lock() = true;
+                *self.inner.closed.lock() = true;
+                return Err(ProxyError::Timeout);
+            }
+        };
         if resp.is_empty() {
             return Err(ProxyError::Invalid("empty response frame".into()));
         }
@@ -168,7 +195,7 @@ impl ProxyConn {
     /// Issue a request and wait for the response. The request payload is
     /// the `args` part; the response payload is the data section.
     async fn request(&self, op: Op, args: &[u8]) -> Result<Bytes> {
-        if *self.inner.closed.lock() { return Err(ProxyError::Closed); }
+        if self.is_closed() || self.is_poisoned() { return Err(ProxyError::Closed); }
         // Serialize requests on this connection: lock held for the duration
         // of the request + response, so no two requests interleave.
         let _guard = self.inner.req_lock.lock().await;
@@ -179,15 +206,26 @@ impl ProxyConn {
         frame.extend_from_slice(&(args.len() as u32).to_le_bytes());
         frame.extend_from_slice(args);
 
-        self.inner.write_tx.send(frame.freeze()).await
-            .map_err(|_| ProxyError::Closed)?;
-
         // The reader task pushes every received frame onto `resp_tx` in
         // order. Because the connection is serialized by `req_lock`, the
         // next frame is ours.
-        let resp = {
+        let recv = async {
+            self.inner.write_tx.send(frame.freeze()).await
+                .map_err(|_| ProxyError::Closed)?;
             let mut rx = self.inner.read_rx.lock().await;
-            rx.recv().await.ok_or(ProxyError::Closed)?
+            rx.recv().await.ok_or(ProxyError::Closed)
+        };
+        let resp = match tokio::time::timeout(REQUEST_TIMEOUT, recv).await {
+            Ok(resp) => resp?,
+            Err(_) => {
+                // A caller abandoning a timed-out request would leave a
+                // stale response in flight, which the next request on this
+                // connection would consume. Mark the connection unusable so
+                // release() discards it instead of pooling it.
+                *self.inner.poisoned.lock() = true;
+                *self.inner.closed.lock() = true;
+                return Err(ProxyError::Timeout);
+            }
         };
         if resp.is_empty() {
             // A zero-length frame carries no status byte; indexing resp[0]
@@ -251,7 +289,7 @@ impl ProxyClient {
                 pool.pop()
             };
             match conn {
-                Some(c) if !c.is_closed() => return Ok((c, permit)),
+                Some(c) if !c.is_closed() && !c.is_poisoned() => return Ok((c, permit)),
                 Some(_) => {
                     // Closed connection popped; try opening a replacement.
                     match ProxyConn::open(&self.addr).await {
@@ -269,7 +307,9 @@ impl ProxyClient {
     }
 
     fn release(&self, conn: ProxyConn) {
-        if conn.is_closed() {
+        if conn.is_closed() || conn.is_poisoned() {
+            // A timed-out request may leave a stale response in flight, so
+            // a poisoned connection can never be reused safely.
             return;
         }
         let mut pool = self.pool.lock();
