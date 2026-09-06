@@ -138,6 +138,33 @@ impl ProxyConn {
         })
     }
 
+    /// Queue a pre-built frame synchronously (best effort, e.g. from Drop).
+    /// The response, if any, is never consumed — callers must not reuse the
+    /// connection afterwards.
+    fn try_send_frame(&self, frame: Bytes) -> Result<()> {
+        self.inner.write_tx.try_send(frame).map_err(|_| ProxyError::Closed)
+    }
+
+    /// Send a pre-built frame and wait for its response. Used by Drop so the
+    /// connection stays synchronized after a best-effort close.
+    async fn send_frame_and_await(&self, frame: Bytes) -> Result<Bytes> {
+        if self.is_closed() { return Err(ProxyError::Closed); }
+        let _guard = self.inner.req_lock.lock().await;
+        self.inner.write_tx.send(frame).await.map_err(|_| ProxyError::Closed)?;
+        let mut rx = self.inner.read_rx.lock().await;
+        let resp = rx.recv().await.ok_or(ProxyError::Closed)?;
+        if resp.is_empty() {
+            return Err(ProxyError::Invalid("empty response frame".into()));
+        }
+        let status = Status::from_u8(resp[0]);
+        let data = resp.slice(1..);
+        if status != Status::Ok {
+            let s = String::from_utf8_lossy(&data).into_owned();
+            return Err(ProxyError::Status(status, s));
+        }
+        Ok(data)
+    }
+
     /// Issue a request and wait for the response. The request payload is
     /// the `args` part; the response payload is the data section.
     async fn request(&self, op: Op, args: &[u8]) -> Result<Bytes> {
@@ -292,27 +319,27 @@ impl ProxyClient {
 
     pub async fn open(&self, path: &str, flags: OpenFlags, mode: u32) -> Result<ProxyFile> {
         let (conn, _permit) = self.acquire().await?;
-        let res = async {
-            let mut args = Vec::new();
-            args.extend_from_slice(&flags.bits().to_le_bytes());
-            args.extend_from_slice(&mode.to_le_bytes());
-            args.extend_from_slice(&(path.len() as u32).to_le_bytes());
-            args.extend_from_slice(path.as_bytes());
-            let resp = conn.request(Op::Open, &args).await?;
-            if resp.len() < 4 {
-                return Err(ProxyError::Invalid("open response short".into()));
-            }
-            let fd = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
-            Ok(ProxyFile {
-                conn: Some(conn.clone()),
+        let mut args = Vec::new();
+        args.extend_from_slice(&flags.bits().to_le_bytes());
+        args.extend_from_slice(&mode.to_le_bytes());
+        args.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        args.extend_from_slice(path.as_bytes());
+        let resp = match conn.request(Op::Open, &args).await {
+            Ok(resp) => resp,
+            Err(e) => { self.release(conn); return Err(e); }
+        };
+        if resp.len() < 4 {
+            self.release(conn);
+            return Err(ProxyError::Invalid("open response short".into()));
+        }
+        let fd = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+        Ok(ProxyFile {
+            inner: Arc::new(ProxyFileInner {
+                conn: PlMutex::new(Some(conn)),
                 fd,
                 path: path.to_string(),
-            })
-        }.await;
-        match res {
-            Ok(file) => Ok(file),
-            Err(e) => { self.release(conn); Err(e) }
-        }
+            }),
+        })
     }
 
     pub async fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
@@ -406,42 +433,104 @@ impl ProxyClient {
     }
 }
 
-#[derive(Debug, Clone)]
+/// A handle to a file opened on the device.
+///
+/// Cloning shares the same underlying file handle: the `Op::Close` is sent
+/// by `close()` or, failing that, when the *last* clone is dropped. Every
+/// error path after `open` therefore releases the device-side fd instead of
+/// leaking it until EMFILE.
+#[derive(Clone)]
 pub struct ProxyFile {
-    /// `None` once `close` has been called or the file has been moved.
-    conn: Option<ProxyConn>,
+    inner: Arc<ProxyFileInner>,
+}
+
+struct ProxyFileInner {
+    /// `None` once the file has been closed.
+    conn: PlMutex<Option<ProxyConn>>,
     fd: u32,
     path: String,
 }
 
+impl std::fmt::Debug for ProxyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyFile")
+            .field("fd", &self.inner.fd)
+            .field("path", &self.inner.path)
+            .finish()
+    }
+}
+
 impl ProxyFile {
-    pub fn path(&self) -> &str { &self.path }
-    pub fn fd(&self) -> u32 { self.fd }
+    pub fn path(&self) -> &str { &self.inner.path }
+    pub fn fd(&self) -> u32 { self.inner.fd }
+
+    /// Clone of the live connection, or `Closed` if already closed.
+    fn conn(&self) -> Result<ProxyConn> {
+        self.inner.conn.lock().clone().ok_or(ProxyError::Closed)
+    }
 
     pub async fn read_at(&self, offset: u64, len: u32) -> Result<Bytes> {
-        let conn = self.conn.as_ref().ok_or(ProxyError::Closed)?;
+        let conn = self.conn()?;
         let mut args = Vec::new();
-        args.extend_from_slice(&self.fd.to_le_bytes());
+        args.extend_from_slice(&self.inner.fd.to_le_bytes());
         args.extend_from_slice(&offset.to_le_bytes());
         args.extend_from_slice(&len.to_le_bytes());
         conn.request(Op::Read, &args).await
     }
 
     pub async fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
-        let conn = self.conn.as_ref().ok_or(ProxyError::Closed)?;
+        let conn = self.conn()?;
         let mut args = Vec::new();
-        args.extend_from_slice(&self.fd.to_le_bytes());
+        args.extend_from_slice(&self.inner.fd.to_le_bytes());
         args.extend_from_slice(&offset.to_le_bytes());
         args.extend_from_slice(&(data.len() as u32).to_le_bytes());
         args.extend_from_slice(data);
         conn.request(Op::Write, &args).await.map(|_| ())
     }
 
-    pub async fn close(mut self) -> Result<()> {
-        let conn = self.conn.take().ok_or(ProxyError::Closed)?;
+    pub async fn close(self) -> Result<()> {
+        let conn = self.inner.conn.lock().take().ok_or(ProxyError::Closed)?;
         let mut args = Vec::new();
-        args.extend_from_slice(&self.fd.to_le_bytes());
+        args.extend_from_slice(&self.inner.fd.to_le_bytes());
         conn.request(Op::Close, &args).await.map(|_| ())
+    }
+}
+
+impl Drop for ProxyFile {
+    fn drop(&mut self) {
+        // Other clones may still be using the file handle; only the last
+        // one out closes it. `conn` being `None` means close() already ran.
+        if Arc::strong_count(&self.inner) != 1 {
+            return;
+        }
+        let conn = self.inner.conn.lock().take();
+        let Some(conn) = conn else { return };
+        let fd = self.inner.fd;
+
+        // Build the Close request frame: [op u8][len u32 LE][fd u32 LE].
+        let close_frame = {
+            let mut frame = BytesMut::with_capacity(5 + 4);
+            frame.extend_from_slice(&[Op::Close as u8]);
+            frame.extend_from_slice(&4u32.to_le_bytes());
+            frame.extend_from_slice(&fd.to_le_bytes());
+            frame.freeze()
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Drop can't await; spawn a task to send the Close properly
+                // (consuming the response so the stream stays in sync).
+                handle.spawn(async move {
+                    let _ = conn.send_frame_and_await(close_frame).await;
+                });
+            }
+            Err(_) => {
+                // No runtime: best-effort synchronous send. The queued frame
+                // still reaches the device before the socket closes, but the
+                // response is never read, so the connection is discarded.
+                let _ = conn.try_send_frame(close_frame);
+            }
+        }
     }
 }
 
