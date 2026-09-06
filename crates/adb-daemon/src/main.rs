@@ -136,8 +136,14 @@ async fn main() -> anyhow::Result<()> {
                 adb_device::watcher::WatchEvent::Removed(id) => {
                     info!(?id, "device removed");
                     let slot = state_clone.lock().devices.remove(&id);
-                    if let Some(DeviceSlot { mountpoint: Some(mp), .. }) = slot {
-                        let _ = Command::new("fusermount3").args(["-u", "-z", mp.to_str().unwrap()]).status().await;
+                    if let Some(slot) = slot {
+                        // Kill the on-device proxy and drop our forward
+                        // (only ours — never the user's other forwards).
+                        teardown_device(id.as_str(), slot.host_port).await;
+                        if let Some(mp) = slot.mountpoint {
+                            let mp_str = mp.to_string_lossy().into_owned();
+                            let _ = Command::new("fusermount3").args(["-u", "-z", &mp_str]).status().await;
+                        }
                     }
                 }
                 adb_device::watcher::WatchEvent::Changed(id) => {
@@ -213,12 +219,12 @@ async fn main() -> anyhow::Result<()> {
     // Idle loop.
     tokio::signal::ctrl_c().await?;
     info!("shutting down");
-    {
-        let devices = state.lock().devices.drain().collect::<Vec<_>>();
-        for (_id, slot) in devices {
-            if let Some(mp) = slot.mountpoint {
-                let _ = std::process::Command::new("fusermount3").args(["-u", "-z", mp.to_str().unwrap()]).status();
-            }
+    for (id, slot) in state.lock().devices.drain().collect::<Vec<_>>() {
+        // Kill the on-device proxy and drop our host-side forward.
+        teardown_device(id.as_str(), slot.host_port).await;
+        if let Some(mp) = slot.mountpoint {
+            let mp_str = mp.to_string_lossy().into_owned();
+            let _ = Command::new("fusermount3").args(["-u", "-z", &mp_str]).status().await;
         }
     }
     drop(conn);
@@ -478,6 +484,26 @@ async fn locate_proxy_binary(device: &DeviceId) -> anyhow::Result<PathBuf> {
     }
 
     anyhow::bail!("adbshare-proxy binary not found for device ABI '{abi}'. Build with `cargo build --release --target aarch64-unknown-linux-musl --bin adbshare-proxy` or set ADBSHARE_PROXY_BIN.")
+}
+
+/// Best-effort cleanup for a device that is going away (or being torn down):
+/// kill the on-device proxy process and remove our host-side adb forward.
+/// Safe to call more than once; failures are logged, never fatal (the device
+/// may already be unplugged).
+async fn teardown_device(serial: &str, host_port: u16) {
+    match adb_shell(serial, &format!("pkill -f {}", PROXY_BIN_PATH)).await {
+        Ok(_) => {}
+        // pkill exits non-zero when no process matched — that's fine.
+        Err(e) => tracing::debug!(serial, host_port, %e, "pkill proxy (best-effort) failed"),
+    }
+    if let Err(e) = adb_run(
+        &["-s", serial, "forward", "--remove", &format!("tcp:{host_port}")],
+        ADB_CMD_TIMEOUT,
+    )
+    .await
+    {
+        tracing::debug!(serial, host_port, %e, "forward --remove (best-effort) failed");
+    }
 }
 
 /// Serial looks like host:port (wireless pairing) vs a plain USB serial.
