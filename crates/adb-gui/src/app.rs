@@ -888,8 +888,10 @@ fn list_local_dir(path: &std::path::Path) -> Result<Vec<FsDirEntry>, String> {
     let read_dir = std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
     for entry in read_dir.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // Hide dotfiles like Nautilus does by default.
-        if name.starts_with('.') { continue; }
+        // Collect ALL entries, dotfiles included: the browser's
+        // "Show hidden files" toggle filters them GUI-side, the same way it
+        // does for device listings. Filtering here made the toggle a no-op
+        // in local mode.
         // DirEntry::metadata() does not follow symlinks; stat the target so
         // symlinked directories (e.g. /bin -> usr/bin) render as folders.
         let meta = std::fs::metadata(entry.path()).or_else(|_| entry.metadata());
