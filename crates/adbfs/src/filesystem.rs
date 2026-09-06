@@ -195,14 +195,10 @@ impl SyncProxy {
     {
         let (tx, rx) = std::sync::mpsc::channel();
         let req = build(tx);
-        eprintln!("adbfs: SyncProxy::call: sending request");
         if self.tx.send(req).is_err() {
             return Err(ProxyError::Closed);
         }
-        eprintln!("adbfs: SyncProxy::call: waiting for response");
-        let result = rx.recv().map_err(|_| ProxyError::Closed)?;
-        eprintln!("adbfs: SyncProxy::call: got response");
-        result
+        rx.recv().map_err(|_| ProxyError::Closed)?
     }
 
     fn stat(&self, path: &str) -> std::result::Result<Stat, ProxyError> {
@@ -325,19 +321,15 @@ impl Adbfs {
 
 impl Filesystem for Adbfs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        eprintln!("adbfs: lookup({}, {:?})", parent, name);
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
-        eprintln!("adbfs: lookup: calling proxy.stat({})", path.display());
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
             return;
         };
-        let res = self.proxy.stat(&path_str);
-        eprintln!("adbfs: lookup: proxy.stat returned {:?}", res.as_ref().err().map(|e| e.to_string()));
-        match res {
+        match self.proxy.stat(&path_str) {
             Ok(stat) => {
                 self.cache.put(path.clone(), stat);
                 let ino = self.ino_for(path);
@@ -345,7 +337,7 @@ impl Filesystem for Adbfs {
                 reply.entry(&TTL, &attr, 0);
             }
             Err(ProxyError::Status(Status::NotFound, _)) => reply.error(libc::ENOENT),
-            Err(e) => { eprintln!("lookup: {e}"); reply.error(libc::EIO); }
+            Err(e) => reply.error(Self::proxy_to_errno(e)),
         }
     }
 
@@ -370,7 +362,7 @@ impl Filesystem for Adbfs {
                 let attr = self.attr_from_stat(ino, stat);
                 reply.attr(&TTL, &attr);
             }
-            Err(_) => reply.error(libc::EIO),
+            Err(e) => reply.error(Self::proxy_to_errno(e)),
         }
     }
 
@@ -387,7 +379,7 @@ impl Filesystem for Adbfs {
         let entries = self.proxy.listdir(&path_str);
         let entries = match entries {
             Ok(e) => e,
-            Err(_) => { reply.error(libc::EIO); return; }
+            Err(e) => { reply.error(Self::proxy_to_errno(e)); return; }
         };
         let mut cur = offset.max(0) as usize;
         if cur == 0 { let _ = reply.add(ino, 1, FileType::Directory, "."); cur = 1; }
