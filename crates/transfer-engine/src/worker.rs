@@ -156,7 +156,9 @@ impl Worker {
             }
             return Err(e);
         }
-        let _ = dst.close().await;
+        // A failed close may mean the device never durably received the
+        // final chunks; report it instead of silently completing.
+        dst.close().await.map_err(|e| ProxyError::Other(format!("close destination: {e}")))?;
         Ok(())
     }
 
@@ -252,7 +254,9 @@ impl Worker {
             }
             return Err(e);
         }
-        let _ = src.close().await;
+        // A failed close may mean the device never registered the final
+        // read; report it instead of silently completing.
+        src.close().await.map_err(|e| ProxyError::Other(format!("close source: {e}")))?;
         dst.flush().await.map_err(|e| ProxyError::Other(e.to_string()))?;
 
         if matches!(job.options.verify, super::job::VerifyMode::On) {
