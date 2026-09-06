@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -58,6 +58,15 @@ impl std::fmt::Debug for Adbfs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Adbfs").finish()
     }
+}
+
+/// Convert a path into the UTF-8 string the proxy protocol requires.
+///
+/// Non-UTF-8 filenames are legal on Linux; the proxy protocol carries
+/// JSON strings and cannot represent them, so this returns `None` and
+/// callers reply with an errno instead of panicking the FUSE thread.
+fn path_to_string(p: &Path) -> Option<String> {
+    p.to_str().map(|s| s.to_string())
 }
 
 /// Synchronous proxy wrapper. Spawns a dedicated thread that owns a
@@ -322,7 +331,11 @@ impl Filesystem for Adbfs {
             None => { reply.error(libc::EINVAL); return; }
         };
         eprintln!("adbfs: lookup: calling proxy.stat({})", path.display());
-        let res = self.proxy.stat(path.to_str().unwrap());
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        let res = self.proxy.stat(&path_str);
         eprintln!("adbfs: lookup: proxy.stat returned {:?}", res.as_ref().err().map(|e| e.to_string()));
         match res {
             Ok(stat) => {
@@ -347,10 +360,13 @@ impl Filesystem for Adbfs {
             reply.attr(&TTL, &attr);
             return;
         }
-        let res = self.proxy.stat(path.to_str().unwrap());
-        match res {
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.proxy.stat(&path_str) {
             Ok(stat) => {
-                self.cache.put(path.clone(), stat);
+                self.cache.put(path, stat);
                 let attr = self.attr_from_stat(ino, stat);
                 reply.attr(&TTL, &attr);
             }
@@ -364,7 +380,11 @@ impl Filesystem for Adbfs {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
-        let entries = self.proxy.listdir(path.to_str().unwrap());
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        let entries = self.proxy.listdir(&path_str);
         let entries = match entries {
             Ok(e) => e,
             Err(_) => { reply.error(libc::EIO); return; }
@@ -392,6 +412,10 @@ impl Filesystem for Adbfs {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
         let mut oflags = OpenFlags::READ;
         if flags & libc::O_WRONLY != 0 { oflags = OpenFlags::WRITE; }
         if flags & libc::O_RDWR != 0 { oflags = OpenFlags::READ | OpenFlags::WRITE; }
@@ -399,7 +423,7 @@ impl Filesystem for Adbfs {
         if flags & libc::O_TRUNC != 0 { oflags |= OpenFlags::TRUNC; }
         if flags & libc::O_APPEND != 0 { oflags |= OpenFlags::APPEND; }
         let mode = 0o644;
-        let res = self.proxy.open(path.to_str().unwrap(), oflags, mode);
+        let res = self.proxy.open(&path_str, oflags, mode);
         match res {
             Ok(file) => {
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -465,16 +489,20 @@ impl Filesystem for Adbfs {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
         let mut oflags = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
         if flags & libc::O_TRUNC != 0 { oflags |= OpenFlags::TRUNC; }
         if flags & libc::O_EXCL != 0 { oflags |= OpenFlags::EXCL; }
-        let res = self.proxy.open(path.to_str().unwrap(), oflags, mode);
+        let res = self.proxy.open(&path_str, oflags, mode);
         match res {
             Ok(file) => {
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
                 self.open_files.lock().insert(fh, OpenFile { proxy: file });
                 let ino = self.ino_for(path.clone());
-                let stat = self.proxy.stat(path.to_str().unwrap()).unwrap_or(Stat {
+                let stat = self.proxy.stat(&path_str).unwrap_or(Stat {
                     mode: FileMode::file(),
                     size: 0,
                     mtime: 0,
@@ -507,10 +535,14 @@ impl Filesystem for Adbfs {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
-        match self.proxy.mkdir(path.to_str().unwrap(), mode) {
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.proxy.mkdir(&path_str, mode) {
             Ok(()) => {
                 let ino = self.ino_for(path.clone());
-                let stat = self.proxy.stat(path.to_str().unwrap()).unwrap_or(Stat {
+                let stat = self.proxy.stat(&path_str).unwrap_or(Stat {
                     mode: FileMode::dir(),
                     size: 4096,
                     mtime: 0,
@@ -535,7 +567,11 @@ impl Filesystem for Adbfs {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
-        match self.proxy.unlink(path.to_str().unwrap()) {
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.proxy.unlink(&path_str) {
             Ok(()) => {
                 self.cache.invalidate(&path);
                 reply.ok();
@@ -549,7 +585,11 @@ impl Filesystem for Adbfs {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
-        match self.proxy.rmdir(path.to_str().unwrap()) {
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.proxy.rmdir(&path_str) {
             Ok(()) => {
                 self.cache.invalidate(&path);
                 reply.ok();
@@ -576,7 +616,15 @@ impl Filesystem for Adbfs {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
-        match self.proxy.rename(src.to_str().unwrap(), dst.to_str().unwrap()) {
+        let Some(src_str) = path_to_string(&src) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        let Some(dst_str) = path_to_string(&dst) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
+        match self.proxy.rename(&src_str, &dst_str) {
             Ok(()) => {
                 self.cache.invalidate(&src);
                 self.cache.invalidate(&dst);
@@ -609,10 +657,14 @@ impl Filesystem for Adbfs {
             Some(p) => p,
             None => { reply.error(libc::EINVAL); return; }
         };
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(libc::EINVAL);
+            return;
+        };
         if let Some(s) = size {
-            let _ = self.proxy.truncate(path.to_str().unwrap(), s);
+            let _ = self.proxy.truncate(&path_str, s);
         }
-        match self.proxy.stat(path.to_str().unwrap()) {
+        match self.proxy.stat(&path_str) {
             Ok(stat) => {
                 self.cache.put(path, stat);
                 let attr = self.attr_from_stat(ino, stat);
