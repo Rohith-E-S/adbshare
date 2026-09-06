@@ -86,17 +86,39 @@ impl AsyncRead for Stream {
 impl AsyncWrite for Stream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let chunk = Bytes::copy_from_slice(buf);
-        let len = chunk.len();
-        let msg = WriteReq::Data { local: self.id.0, remote: self.id.1, payload: chunk };
-        match self.write_tx.try_send(msg) {
-            Ok(()) => Poll::Ready(Ok(len)),
-            Err(mpsc::error::TrySendError::Full(_)) => Poll::Pending,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "conn closed")))
+        // Reserve a slot in the writer queue *before* building the request.
+        // If the queue is full we must not just return Pending: nothing
+        // would ever re-poll this task again. Instead, spawn a helper that
+        // holds a permit reservation and wakes us once capacity frees up,
+        // mirroring the pattern used by the transport's ChannelWriter.
+        match self.write_tx.try_reserve() {
+            Ok(permit) => {
+                let chunk = Bytes::copy_from_slice(buf);
+                let len = chunk.len();
+                permit.send(WriteReq::Data {
+                    local: self.id.0,
+                    remote: self.id.1,
+                    payload: chunk,
+                });
+                Poll::Ready(Ok(len))
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let waker = cx.waker().clone();
+                let tx = self.write_tx.clone();
+                tokio::spawn(async move {
+                    let _permit = tx.reserve().await;
+                    waker.wake();
+                });
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection writer closed",
+                )))
             }
         }
     }
