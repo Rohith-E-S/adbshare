@@ -318,7 +318,7 @@ impl ProxyClient {
     }
 
     pub async fn open(&self, path: &str, flags: OpenFlags, mode: u32) -> Result<ProxyFile> {
-        let (conn, _permit) = self.acquire().await?;
+        let (conn, permit) = self.acquire().await?;
         let mut args = Vec::new();
         args.extend_from_slice(&flags.bits().to_le_bytes());
         args.extend_from_slice(&mode.to_le_bytes());
@@ -335,9 +335,11 @@ impl ProxyClient {
         let fd = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
         Ok(ProxyFile {
             inner: Arc::new(ProxyFileInner {
+                client: self.clone(),
                 conn: PlMutex::new(Some(conn)),
                 fd,
                 path: path.to_string(),
+                permit: PlMutex::new(Some(permit)),
             }),
         })
     }
@@ -445,10 +447,16 @@ pub struct ProxyFile {
 }
 
 struct ProxyFileInner {
+    /// Pool the connection is returned to when the file closes.
+    client: ProxyClient,
     /// `None` once the file has been closed.
     conn: PlMutex<Option<ProxyConn>>,
     fd: u32,
     path: String,
+    /// Pool permit held for the lifetime of the file: each open file counts
+    /// against the client's concurrency limiter instead of silently removing
+    /// a connection from the pool.
+    permit: PlMutex<Option<OwnedSemaphorePermit>>,
 }
 
 impl std::fmt::Debug for ProxyFile {
@@ -492,7 +500,12 @@ impl ProxyFile {
         let conn = self.inner.conn.lock().take().ok_or(ProxyError::Closed)?;
         let mut args = Vec::new();
         args.extend_from_slice(&self.inner.fd.to_le_bytes());
-        conn.request(Op::Close, &args).await.map(|_| ())
+        let res = conn.request(Op::Close, &args).await.map(|_| ());
+        // Return the connection to the pool (release() discards it if it is
+        // closed/poisoned or the pool is full) and free the file's permit.
+        self.inner.client.release(conn);
+        drop(self.inner.permit.lock().take());
+        res
     }
 }
 
@@ -506,6 +519,7 @@ impl Drop for ProxyFile {
         let conn = self.inner.conn.lock().take();
         let Some(conn) = conn else { return };
         let fd = self.inner.fd;
+        let client = self.inner.client.clone();
 
         // Build the Close request frame: [op u8][len u32 LE][fd u32 LE].
         let close_frame = {
@@ -519,9 +533,11 @@ impl Drop for ProxyFile {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 // Drop can't await; spawn a task to send the Close properly
-                // (consuming the response so the stream stays in sync).
+                // (consuming the response so the stream stays in sync) and
+                // then recycle the connection into the pool.
                 handle.spawn(async move {
                     let _ = conn.send_frame_and_await(close_frame).await;
+                    client.release(conn);
                 });
             }
             Err(_) => {
