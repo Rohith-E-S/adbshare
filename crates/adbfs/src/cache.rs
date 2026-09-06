@@ -6,6 +6,12 @@ use std::time::{Duration, Instant};
 
 use adb_proxy::Stat;
 
+/// Upper bound on cached entries. When exceeded, expired entries are
+/// dropped first; if the cache is still over the cap, it is cleared
+/// outright (entries only live for the TTL anyway, so a full clear is
+/// cheap and bounded growth is what matters).
+const MAX_ENTRIES: usize = 8192;
+
 #[derive(Debug)]
 pub struct StatCache {
     inner: parking_lot::Mutex<HashMap<PathBuf, (Stat, Instant)>>,
@@ -18,14 +24,29 @@ impl StatCache {
     }
 
     pub fn get(&self, path: &PathBuf) -> Option<Stat> {
-        let inner = self.inner.lock();
-        inner.get(path).and_then(|(s, when)| {
-            if when.elapsed() < self.ttl { Some(*s) } else { None }
-        })
+        let mut inner = self.inner.lock();
+        if let Some((s, when)) = inner.get(path) {
+            if when.elapsed() < self.ttl {
+                return Some(*s);
+            }
+        } else {
+            return None;
+        }
+        // Expired: drop it so the map does not grow without bound.
+        inner.remove(path);
+        None
     }
 
     pub fn put(&self, path: PathBuf, stat: Stat) {
-        self.inner.lock().insert(path, (stat, Instant::now()));
+        let mut inner = self.inner.lock();
+        if inner.len() >= MAX_ENTRIES {
+            let ttl = self.ttl;
+            inner.retain(|_, (_, when)| when.elapsed() < ttl);
+            if inner.len() >= MAX_ENTRIES {
+                inner.clear();
+            }
+        }
+        inner.insert(path, (stat, Instant::now()));
     }
 
     pub fn invalidate(&self, path: &PathBuf) {
