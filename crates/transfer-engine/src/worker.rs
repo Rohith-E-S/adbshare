@@ -126,25 +126,35 @@ impl Worker {
         let dst = self.client.open(&dest, flags, 0o644).await?;
 
         let mut buf = vec![0u8; self.chunk_size];
-        loop {
+        let outcome: Result<(), ProxyError> = loop {
             if job.is_cancelled() || self.wait_while_paused(job).await {
-                let _ = dst.close().await;
-                // Don't leave a partial file behind on the device — but only
-                // if this job created it; never unlink a pre-existing file.
-                if created {
-                    let _ = self.client.unlink(&dest).await;
-                }
-                return Err(ProxyError::Other("cancelled".into()));
+                break Err(ProxyError::Other("cancelled".into()));
             }
-            let n = src.read(&mut buf).await.map_err(|e| ProxyError::Other(e.to_string()))?;
-            if n == 0 { break; }
-            dst.write_at(offset, &buf[..n]).await?;
+            let n = match src.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => break Err(ProxyError::Other(format!("read source: {e}"))),
+            };
+            if n == 0 { break Ok(()); }
+            if let Err(e) = dst.write_at(offset, &buf[..n]).await {
+                break Err(e);
+            }
             offset += n as u64;
             job.add_bytes(n as u64);
             tracker.tick(offset);
             let snap = tracker.snapshot(job.bytes_total());
             job.set_speed_bps(snap.current_bps as u64);
             job.set_eta_secs(snap.eta.map(|d| d.as_secs()).unwrap_or(0));
+        };
+
+        if let Err(e) = outcome {
+            let _ = dst.close().await;
+            // Don't leave a partial file behind — but only if this job
+            // created it; never remove a pre-existing file (Resume keeps
+            // its partial destination precisely so it can be resumed).
+            if created {
+                let _ = self.client.unlink(&dest).await;
+            }
+            return Err(e);
         }
         let _ = dst.close().await;
         Ok(())
@@ -209,28 +219,38 @@ impl Worker {
         ).await?;
 
         let total = job.bytes_total();
-        while offset < total || total == 0 {
+        let outcome: Result<(), ProxyError> = loop {
             if job.is_cancelled() || self.wait_while_paused(job).await {
-                let _ = src.close().await;
-                // Don't leave a partial file behind locally — but only if
-                // this job created it; never remove a pre-existing file.
-                if created {
-                    let _ = dst.flush().await;
-                    drop(dst);
-                    let _ = tokio::fs::remove_file(&dest).await;
-                }
-                return Err(ProxyError::Other("cancelled".into()));
+                break Err(ProxyError::Other("cancelled".into()));
             }
             let want = self.chunk_size as u32;
-            let data = src.read_at(offset, want).await?;
-            if data.is_empty() { break; }
-            dst.write_all(&data).await.map_err(|e| ProxyError::Other(e.to_string()))?;
+            let data = match src.read_at(offset, want).await {
+                Ok(d) => d,
+                Err(e) => break Err(e),
+            };
+            if data.is_empty() { break Ok(()); }
+            if let Err(e) = dst.write_all(&data).await {
+                break Err(ProxyError::Other(format!("write destination: {e}")));
+            }
             offset += data.len() as u64;
             job.add_bytes(data.len() as u64);
             tracker.tick(offset);
             let snap = tracker.snapshot(job.bytes_total());
             job.set_speed_bps(snap.current_bps as u64);
             job.set_eta_secs(snap.eta.map(|d| d.as_secs()).unwrap_or(0));
+        };
+
+        if let Err(e) = outcome {
+            let _ = src.close().await;
+            // Don't leave a partial file behind locally — but only if this
+            // job created it; never remove a pre-existing file (Resume keeps
+            // its partial destination precisely so it can be resumed).
+            if created {
+                let _ = dst.flush().await;
+                drop(dst);
+                let _ = tokio::fs::remove_file(&dest).await;
+            }
+            return Err(e);
         }
         let _ = src.close().await;
         dst.flush().await.map_err(|e| ProxyError::Other(e.to_string()))?;
