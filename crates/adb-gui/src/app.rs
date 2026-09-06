@@ -563,7 +563,24 @@ impl AdbshareApp {
             // --- Drain dir results ---
             let handles_dir = handles.clone();
             glib::spawn_future_local(async move {
-                while let Ok((_serial, path, result)) = dir_rx.recv().await {
+                while let Ok((serial, path, result)) = dir_rx.recv().await {
+                    // Drop listings that no longer match what the user is
+                    // looking at: a slow listing from device A (or from local
+                    // mode) must not overwrite the view after the user
+                    // switched to device B (or to a device from local mode).
+                    let expected = if handles_dir.browser.is_local_mode() {
+                        LOCAL_DEVICE.to_string()
+                    } else {
+                        match handles_dir.selected_device.lock().clone() {
+                            Some(d) => d,
+                            // Nothing selected: nothing may claim the view.
+                            None => continue,
+                        }
+                    };
+                    if serial != expected {
+                        tracing::debug!(stale = %serial, current = %expected, "dropped stale dir listing");
+                        continue;
+                    }
                     match result {
                         Ok(entries) => {
                             handles_dir.browser.show_path(path);
