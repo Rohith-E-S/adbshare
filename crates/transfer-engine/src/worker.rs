@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use adb_proxy::{OpenFlags, ProxyClient, ProxyError};
@@ -159,6 +160,9 @@ impl Worker {
         // A failed close may mean the device never durably received the
         // final chunks; report it instead of silently completing.
         dst.close().await.map_err(|e| ProxyError::Other(format!("close destination: {e}")))?;
+        if matches!(job.options.verify, super::job::VerifyMode::On) {
+            self.verify_transfer(job).await?;
+        }
         Ok(())
     }
 
@@ -220,7 +224,6 @@ impl Worker {
             0,
         ).await?;
 
-        let total = job.bytes_total();
         let outcome: Result<(), ProxyError> = loop {
             if job.is_cancelled() || self.wait_while_paused(job).await {
                 break Err(ProxyError::Other("cancelled".into()));
@@ -260,9 +263,57 @@ impl Worker {
         dst.flush().await.map_err(|e| ProxyError::Other(e.to_string()))?;
 
         if matches!(job.options.verify, super::job::VerifyMode::On) {
-            let _ = verify::verify_checksum(&dest, "").await;
+            self.verify_transfer(job).await?;
         }
         Ok(())
+    }
+
+    /// End-to-end verification: hash the local copy of the file and hash the
+    /// remote copy by re-reading it over the proxy protocol, then compare.
+    ///
+    /// What this guarantees: every byte that arrived on the receiving side
+    /// matches the other side as re-read at verification time — it catches
+    /// corruption in the transfer path (truncation, lost/mangled chunks,
+    /// partially applied writes).
+    ///
+    /// What this does NOT guarantee: if the device itself serves corrupt
+    /// data deterministically (bad storage), both reads agree and the
+    /// corruption is not detected. Job options carry no source checksum,
+    /// so there is no independent reference hash.
+    async fn verify_transfer(&self, job: &Job) -> Result<(), ProxyError> {
+        // Local side: push reads/writes source -> remote destination;
+        // pull reads/writes remote source -> local destination.
+        let (local, remote) = match job.direction {
+            Direction::Push => (&job.source, job.destination.to_string_lossy().into_owned()),
+            Direction::Pull => (&job.destination, job.source.to_string_lossy().into_owned()),
+        };
+        let local_hash = verify::sha256_file(local).await
+            .map_err(|e| ProxyError::Other(format!("verify: hashing local file failed: {e}")))?;
+        let remote_hash = self.hash_remote(&remote).await
+            .map_err(|e| ProxyError::Other(format!("verify: hashing remote file failed: {e}")))?;
+        if local_hash != remote_hash {
+            return Err(ProxyError::Other(format!(
+                "verify: checksum mismatch (local sha256 {local_hash}, remote sha256 {remote_hash})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read a remote file back in chunks and return its SHA-256.
+    async fn hash_remote(&self, path: &str) -> Result<String, ProxyError> {
+        let f = self.client.open(path, OpenFlags::READ, 0).await?;
+        let mut hasher = Sha256::new();
+        let mut offset: u64 = 0;
+        let want = self.chunk_size.min(u32::MAX as usize) as u32;
+        loop {
+            let data = f.read_at(offset, want).await?;
+            if data.is_empty() { break; }
+            hasher.update(&data);
+            offset += data.len() as u64;
+        }
+        let hash = hex::encode(hasher.finalize());
+        f.close().await.map_err(|e| ProxyError::Other(format!("close remote file: {e}")))?;
+        Ok(hash)
     }
 
     /// Pick a free "name (1).ext", "name (2).ext", ... path on the device.
