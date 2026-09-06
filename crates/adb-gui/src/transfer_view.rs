@@ -2,7 +2,7 @@
 
 use gtk4::prelude::*;
 use libadwaita as adw;
-use libadwaita::prelude::ActionRowExt;
+use libadwaita::prelude::{ActionRowExt, PreferencesRowExt};
 
 #[derive(Debug, Clone)]
 pub struct JobInfo {
@@ -130,6 +130,9 @@ impl TransferView {
                 .subtitle(&j.status_text())
                 .build();
             row.add_css_class("transfer-card");
+            // Row titles embed raw file names: plain text so names with
+            // Pango markup characters render correctly.
+            row.set_use_markup(false);
             let progress = gtk4::ProgressBar::builder()
                 .fraction(j.fraction().clamp(0.0, 1.0))
                 .valign(gtk4::Align::Center)

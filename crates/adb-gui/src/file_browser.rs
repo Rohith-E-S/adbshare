@@ -1058,6 +1058,9 @@ impl FileBrowser {
                 .build();
             row.add_css_class("file-row");
             row.set_widget_name(&e.name);
+            // AdwPreferencesRow parses Pango markup by default; raw file
+            // names containing & < > would break rendering.
+            row.set_use_markup(false);
 
             let icon = match asset_icon_for(&e)
                 .and_then(|name| asset_icon_dir().map(|dir| dir.join(name)))
@@ -2466,6 +2469,11 @@ fn show_properties_dialog(
     let row_path = adw::ActionRow::builder().title("Location").subtitle(full_path.to_string_lossy().as_ref()).build();
     let row_date = adw::ActionRow::builder().title("Modified").subtitle(&entry.display_date()).build();
     let row_mode = adw::ActionRow::builder().title("Permissions").subtitle(format!("{:#o}", entry.mode & 0o7777)).build();
+
+    // The name/location rows receive raw file names and paths: switch the
+    // rows to plain text so names with &, < or > render correctly.
+    row_name.set_use_markup(false);
+    row_path.set_use_markup(false);
 
     group.add(&row_name);
     group.add(&row_type);
