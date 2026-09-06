@@ -392,17 +392,25 @@ impl AdbshareApp {
             // Drop files from other apps onto the canvas -> push/copy into
             // the directory being browsed.
             let (drop_tx, drop_rx) = async_channel::unbounded::<(PathBuf, Vec<PathBuf>)>();
+            // Accept both a single gio::File and a GdkFileList: multi-file
+            // drags (e.g. from Nautilus) deliver a GdkFileList, and matching
+            // only the File GType dropped every file but the first.
             let drop_target = gtk4::DropTarget::new(gtk4::gio::File::static_type(), gdk4::DragAction::COPY);
+            drop_target.set_types(&[gtk4::gio::File::static_type(), gdk4::FileList::static_type()]);
             let browser_drop = browser.clone();
             drop_target.connect_drop(move |_target, value, _x, _y| {
-                if let Ok(file) = value.get::<gtk4::gio::File>() {
-                    if let Some(src) = file.path() {
-                        let curr = browser_drop.current_path();
-                        let _ = drop_tx.try_send((curr.clone(), vec![src]));
-                        return true;
-                    }
+                let mut paths: Vec<PathBuf> = Vec::new();
+                if let Ok(list) = value.get::<gdk4::FileList>() {
+                    paths.extend(list.files().iter().filter_map(|f| f.path()));
+                } else if let Ok(file) = value.get::<gtk4::gio::File>() {
+                    paths.extend(file.path());
                 }
-                false
+                if paths.is_empty() {
+                    return false;
+                }
+                let curr = browser_drop.current_path();
+                let _ = drop_tx.try_send((curr, paths));
+                true
             });
             browser.root.add_controller(drop_target);
 
