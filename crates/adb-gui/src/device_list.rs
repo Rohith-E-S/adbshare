@@ -24,7 +24,7 @@ pub enum SidebarEvent {
 }
 
 /// A device as reported by the daemon (`list_devices` + `device_info`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceEntry {
     pub serial: String,
     pub model: Option<String>,
@@ -200,6 +200,9 @@ pub struct DeviceList {
     phone_folders_box: gtk4::ListBox,
     phone_hint: gtk4::Label,
     on_event: Rc<RefCell<Option<Box<dyn Fn(SidebarEvent)>>>>,
+    /// The last (devices, selected) pair applied, so unchanged 3-second
+    /// polls skip the wholesale rebuild.
+    last_applied: RefCell<Option<(Vec<DeviceEntry>, Option<String>)>>,
 }
 
 impl DeviceList {
@@ -333,6 +336,7 @@ impl DeviceList {
             phone_folders_box,
             phone_hint: hint,
             on_event,
+            last_applied: RefCell::new(None),
         }
     }
 
@@ -358,6 +362,13 @@ impl DeviceList {
 
     /// Replace the phone list. Empty => onboarding steps.
     pub fn set_devices(&self, devices: &[DeviceEntry], selected: Option<&str>) {
+        // The poll fires every 3s; skip the wholesale rebuild (which loses
+        // hover/focus and flickers) when nothing actually changed.
+        let next = (devices.to_vec(), selected.map(|s| s.to_string()));
+        if self.last_applied.borrow().as_ref() == Some(&next) {
+            return;
+        }
+        *self.last_applied.borrow_mut() = Some(next);
         while let Some(child) = self.device_list_box.first_child() {
             self.device_list_box.remove(&child);
         }
