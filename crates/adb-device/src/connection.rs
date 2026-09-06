@@ -20,7 +20,7 @@ use tokio::{
 };
 
 use crate::error::{AdbError, Result};
-use crate::packet::{Message, Command};
+use crate::packet::{Message, Command, MAX_PAYLOAD};
 
 pub type LocalId = u32;
 pub type RemoteId = u32;
@@ -28,18 +28,24 @@ pub type RemoteId = u32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub LocalId, pub RemoteId);
 
-/// A pending WRTE for a specific local stream id.
-struct PendingWrite {
-    local: LocalId,
-    payload: Bytes,
+/// A request for the connection's writer task.
+enum WriteReq {
+    /// A complete protocol frame (OPEN, CLSE, OKAY, ...) to put on the wire
+    /// as-is.
+    Frame(Message),
+    /// Stream payload to be wrapped in a WRTE frame.
+    Data { local: LocalId, remote: RemoteId, payload: Bytes },
 }
+
+/// How long to wait for the device's OKAY after sending OPEN.
+const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Open ADB stream. `AsyncRead + AsyncWrite` to the device-side endpoint.
 pub struct Stream {
     id: StreamId,
     rx: mpsc::Receiver<Bytes>,
     incoming: Arc<PlMutex<Option<Bytes>>>,
-    write_tx: mpsc::Sender<PendingWrite>,
+    write_tx: mpsc::Sender<WriteReq>,
     close_tx: Option<oneshot::Sender<StreamId>>,
 }
 
@@ -83,17 +89,39 @@ impl AsyncRead for Stream {
 impl AsyncWrite for Stream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let chunk = Bytes::copy_from_slice(buf);
-        let len = chunk.len();
-        let msg = PendingWrite { local: self.id.0, payload: chunk };
-        match self.write_tx.try_send(msg) {
-            Ok(()) => Poll::Ready(Ok(len)),
-            Err(mpsc::error::TrySendError::Full(_)) => Poll::Pending,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "conn closed")))
+        // Reserve a slot in the writer queue *before* building the request.
+        // If the queue is full we must not just return Pending: nothing
+        // would ever re-poll this task again. Instead, spawn a helper that
+        // holds a permit reservation and wakes us once capacity frees up,
+        // mirroring the pattern used by the transport's ChannelWriter.
+        match self.write_tx.try_reserve() {
+            Ok(permit) => {
+                let chunk = Bytes::copy_from_slice(buf);
+                let len = chunk.len();
+                permit.send(WriteReq::Data {
+                    local: self.id.0,
+                    remote: self.id.1,
+                    payload: chunk,
+                });
+                Poll::Ready(Ok(len))
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let waker = cx.waker().clone();
+                let tx = self.write_tx.clone();
+                tokio::spawn(async move {
+                    let _permit = tx.reserve().await;
+                    waker.wake();
+                });
+                Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection writer closed",
+                )))
             }
         }
     }
@@ -120,8 +148,10 @@ pub struct AdbConnection {
     next_local: Mutex<LocalId>,
     streams: Arc<PlMutex<HashMap<LocalId, mpsc::Sender<Bytes>>>>,
     pending_opens: Arc<PlMutex<HashMap<LocalId, oneshot::Sender<Result<StreamId>>>>>,
-    write_tx: mpsc::Sender<PendingWrite>,
+    write_tx: mpsc::Sender<WriteReq>,
     close_tx: Option<oneshot::Sender<()>>,
+    /// Signals the reader task to shut down; fired from `Drop`.
+    reader_close_tx: Option<oneshot::Sender<()>>,
 }
 
 impl AdbConnection {
@@ -130,7 +160,7 @@ impl AdbConnection {
         reader: Arc<Mutex<Box<dyn AsyncRead + Send + Unpin>>>,
         writer: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     ) -> Result<Self> {
-        let (write_tx, mut write_rx) = mpsc::channel::<PendingWrite>(2048);
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteReq>(2048);
         let (close_tx, close_rx) = oneshot::channel::<()>();
         let streams: Arc<PlMutex<HashMap<LocalId, mpsc::Sender<Bytes>>>> =
             Arc::new(PlMutex::new(HashMap::new()));
@@ -138,16 +168,32 @@ impl AdbConnection {
             Arc::new(PlMutex::new(HashMap::new()));
         let streams_r = streams.clone();
         let pending_opens_r = pending_opens.clone();
+        let write_tx_r = write_tx.clone();
+        let (reader_close_tx, mut reader_close_rx) = oneshot::channel::<()>();
 
         // Reader task: dispatch frames to per-stream channels; resolve OPEN replies.
         tokio::spawn(async move {
             let mut reader = reader.lock().await;
             loop {
                 let mut header = [0u8; Message::HEADER_LEN];
-                if reader.read_exact(&mut header).await.is_err() {
-                    break;
+                // The reader pins the transport's read half, so it must exit
+                // when the connection is dropped, not only on I/O errors.
+                tokio::select! {
+                    _ = &mut reader_close_rx => break,
+                    res = reader.read_exact(&mut header) => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
                 }
                 let len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+                if len > MAX_PAYLOAD {
+                    // The claimed length is attacker-controlled; honouring it
+                    // blindly would let a hostile peer wedge us with a ~4 GiB
+                    // allocation. This is unrecoverable framing corruption.
+                    tracing::error!(len, "frame exceeds MAX_PAYLOAD; dropping connection");
+                    break;
+                }
                 let mut payload = BytesMut::with_capacity(len);
                 if len > 0 {
                     payload.resize(len, 0);
@@ -161,14 +207,17 @@ impl AdbConnection {
                 };
                 match msg.command {
                     Command::Okay => {
-                        let local = msg.arg0;
-                        let remote = msg.arg1;
+                        // In device->host messages our local id is in arg1 and
+                        // the device's id is in arg0 (the mirror image of
+                        // host->device frames).
+                        let local = msg.arg1;
+                        let remote = msg.arg0;
                         if let Some(tx) = pending_opens_r.lock().remove(&local) {
                             let _ = tx.send(Ok(StreamId(local, remote)));
                         }
                     }
                     Command::Close => {
-                        let local = msg.arg0;
+                        let local = msg.arg1;
                         if let Some(tx) = pending_opens_r.lock().remove(&local) {
                             let _ = tx.send(Err(AdbError::InvalidResponse("CLSE on OPEN".into())));
                         }
@@ -176,8 +225,35 @@ impl AdbConnection {
                     }
                     Command::Write => {
                         let local = msg.arg1;
-                        if let Some(tx) = streams_r.lock().get(&local) {
-                            let _ = tx.try_send(msg.payload);
+                        // Clone the sender out so the map lock (a blocking
+                        // parking_lot lock) is never held across an await.
+                        let Some(tx) = streams_r.lock().get(&local).cloned() else {
+                            continue;
+                        };
+                        // Apply backpressure: wait for a slot in the stream's
+                        // data channel instead of silently dropping the
+                        // payload when all 256 slots are full. Note this
+                        // head-of-line blocks the connection on a slow
+                        // consumer, which mirrors how a single ADB transport
+                        // is flow-controlled.
+                        if tx.send(msg.payload).await.is_err() {
+                            // The Stream end went away without closing:
+                            // unregister the stream and tell the device.
+                            streams_r.lock().remove(&local);
+                            let clse = Message::new(Command::Close, local, msg.arg0, Bytes::new());
+                            if write_tx_r.send(WriteReq::Frame(clse)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        // ADB flow control: every received WRTE must be
+                        // acknowledged with an OKAY, otherwise adbd stalls
+                        // after sending a single data packet per stream.
+                        // arg0 = our local (source) id, arg1 = the device's
+                        // (destination) id, which is the WRTE's arg0.
+                        let okay = Message::new(Command::Okay, local, msg.arg0, Bytes::new());
+                        if write_tx_r.send(WriteReq::Frame(okay)).await.is_err() {
+                            break;
                         }
                     }
                     _ => {}
@@ -194,8 +270,15 @@ impl AdbConnection {
                 tokio::select! {
                     _ = &mut close_rx => break,
                     maybe = write_rx.recv() => {
-                        let Some(p) = maybe else { break; };
-                        let frame = Message::new(Command::Write, p.local, 0, p.payload);
+                        let Some(req) = maybe else { break; };
+                        // WRTE frames carry the *device-side* (remote) id in
+                        // arg1 and our local id in arg0.
+                        let frame = match req {
+                            WriteReq::Frame(m) => m,
+                            WriteReq::Data { local, remote, payload } => {
+                                Message::new(Command::Write, local, remote, payload)
+                            }
+                        };
                         if writer.write_all(&frame.encode()).await.is_err() { break; }
                         if writer.flush().await.is_err() { break; }
                     }
@@ -214,10 +297,18 @@ impl AdbConnection {
             pending_opens,
             write_tx,
             close_tx: Some(close_tx),
+            reader_close_tx: Some(reader_close_tx),
         })
     }
 
     pub fn serial(&self) -> &str { &self.serial }
+
+    /// Abort an in-flight open: drop the pending reply slot and the
+    /// pre-registered data channel for `local`.
+    fn abort_open(&self, local: LocalId) {
+        self.pending_opens.lock().remove(&local);
+        self.streams.lock().remove(&local);
+    }
 
     pub async fn open_stream(&self, dest: &str) -> Result<Stream> {
         let local = {
@@ -226,6 +317,13 @@ impl AdbConnection {
             *n
         };
         let (open_tx, open_rx) = oneshot::channel::<Result<StreamId>>();
+        let (data_tx, data_rx) = mpsc::channel::<Bytes>(256);
+
+        // Register the data channel *before* the OPEN goes out: the device
+        // may send WRTE immediately after its OKAY, and registering only
+        // after the reply is observed would drop that early data. If the
+        // open fails, abort_open() removes the entry again.
+        self.streams.lock().insert(local, data_tx);
         self.pending_opens.lock().insert(local, open_tx);
 
         // Send OPEN frame.
@@ -235,25 +333,39 @@ impl AdbConnection {
             0,
             Bytes::copy_from_slice(dest.as_bytes()),
         );
-        self.write_tx
-            .send(PendingWrite { local, payload: open.encode().freeze() })
-            .await
-            .map_err(|_| AdbError::Disconnected)?;
+        if self.write_tx.send(WriteReq::Frame(open)).await.is_err() {
+            self.abort_open(local);
+            return Err(AdbError::Disconnected);
+        }
 
-        let stream_id = open_rx.await.map_err(|_| AdbError::Disconnected)??;
-
-        let (data_tx, data_rx) = mpsc::channel::<Bytes>(256);
-        self.streams.lock().insert(local, data_tx);
-
+        let stream_id = match tokio::time::timeout(OPEN_TIMEOUT, open_rx).await {
+            Ok(Ok(Ok(id))) => id,
+            Ok(Ok(Err(e))) => {
+                self.abort_open(local);
+                return Err(e);
+            }
+            // Reply channel dropped: the reader task is gone.
+            Ok(Err(_)) => {
+                self.abort_open(local);
+                return Err(AdbError::Disconnected);
+            }
+            // Device never acknowledged the OPEN.
+            Err(_) => {
+                self.abort_open(local);
+                return Err(AdbError::Timeout);
+            }
+        };
         let (close_tx, mut close_rx) = oneshot::channel::<StreamId>();
         let streams_for_close = self.streams.clone();
+        let write_tx_for_close = self.write_tx.clone();
         tokio::spawn(async move {
-            if let Ok(_id) = close_rx.await {
-                streams_for_close.lock().remove(&local);
-                // Send CLSE frame.
-                let clse = Message::new(Command::Close, local, 0, Bytes::new());
-                // Best-effort; if writer is gone we just drop.
-                let _ = clse;
+            if let Ok(id) = close_rx.await {
+                streams_for_close.lock().remove(&id.0);
+                // CLSE: arg0 = our local (source) id, arg1 = the device's
+                // (destination) id. Best-effort: if the writer is gone the
+                // connection is dead anyway.
+                let clse = Message::new(Command::Close, id.0, id.1, Bytes::new());
+                let _ = write_tx_for_close.send(WriteReq::Frame(clse)).await;
             }
         });
 
@@ -264,5 +376,20 @@ impl AdbConnection {
             write_tx: self.write_tx.clone(),
             close_tx: Some(close_tx),
         })
+    }
+}
+
+impl Drop for AdbConnection {
+    fn drop(&mut self) {
+        // Signal both background tasks. The writer also exits when the write
+        // queue closes, but the reader holds the transport's read half and
+        // would otherwise keep it pinned (and keep reading frames) forever
+        // after the connection is dropped.
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.reader_close_tx.take() {
+            let _ = tx.send(());
+        }
     }
 }

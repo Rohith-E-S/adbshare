@@ -16,9 +16,20 @@
 //!
 //! Commands: A_SYNC, A_CNXN, A_OPEN, A_OKAY, A_CLSE, A_WRTE, A_AUTH.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 pub const ADB_VERSION: u32 = 0x01000000;
+
+/// Maximum payload size we will ever allocate for or accept in a single frame.
+///
+/// 256 KiB is the classic ADB `MAX_PAYLOAD`. The precise limit is negotiated
+/// per-connection in the CNXN handshake (`max_payload`), but that value lives
+/// in the transport layer and is not plumbed through yet; until it is, this
+/// constant bounds how large a frame the reader will trust. Frames claiming a
+/// larger `data_length` are treated as a protocol error: trusting the wire
+/// value would let a hostile or glitching peer demand a ~4 GiB allocation and
+/// wedge the connection.
+pub const MAX_PAYLOAD: usize = 256 * 1024;
 
 pub const A_SYNC: u32 = 0x434e5953;
 pub const A_CNXN: u32 = 0x4e584e43;
@@ -86,17 +97,34 @@ impl Message {
     }
 
     pub fn encode(&self) -> BytesMut {
+        // `encode` cannot change signature without breaking callers outside
+        // this crate; it now fails loudly instead of silently truncating a
+        // payload >4 GiB into a bogus 32-bit length. Prefer `try_encode` for
+        // fallible handling.
+        self.try_encode().expect("payload exceeds the 32-bit ADB data_length field")
+    }
+
+    /// Like [`Message::encode`], but returns an error instead of panicking
+    /// when the payload is too large for the 32-bit `data_length` header
+    /// field (`u32::try_from` instead of an `as u32` cast that silently
+    /// truncates).
+    pub fn try_encode(&self) -> crate::Result<BytesMut> {
+        let len = u32::try_from(self.payload.len()).map_err(|_| {
+            crate::AdbError::Protocol(format!(
+                "payload length {} exceeds the 32-bit ADB data_length field",
+                self.payload.len()
+            ))
+        })?;
         let mut buf = BytesMut::with_capacity(Self::HEADER_LEN + self.payload.len());
         buf.put_u32_le(self.command.as_u32());
         buf.put_u32_le(self.arg0);
         buf.put_u32_le(self.arg1);
-        let len = self.payload.len() as u32;
         buf.put_u32_le(len);
-        let crc = crc32(&self.payload);
+        let crc = data_checksum(&self.payload);
         buf.put_u32_le(crc);
         buf.put_u32_le(self.command.as_u32() ^ 0xFFFF_FFFF);
         buf.extend_from_slice(&self.payload);
-        buf
+        Ok(buf)
     }
 
     pub fn decode(header: &[u8; Self::HEADER_LEN], payload: Bytes) -> crate::Result<Self> {
@@ -107,7 +135,6 @@ impl Message {
         let data_length = u32::from_le_bytes([h[12], h[13], h[14], h[15]]);
         let data_crc = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
         let magic = u32::from_le_bytes([h[20], h[21], h[22], h[23]]);
-        let _ = h.get_u32_le();
 
         let command = Command::from_u32(command)
             .ok_or_else(|| crate::AdbError::InvalidResponse(format!("unknown command 0x{:08x}", command)))?;
@@ -122,7 +149,7 @@ impl Message {
                 data_length
             )));
         }
-        let actual_crc = crc32(&payload);
+        let actual_crc = data_checksum(&payload);
         if actual_crc != data_crc {
             return Err(crate::AdbError::InvalidResponse(format!(
                 "crc mismatch: got {:08x}, want {:08x}",
@@ -134,23 +161,13 @@ impl Message {
     }
 }
 
-pub fn crc32(data: &[u8]) -> u32 {
-    // ADB uses a custom CRC32 with polynomial 0x04C11DB7 and an initial value of 0xFFFFFFFF.
-    // We use the `crc32fast` crate's algorithm with the right polynomial via manual table
-    // generation. To keep zero-deps, here is a hand-rolled table-less implementation.
-    const POLY: u32 = 0x04C1_1DB7;
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= (b as u32) << 24;
-        for _ in 0..8 {
-            if crc & 0x8000_0000 != 0 {
-                crc = (crc << 1) ^ POLY;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc ^ 0xFFFF_FFFF
+/// ADB's `data_crc32` header field.
+///
+/// Despite the name, this is *not* a CRC: adbd computes it as a plain additive
+/// byte sum (`sum += byte` over the payload, wrapping at 32 bits). See
+/// `PROTOCOL.txt` in the AOSP adb tree ("the crc is the sum of all bytes").
+pub fn data_checksum(data: &[u8]) -> u32 {
+    data.iter().fold(0u32, |a, &b| a.wrapping_add(b as u32))
 }
 
 #[cfg(test)]
@@ -158,12 +175,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crc32_known() {
-        // From AOSP adb protocol doc, "host:version" payload.
-        let v = crc32(b"host:version");
-        // We don't pin to a specific value here — just that it doesn't panic and is stable.
-        let v2 = crc32(b"host:version");
-        assert_eq!(v, v2);
+    fn data_checksum_known_answers() {
+        // Additive byte sum, so empty input is 0 and "hello" sums to
+        // 104+101+108+108+111 = 532 = 0x214.
+        assert_eq!(data_checksum(b""), 0);
+        assert_eq!(data_checksum(b"hello"), 0x214);
+        // "host:version" from the AOSP adb protocol doc.
+        assert_eq!(data_checksum(b"host:version"), 1278);
+    }
+
+    #[test]
+    fn try_encode_matches_encode() {
+        let msg = Message::new(Command::Open, 7, 0, Bytes::from_static(b"shell:"));
+        assert_eq!(msg.try_encode().unwrap(), msg.encode());
     }
 
     #[test]
