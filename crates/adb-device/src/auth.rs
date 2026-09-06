@@ -198,11 +198,54 @@ fn ssh_pub_from_pkcs8(pkcs8_der: &[u8]) -> Result<Vec<u8>> {
     let e = key.e().to_bytes_be();
 
     // SSH wire format: string "ssh-rsa", mpint e, mpint n.
-    let mut out = Vec::new();
-    push_ssh_string(&mut out, b"ssh-rsa");
-    push_ssh_mpint(&mut out, &e);
-    push_ssh_mpint(&mut out, &n);
+    let mut wire = Vec::new();
+    push_ssh_string(&mut wire, b"ssh-rsa");
+    push_ssh_mpint(&mut wire, &e);
+    push_ssh_mpint(&mut wire, &n);
+
+    // Android adbd expects the "Android public key" text format:
+    //   base64(ssh-rsa-blob) + " " + user@host + '\0'
+    // The payload sent as AUTH RSAPUBLICKEY must include the trailing NUL.
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let host = current_hostname();
+    let mut out = base64_encode(&wire).into_bytes();
+    out.extend_from_slice(format!(" {user}@{host}\0").as_bytes());
     Ok(out)
+}
+
+fn current_hostname() -> String {
+    // HOSTNAME is set by most shells; fall back to the kernel hostname file
+    // (nix's gethostname() is gated behind a feature we can't enable here
+    // without adding a dependency feature).
+    std::env::var("HOSTNAME").ok()
+        .or_else(|| {
+            fs::read_to_string("/proc/sys/kernel/hostname")
+                .or_else(|_| fs::read_to_string("/etc/hostname"))
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// Minimal standard-alphabet base64 encoder (no padding-skipping shortcuts).
+/// Hand-rolled because this crate has no base64 dependency.
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 fn push_ssh_string(out: &mut Vec<u8>, s: &[u8]) {
@@ -211,13 +254,18 @@ fn push_ssh_string(out: &mut Vec<u8>, s: &[u8]) {
 }
 
 fn push_ssh_mpint(out: &mut Vec<u8>, bytes: &[u8]) {
-    let padded = if bytes.first().map_or(false, |b| *b & 0x80 != 0) {
-        let mut v = Vec::with_capacity(bytes.len() + 1);
-        v.push(0);
-        v.extend_from_slice(bytes);
-        v
+    // Per RFC 4251 the stored value must be minimal: strip redundant leading
+    // zero bytes, then prepend a single zero byte if the high bit is set
+    // (to mark the number as positive).
+    let mut v = bytes;
+    while v.len() > 1 && v[0] == 0 {
+        v = &v[1..];
+    }
+    if v.first().map_or(false, |b| *b & 0x80 != 0) {
+        out.extend_from_slice(&((v.len() + 1) as u32).to_be_bytes());
+        out.push(0);
+        out.extend_from_slice(v);
     } else {
-        bytes.to_vec()
-    };
-    push_ssh_string(out, &padded);
+        push_ssh_string(out, v);
+    }
 }
