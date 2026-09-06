@@ -383,6 +383,10 @@ impl Filesystem for Adbfs {
         };
         let mut cur = offset.max(0) as usize;
         if cur == 0 { let _ = reply.add(ino, 1, FileType::Directory, "."); cur = 1; }
+        // NOTE: `..` is advertised with FUSE_ROOT_ID, not the real parent
+        // inode. The kernel resolves parents through its own dentry cache,
+        // so this works in practice; reworking parent inode tracking is a
+        // separate change.
         if cur == 1 { let _ = reply.add(FUSE_ROOT_ID, 2, FileType::Directory, ".."); cur = 2; }
         for (n, entry) in entries.into_iter().enumerate().skip(cur.saturating_sub(2)) {
             let child_path = {
@@ -392,7 +396,13 @@ impl Filesystem for Adbfs {
             };
             let child_ino = self.ino_for(child_path.clone());
             self.cache.put(child_path, entry.stat);
-            let kind = if entry.stat.mode.is_dir() { FileType::Directory } else { FileType::RegularFile };
+            let kind = if entry.stat.mode.is_dir() {
+                FileType::Directory
+            } else if entry.stat.mode.is_symlink() {
+                FileType::Symlink
+            } else {
+                FileType::RegularFile
+            };
             let _ = reply.add(child_ino, (n as i64) + 3, kind, entry.name);
         }
         reply.ok();
