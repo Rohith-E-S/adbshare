@@ -310,13 +310,15 @@ impl AdbConnection {
 
         let (close_tx, mut close_rx) = oneshot::channel::<StreamId>();
         let streams_for_close = self.streams.clone();
+        let write_tx_for_close = self.write_tx.clone();
         tokio::spawn(async move {
-            if let Ok(_id) = close_rx.await {
-                streams_for_close.lock().remove(&local);
-                // Send CLSE frame.
-                let clse = Message::new(Command::Close, local, 0, Bytes::new());
-                // Best-effort; if writer is gone we just drop.
-                let _ = clse;
+            if let Ok(id) = close_rx.await {
+                streams_for_close.lock().remove(&id.0);
+                // CLSE: arg0 = our local (source) id, arg1 = the device's
+                // (destination) id. Best-effort: if the writer is gone the
+                // connection is dead anyway.
+                let clse = Message::new(Command::Close, id.0, id.1, Bytes::new());
+                let _ = write_tx_for_close.send(WriteReq::Frame(clse)).await;
             }
         });
 
