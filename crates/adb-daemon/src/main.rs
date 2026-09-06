@@ -234,7 +234,7 @@ const ADB_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Run `adb <args>` with a hard timeout so a hung device or adb server can't
 /// stall the single watcher task. Returns the command's exit status.
 async fn adb_run(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
-    tokio::time::timeout(timeout, Command::new("adb").args(args).status())
+    tokio::time::timeout(timeout, Command::new("adb").args(args).kill_on_drop(true).status())
         .await
         .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
         .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
@@ -242,7 +242,7 @@ async fn adb_run(args: &[&str], timeout: Duration) -> anyhow::Result<std::proces
 
 /// `adb_run` variant that captures stdout/stderr.
 async fn adb_run_output(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::Output> {
-    tokio::time::timeout(timeout, Command::new("adb").args(args).output())
+    tokio::time::timeout(timeout, Command::new("adb").args(args).kill_on_drop(true).output())
         .await
         .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
         .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
@@ -339,6 +339,7 @@ async fn setup(
         ADB_CMD_TIMEOUT,
         Command::new("adb")
             .args(["-s", device.as_str(), "shell", &proxy_cmd])
+            .kill_on_drop(true)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status(),
@@ -492,7 +493,10 @@ fn is_wireless_serial(serial: &str) -> bool {
 async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        Command::new("adb").args(["-s", serial, "shell", cmd]).output(),
+        Command::new("adb")
+            .args(["-s", serial, "shell", cmd])
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("adb shell timed out"))??;
@@ -606,7 +610,7 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
 async fn adb_version() -> anyhow::Result<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        Command::new("adb").arg("version").output(),
+        Command::new("adb").arg("version").kill_on_drop(true).output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("adb version timed out"))??;
@@ -809,7 +813,10 @@ impl ManagerInterface {
         }
         let out = tokio::time::timeout(
             Duration::from_secs(10),
-            Command::new("adb").args(["connect", address]).output(),
+            Command::new("adb")
+                .args(["connect", address])
+                .kill_on_drop(true)
+                .output(),
         )
         .await
         .map_err(|_| zbus::fdo::Error::Failed(format!("adb connect {address} timed out")))?
