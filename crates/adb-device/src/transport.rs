@@ -241,13 +241,16 @@ fn open_usb_pump(
         })?;
 
     // Wrap mpsc receivers/senders as AsyncRead/AsyncWrite.
-    let reader = ChannelReader { rx: rx_to_app };
+    let reader = ChannelReader { rx: rx_to_app, pending: None };
     let writer = ChannelWriter { tx: tx_from_app };
     Ok((Box::new(reader), Box::new(writer)))
 }
 
 struct ChannelReader {
     rx: mpsc::Receiver<bytes::Bytes>,
+    /// Leftover bytes from a USB chunk that exceeded the caller's read buffer.
+    /// These must be served before pulling a new chunk, otherwise data is lost.
+    pending: Option<bytes::Bytes>,
 }
 
 impl tokio::io::AsyncRead for ChannelReader {
@@ -263,19 +266,29 @@ impl tokio::io::AsyncRead for ChannelReader {
             if unfilled == 0 {
                 return Poll::Ready(Ok(()));
             }
+            // Serve leftover bytes from a previously oversized chunk first.
+            if let Some(mut pending) = this.pending.take() {
+                let take = pending.len().min(unfilled);
+                buf.put_slice(&pending[..take]);
+                total += take;
+                if take < pending.len() {
+                    this.pending = Some(pending.split_off(take));
+                }
+                if total >= unfilled {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
+            }
             match this.rx.try_recv() {
                 Ok(mut chunk) => {
                     let take = chunk.len().min(unfilled);
                     buf.put_slice(&chunk[..take]);
                     total += take;
                     if take < chunk.len() {
-                        // Buffer the rest for next poll by re-sending; but try_recv is
-                        // one-shot, so instead, store the remainder.
+                        // Keep the remainder for the next poll_read; every 24-byte
+                        // ADB header read leaves ~4KB of a 64KB USB transfer behind.
                         let rest = chunk.split_off(take);
-                        // If there's still a pending remainder, prepend by sending it
-                        // back to ourselves. We use a oneshot for simplicity.
-                        let _ = rest;
-                        // Just drop the rest for now (extremely rare; packets are 64KB).
+                        this.pending = Some(rest);
                         return Poll::Ready(Ok(()));
                     }
                     if total >= unfilled {
