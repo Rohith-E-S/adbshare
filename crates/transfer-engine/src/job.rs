@@ -124,9 +124,58 @@ impl Job {
     pub fn resume(&self) { self.paused.store(false, Ordering::Relaxed); }
     pub fn is_paused(&self) -> bool { self.paused.load(Ordering::Relaxed) }
 
+    /// Fraction of the transfer completed, clamped to [0.0, 1.0].
+    ///
+    /// When the total size is unknown (or the file is genuinely 0 bytes),
+    /// a completed job reports 1.0; anything still in progress reports 0.0.
     pub fn progress_frac(&self) -> f64 {
         let total = self.bytes_total();
-        if total == 0 { return 0.0; }
-        (self.bytes_done() as f64) / (total as f64)
+        let frac = if total == 0 {
+            match self.state() {
+                JobState::Completed => 1.0,
+                _ => 0.0,
+            }
+        } else {
+            (self.bytes_done() as f64) / (total as f64)
+        };
+        frac.clamp(0.0, 1.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_job(direction: Direction, source: &str, destination: &str) -> Self {
+        Self::new(
+            0,
+            direction,
+            PathBuf::from(source),
+            PathBuf::from(destination),
+            JobOptions::default(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_frac_completed_zero_byte_file() {
+        let job = Job::test_job(Direction::Push, "/src/a", "/dst/a");
+        job.set_total(0);
+        job.set_state(JobState::Running);
+        assert_eq!(job.progress_frac(), 0.0);
+        job.set_state(JobState::Completed);
+        assert_eq!(job.progress_frac(), 1.0);
+    }
+
+    #[test]
+    fn progress_frac_is_clamped() {
+        let job = Job::test_job(Direction::Push, "/src/a", "/dst/a");
+        job.set_total(100);
+        job.add_bytes(250); // over-counted bytes must not exceed 1.0
+        assert_eq!(job.progress_frac(), 1.0);
+        let job2 = Job::test_job(Direction::Push, "/src/b", "/dst/b");
+        job2.set_total(100);
+        job2.add_bytes(50);
+        assert!((job2.progress_frac() - 0.5).abs() < 1e-9);
     }
 }
