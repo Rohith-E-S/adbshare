@@ -373,6 +373,10 @@ pub struct FileBrowser {
     entries: Rc<RefCell<Vec<DirEntry>>>,
     history_back: Rc<RefCell<Vec<PathBuf>>>,
     history_forward: Rc<RefCell<Vec<PathBuf>>>,
+    /// Set while a go_back/go_forward-initiated navigation is in flight, so
+    /// show_path does not push the abandoned path back onto the opposite
+    /// stack (which would make Back oscillate between two directories).
+    navigating_history: Rc<Cell<bool>>,
     search_query: Rc<RefCell<String>>,
     on_event: Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>>,
 }
@@ -646,6 +650,7 @@ impl FileBrowser {
         let entries = Rc::new(RefCell::new(Vec::new()));
         let history_back = Rc::new(RefCell::new(Vec::new()));
         let history_forward = Rc::new(RefCell::new(Vec::new()));
+        let navigating_history = Rc::new(Cell::new(false));
         let search_query = Rc::new(RefCell::new(String::new()));
         let on_event: Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>> = Rc::new(RefCell::new(None));
         let view_mode = Rc::new(RefCell::new(ViewMode::Grid));
@@ -702,6 +707,7 @@ impl FileBrowser {
             entries,
             history_back,
             history_forward,
+            navigating_history,
             search_query,
             on_event,
         };
@@ -890,6 +896,8 @@ impl FileBrowser {
     pub fn go_back(&self) {
         if let Some(prev) = self.history_back.borrow_mut().pop() {
             self.history_forward.borrow_mut().push(self.current_path.borrow().clone());
+            // show_path must not re-push the abandoned path onto history_back.
+            self.navigating_history.set(true);
             if let Some(cb) = self.on_event.borrow().as_ref() {
                 cb(BrowserEvent::Navigate(prev));
             }
@@ -901,6 +909,8 @@ impl FileBrowser {
     pub fn go_forward(&self) {
         if let Some(next) = self.history_forward.borrow_mut().pop() {
             self.history_back.borrow_mut().push(self.current_path.borrow().clone());
+            // show_path must not re-push the abandoned path onto history_back.
+            self.navigating_history.set(true);
             if let Some(cb) = self.on_event.borrow().as_ref() {
                 cb(BrowserEvent::Navigate(next));
             }
@@ -1048,6 +1058,9 @@ impl FileBrowser {
                 .build();
             row.add_css_class("file-row");
             row.set_widget_name(&e.name);
+            // AdwPreferencesRow parses Pango markup by default; raw file
+            // names containing & < > would break rendering.
+            row.set_use_markup(false);
 
             let icon = match asset_icon_for(&e)
                 .and_then(|name| asset_icon_dir().map(|dir| dir.join(name)))
@@ -1231,8 +1244,16 @@ impl FileBrowser {
 
     pub fn show_path(&self, path: PathBuf) {
         let old_path = self.current_path.borrow().clone();
-        if old_path != path && old_path != PathBuf::from("") {
+        // When the navigation originated from go_back/go_forward, the
+        // abandoned path was already pushed onto the opposite stack there;
+        // pushing it again here would make Back/Forward oscillate between
+        // two directories instead of walking the history.
+        let from_history = self.navigating_history.get();
+        self.navigating_history.set(false);
+        if !from_history && old_path != path && !old_path.as_os_str().is_empty() {
             self.history_back.borrow_mut().push(old_path);
+            // Fresh navigation invalidates everything ahead of us.
+            self.history_forward.borrow_mut().clear();
         }
         *self.current_path.borrow_mut() = path.clone();
         self.render_breadcrumbs(&path);
@@ -1594,6 +1615,24 @@ impl FileBrowser {
             }
         });
 
+        // Escape in the path entry returns to breadcrumb (title) mode. The
+        // toggle button is not packed in any container: app.rs shows the
+        // entry by swapping the header title widget to the path stack, so
+        // deactivating the toggle here is what restores the title.
+        {
+            let edit_toggle_esc = self.path_edit_toggle.clone();
+            let esc = gtk4::EventControllerKey::new();
+            esc.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            esc.connect_key_pressed(move |_, key, _, _| {
+                if key == gdk4::Key::Escape {
+                    edit_toggle_esc.set_active(false);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            self.path_entry.add_controller(esc);
+        }
+
         // Search bar toggle
         let search_bar = self.search_bar.clone();
         self.search_button.connect_toggled(move |btn| {
@@ -1657,9 +1696,13 @@ impl FileBrowser {
         let local_act = self.local_mode.clone();
         let curr_act = self.current_path.clone();
         self.list_box.connect_row_activated(move |_lb, row| {
-            let idx = row.index() as usize;
+            // Resolve the entry by the row's widget name (set in set_entries)
+            // instead of the row index: the entries vec also holds dotfiles
+            // that have no row, so any index past a hidden dotfile would
+            // activate the wrong entry.
+            let name = row.widget_name().to_string();
             let entries = entries_act.borrow();
-            if let Some(e) = entries.get(idx) {
+            if let Some(e) = entries.iter().find(|e| e.name == name) {
                 if e.is_dir || e.is_symlink {
                     if let Some(cb) = on_event_act.borrow().as_ref() {
                         cb(BrowserEvent::OpenDir(e.clone()));
@@ -1695,8 +1738,19 @@ impl FileBrowser {
         let local_grid = self.local_mode.clone();
         let curr_grid = self.current_path.clone();
         self.grid_box.connect_child_activated(move |_fb, child| {
-            let idx = child.index() as usize;
-            if let Some(entry) = entries_sel_grid.borrow().get(idx).cloned() {
+            // Name-based lookup (same reason as the list view): the card's
+            // widget name is the entry name, while the child index drifts
+            // whenever dotfile entries are kept in the vec without a card.
+            let name = child
+                .child()
+                .map(|c| c.widget_name().to_string())
+                .unwrap_or_default();
+            let entry = entries_sel_grid
+                .borrow()
+                .iter()
+                .find(|e| e.name == name)
+                .cloned();
+            if let Some(entry) = entry {
                 if entry.is_dir || entry.is_symlink {
                     if let Some(cb) = on_ev_sel_grid.borrow().as_ref() {
                         cb(BrowserEvent::OpenDir(entry));
@@ -1879,7 +1933,9 @@ impl FileBrowser {
             let grid = self.grid_box.clone();
             let list = self.list_box.clone();
             let stack = self.file_view_stack.clone();
+            let root_sel = self.root.clone();
             add_shortcut("<Control>a", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&root_sel) { return glib::Propagation::Proceed; }
                 if view_is_grid(&stack) { grid.select_all(); } else { list.select_all(); }
                 glib::Propagation::Proceed
             }));
@@ -1897,6 +1953,7 @@ impl FileBrowser {
         {
             let browser = self.clone();
             add_shortcut("Delete", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
                 let sel = browser.selected_entries();
                 if !sel.is_empty() {
                     let label = if sel.len() == 1 { sel[0].name.clone() } else { format!("{} items", sel.len()) };
@@ -1925,10 +1982,19 @@ impl FileBrowser {
             let on_ev = self.on_event.clone();
             add_shortcut("F5", gtk4::CallbackAction::new(move |_, _| { emit_ev(&on_ev, BrowserEvent::Refresh); glib::Propagation::Proceed }));
         }
-        // Ctrl+F / Ctrl+L — search / path entry
+        // Ctrl+F — reveal the search bar and focus its entry. The entry only
+        // receives key events while the SearchBar is in search mode, so
+        // grabbing focus without revealing the bar was a no-op.
         {
+            let btn = self.search_button.clone();
             let entry = self.search_entry.clone();
-            add_shortcut("<Control>f", gtk4::CallbackAction::new(move |_, _| { entry.grab_focus(); glib::Propagation::Proceed }));
+            add_shortcut("<Control>f", gtk4::CallbackAction::new(move |_, _| {
+                if !btn.is_active() {
+                    btn.set_active(true); // toggled handler sets search mode
+                }
+                entry.grab_focus();
+                glib::Propagation::Proceed
+            }));
         }
         {
             let btn = self.path_edit_toggle.clone();
@@ -1939,14 +2005,21 @@ impl FileBrowser {
             let browser = self.clone();
             let on_ev = self.on_event.clone();
             add_shortcut("<Control><Shift>c", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
                 let files: Vec<DirEntry> = browser.selected_entries().into_iter().filter(|e| !e.is_dir).collect();
                 if !files.is_empty() { emit_ev(&on_ev, BrowserEvent::Download(files)); }
                 glib::Propagation::Proceed
             }));
         }
         {
+            let root_push = self.root.clone();
             let on_ev = self.on_event.clone();
-            add_shortcut("<Control>u", gtk4::CallbackAction::new(move |_, _| { emit_ev(&on_ev, BrowserEvent::Upload); glib::Propagation::Proceed }));
+            add_shortcut("<Control>u", gtk4::CallbackAction::new(move |_, _| {
+                // Ctrl+U is "delete to line start" inside text entries.
+                if focus_in_editable(&root_push) { return glib::Propagation::Proceed; }
+                emit_ev(&on_ev, BrowserEvent::Upload);
+                glib::Propagation::Proceed
+            }));
         }
         // Ctrl+= / Ctrl+- — grid zoom
         {
@@ -1982,6 +2055,7 @@ impl FileBrowser {
         {
             let browser = self.clone();
             add_shortcut("<Alt>Return", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
                 let sel = browser.selected_entries();
                 if sel.len() == 1 {
                     let e = sel.into_iter().next().unwrap();
@@ -1996,6 +2070,25 @@ impl FileBrowser {
             }));
         }
     }
+}
+
+/// True when the keyboard focus sits inside a text-editing widget (Entry,
+/// SearchEntry, the internal GtkText, or a TextView). The browser's global
+/// shortcuts (Delete, Ctrl+A, ...) must not fire while the user is typing,
+/// or e.g. pressing Delete mid-text pops the delete-confirmation dialog.
+fn focus_in_editable<W: IsA<gtk4::Widget>>(browser_root: &W) -> bool {
+    let Some(toplevel) = browser_root.root() else { return false };
+    let focus = toplevel
+        .downcast_ref::<gtk4::Window>()
+        .and_then(|w| gtk4::prelude::GtkWindowExt::focus(w));
+    let mut w = focus;
+    while let Some(widget) = w {
+        if widget.is::<gtk4::Editable>() || widget.is::<gtk4::Text>() || widget.is::<gtk4::TextView>() {
+            return true;
+        }
+        w = widget.parent();
+    }
+    false
 }
 
 /// Helper function to create stylish context menu items
@@ -2403,6 +2496,11 @@ fn show_properties_dialog(
     let row_path = adw::ActionRow::builder().title("Location").subtitle(full_path.to_string_lossy().as_ref()).build();
     let row_date = adw::ActionRow::builder().title("Modified").subtitle(&entry.display_date()).build();
     let row_mode = adw::ActionRow::builder().title("Permissions").subtitle(format!("{:#o}", entry.mode & 0o7777)).build();
+
+    // The name/location rows receive raw file names and paths: switch the
+    // rows to plain text so names with &, < or > render correctly.
+    row_name.set_use_markup(false);
+    row_path.set_use_markup(false);
 
     group.add(&row_name);
     group.add(&row_type);
