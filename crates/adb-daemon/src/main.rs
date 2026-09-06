@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:5037")]
     adb_server: String,
 
-    /// Number of concurrent proxy connections per device.
+    /// Number of concurrent proxy connections per device (1-64).
     #[arg(long, default_value_t = 4)]
     proxy_conns: usize,
 
@@ -126,6 +126,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // `--proxy-conns 0` would create a zero-permit semaphore that deadlocks
+    // every RPC; refuse it (and absurd values) with a clear error.
+    if !(1..=64).contains(&cli.proxy_conns) {
+        anyhow::bail!(
+            "--proxy-conns must be between 1 and 64 (got {})",
+            cli.proxy_conns
+        );
+    }
     let mount_base = cli.mount_base.clone().unwrap_or_else(|| {
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
