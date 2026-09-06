@@ -398,19 +398,18 @@ impl DeviceList {
             self.device_list_box.append(&row);
         } else {
             let mut selected_row: Option<gtk4::ListBoxRow> = None;
-            let mut first_row: Option<gtk4::ListBoxRow> = None;
             for d in devices {
                 let is_sel = selected.is_some_and(|s| s == d.serial);
                 let row = device_row(d, is_sel);
-                if first_row.is_none() {
-                    first_row = Some(row.clone());
-                }
                 if is_sel {
                     selected_row = Some(row.clone());
                 }
                 self.device_list_box.append(&row);
             }
-            if let Some(row) = selected_row.or(first_row) {
+            // Only highlight the row the user actually selected. Falling
+            // back to the first row would silently switch devices when the
+            // selected one disappears; the app clears the selection instead.
+            if let Some(row) = selected_row {
                 self.device_list_box.select_row(Some(&row));
             }
         }

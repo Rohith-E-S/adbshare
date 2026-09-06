@@ -529,6 +529,20 @@ impl AdbshareApp {
                             *handles_dev_drain.devices.lock() = devices.clone();
                             let selected = handles_dev_drain.selected_device.lock().clone();
                             dev_list_drain.set_devices(&devices, selected.as_deref());
+                            // The selected device disappeared (unplugged /
+                            // daemon lost it): drop it as the active selection
+                            // and reset the browser instead of silently
+                            // re-highlighting a different row. Re-plugging the
+                            // same device works via a normal sidebar click (or
+                            // the auto-select below once nothing is selected).
+                            if let Some(sel) = selected {
+                                if !devices.iter().any(|d| d.serial == sel) {
+                                    *handles_dev_drain.selected_device.lock() = None;
+                                    if !handles_dev_drain.browser.is_local_mode() {
+                                        handles_dev_drain.browser.set_device(None);
+                                    }
+                                }
+                            }
                             // Auto-select the first real device if none selected.
                             if selected.is_none() {
                                 if let Some(first) = devices.first() {
