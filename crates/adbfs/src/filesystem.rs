@@ -29,6 +29,8 @@ const TTL: Duration = Duration::from_secs(2);
 const BLOCK_SIZE: u32 = 4096;
 const ADB_UID: u32 = 2000;
 const ADB_GID: u32 = 2000;
+/// How long to wait between proxy reconnect attempts.
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum FsError {
@@ -120,11 +122,19 @@ impl SyncProxy {
                     .build()
                     .expect("build proxy runtime");
                 let _enter = rt.enter();
-                let client = match rt.block_on(ProxyClient::connect(&addr, max_conns)) {
-                    Ok(c) => std::sync::Arc::new(c),
-                    Err(e) => {
-                        eprintln!("adbfs: proxy connect to {addr} failed: {e}");
-                        return;
+                // Connect with retries: a temporarily-offline device
+                // (unplugged USB, restarting adbd) should recover instead
+                // of leaving the mount permanently returning EIO.
+                let client = loop {
+                    match rt.block_on(ProxyClient::connect(&addr, max_conns)) {
+                        Ok(c) => break std::sync::Arc::new(c),
+                        Err(e) => {
+                            eprintln!(
+                                "adbfs: proxy connect to {addr} failed: {e}; retrying in {:?}",
+                                CONNECT_RETRY_INTERVAL
+                            );
+                            std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                        }
                     }
                 };
 
