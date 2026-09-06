@@ -79,13 +79,23 @@ impl TransferDock {
         Self { root, pause_button, cancel_button, summary_label, speed_label, rows_box }
     }
 
-    /// Rebuild the dock from the current job list. Only Running/Pending
-    /// jobs count; with none active the dock hides itself.
-    pub fn update(&self, jobs: &[JobInfo]) {
+    /// Rebuild the dock from the current job list. Running/Pending/Paused
+    /// jobs count (paused transfers stay visible and resumable); with none
+    /// active the dock hides itself. `paused` is the global pause toggle and
+    /// switches the pause button between "pause" and "resume".
+    pub fn update(&self, jobs: &[JobInfo], paused: bool) {
         let active: Vec<&JobInfo> = jobs
             .iter()
-            .filter(|j| j.state == "Running" || j.state == "Pending")
+            .filter(|j| j.state == "Running" || j.state == "Pending" || j.state == "Paused")
             .collect();
+
+        if paused {
+            self.pause_button.set_icon_name("media-playback-start-symbolic");
+            self.pause_button.set_tooltip_text(Some("Resume all transfers"));
+        } else {
+            self.pause_button.set_icon_name("media-playback-pause-symbolic");
+            self.pause_button.set_tooltip_text(Some("Pause all transfers"));
+        }
 
         if active.is_empty() {
             self.root.set_visible(false);
