@@ -232,6 +232,9 @@ impl AdbshareApp {
             // Overflow menu: secondary actions only. Primary actions already
             // have header buttons, so they are NOT duplicated here.
             let kebab = gtk4::MenuButton::new();
+            // Declared before the menu items so their handlers can pop it
+            // down after activation.
+            let kebab_pop = gtk4::Popover::new();
             kebab.set_icon_name("view-more-symbolic");
             kebab.add_css_class("flat");
             kebab.set_tooltip_text(Some("More options"));
@@ -257,20 +260,30 @@ impl AdbshareApp {
             let refresh_item = menu_item("view-refresh-symbolic", "Refresh");
             {
                 let rb = browser.refresh_button.clone();
-                refresh_item.connect_clicked(move |_| rb.emit_clicked());
+                let kp = kebab_pop.clone();
+                refresh_item.connect_clicked(move |_| {
+                    kp.popdown();
+                    rb.emit_clicked();
+                });
             }
             kebab_menu.append(&refresh_item);
             let select_all_item = menu_item("edit-select-all-symbolic", "Select all");
             {
                 let browser_sa = browser.clone();
-                select_all_item.connect_clicked(move |_| browser_sa.select_all_active());
+                let kp = kebab_pop.clone();
+                select_all_item.connect_clicked(move |_| {
+                    kp.popdown();
+                    browser_sa.select_all_active();
+                });
             }
             kebab_menu.append(&select_all_item);
             kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
             let files_item = menu_item("system-file-manager-symbolic", "Open in Files");
             {
                 let browser_f = browser.clone();
+                let kp = kebab_pop.clone();
                 files_item.connect_clicked(move |_| {
+                    kp.popdown();
                     browser_f.emit(crate::file_browser::BrowserEvent::OpenExternal(browser_f.current_path()));
                 });
             }
@@ -278,7 +291,9 @@ impl AdbshareApp {
             let terminal_item = menu_item("utilities-terminal-symbolic", "Open in terminal");
             {
                 let browser_t = browser.clone();
+                let kp = kebab_pop.clone();
                 terminal_item.connect_clicked(move |_| {
+                    kp.popdown();
                     browser_t.emit(crate::file_browser::BrowserEvent::OpenTerminal(browser_t.current_path()));
                 });
             }
@@ -290,7 +305,11 @@ impl AdbshareApp {
                 .build();
             {
                 let browser_h = browser.clone();
+                let kp = kebab_pop.clone();
                 hidden_check.connect_toggled(move |btn| {
+                    // Choosing a toggle inside the menu closes it; re-opening
+                    // re-reads the live state.
+                    kp.popdown();
                     if btn.is_active() != browser_h.show_hidden() {
                         browser_h.toggle_show_hidden();
                     }
@@ -301,7 +320,9 @@ impl AdbshareApp {
             let app_about = menu_item("help-about-symbolic", "About ADBShare");
             {
                 let win_about = window.clone();
+                let kp = kebab_pop.clone();
                 app_about.connect_clicked(move |_| {
+                    kp.popdown();
                     let dialog = adw::MessageDialog::builder()
                         .heading("ADBShare Files")
                         .body(format!(
@@ -316,7 +337,6 @@ impl AdbshareApp {
                 });
             }
             kebab_menu.append(&app_about);
-            let kebab_pop = gtk4::Popover::new();
             kebab_pop.set_child(Some(&kebab_menu));
             kebab.set_popover(Some(&kebab_pop));
             header_end.append(&kebab);
