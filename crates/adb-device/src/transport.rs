@@ -260,59 +260,34 @@ impl tokio::io::AsyncRead for ChannelReader {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let mut total = 0usize;
-        loop {
-            let unfilled = buf.remaining();
-            if unfilled == 0 {
-                return Poll::Ready(Ok(()));
-            }
-            // Serve leftover bytes from a previously oversized chunk first.
+        // Serve leftover bytes from a previously oversized chunk first.
+        if buf.remaining() > 0 {
             if let Some(mut pending) = this.pending.take() {
-                let take = pending.len().min(unfilled);
+                let take = pending.len().min(buf.remaining());
                 buf.put_slice(&pending[..take]);
-                total += take;
                 if take < pending.len() {
                     this.pending = Some(pending.split_off(take));
                 }
-                if total >= unfilled {
-                    return Poll::Ready(Ok(()));
-                }
-                continue;
+                return Poll::Ready(Ok(()));
             }
-            match this.rx.try_recv() {
-                Ok(mut chunk) => {
-                    let take = chunk.len().min(unfilled);
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(mut chunk)) => {
+                    let take = chunk.len().min(buf.remaining());
                     buf.put_slice(&chunk[..take]);
-                    total += take;
                     if take < chunk.len() {
                         // Keep the remainder for the next poll_read; every 24-byte
                         // ADB header read leaves ~4KB of a 64KB USB transfer behind.
-                        let rest = chunk.split_off(take);
-                        this.pending = Some(rest);
-                        return Poll::Ready(Ok(()));
+                        this.pending = Some(chunk.split_off(take));
                     }
-                    if total >= unfilled {
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    // Need to wait for more data.
-                    let waker = cx.waker().clone();
-                    let rx = &mut this.rx;
-                    tokio::spawn(async move {
-                        // Tiny delay then wake. (ChannelReceiver doesn't have a waker API
-                        // without `tokio::sync::Notify`; this is a pragmatic shim.)
-                        tokio::time::sleep(std::time::Duration::from_micros(500)).await;
-                        waker.wake();
-                    });
-                    let _ = rx;
-                    return Poll::Pending;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
                     return Poll::Ready(Ok(()));
                 }
+                // Pump thread gone: report EOF.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                // Waker registered with the channel; no manual re-poll needed.
+                Poll::Pending => return Poll::Pending,
             }
         }
+        Poll::Ready(Ok(()))
     }
 }
 
