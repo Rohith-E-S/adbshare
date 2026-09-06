@@ -59,6 +59,10 @@ struct DeviceSlot {
     /// own port so several devices can be connected simultaneously; the
     /// device-side port stays fixed at `DEFAULT_PROXY_PORT`.
     host_port: u16,
+    /// Whether a full setup (push, forward, proxy start) completed for this
+    /// device. Re-add/Changed events use it to decide between a health check
+    /// and a full (proxy-killing) re-setup.
+    setup_ok: bool,
 }
 
 #[derive(Debug, Default)]
@@ -153,31 +157,8 @@ async fn main() -> anyhow::Result<()> {
             match ev {
                 adb_device::watcher::WatchEvent::Added(id) => {
                     info!(?id, "device added");
-                    let mp = mountpoint_for(&mount_base_clone, id.as_str(), no_fuse);
-                    if let Some(ref p) = mp {
-                        if let Err(_e) = std::fs::create_dir_all(p) {
-                            let p_str = p.to_string_lossy().into_owned();
-                            let _ = Command::new("fusermount3").args(["-u", "-z", &p_str]).status().await;
-                            let _ = Command::new("umount").args(["-l", &p_str]).status().await;
-                            if let Err(e2) = std::fs::create_dir_all(p) {
-                                error!(?e2, "create mountpoint");
-                                continue;
-                            }
-                        }
-                    }
-                    match setup(id.clone(), mp.clone(), proxy_conns).await {
-                        Ok((client, host_port)) => {
-                            state_clone.lock().devices.insert(id.clone(), DeviceSlot {
-                                mountpoint: mp,
-                                client: Arc::new(client),
-                                host_port,
-                            });
-                            info!(?id, "device ready");
-                        }
-                        Err(e) => {
-                            error!(?id, ?e, "setup/mount");
-                        }
-                    }
+                    ensure_device_ready(&state_clone, &id, &mount_base_clone, no_fuse, proxy_conns)
+                        .await;
                 }
                 adb_device::watcher::WatchEvent::Removed(id) => {
                     info!(?id, "device removed");
@@ -196,24 +177,12 @@ async fn main() -> anyhow::Result<()> {
                     info!(?id, "device state changed");
                     // If the device was added while still authorizing, setup
                     // failed; the user accepting the prompt fires this event —
-                    // retry for anything not registered yet.
-                    let already = state_clone.lock().devices.contains_key(&id);
-                    if !already {
-                        let mp = mountpoint_for(&mount_base_clone, id.as_str(), no_fuse);
-                        match setup(id.clone(), mp.clone(), proxy_conns).await {
-                            Ok((client, host_port)) => {
-                                state_clone.lock().devices.insert(id.clone(), DeviceSlot {
-                                    mountpoint: mp,
-                                    client: Arc::new(client),
-                                    host_port,
-                                });
-                                info!(?id, "device ready (post-authorize retry)");
-                            }
-                            Err(e) => {
-                                error!(?id, ?e, "setup retry failed");
-                            }
-                        }
-                    }
+                    // ensure_device_ready retries, but only tears down and
+                    // re-runs setup when the existing setup is actually broken
+                    // (a healthy setup is just health-checked, so active
+                    // transfers aren't killed by a re-add/Changed event).
+                    ensure_device_ready(&state_clone, &id, &mount_base_clone, no_fuse, proxy_conns)
+                        .await;
                 }
             }
         }
@@ -298,6 +267,79 @@ async fn adb_run_output(args: &[&str], timeout: Duration) -> anyhow::Result<std:
         .await
         .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
         .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
+}
+
+/// True if the pooled client can still serve requests (proxy reachable).
+async fn device_healthy(client: &ProxyClient) -> bool {
+    tokio::time::timeout(Duration::from_secs(3), client.stat("/"))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// Handle a device appearing (Added) or changing state (Changed).
+///
+/// If a setup already exists for this device we must NOT blindly re-run
+/// `setup()`: it `pkill`s the on-device proxy, killing any in-flight
+/// transfers. Instead, an existing setup is health-checked and only torn
+/// down + re-set-up when it is actually broken (or `setup()` never
+/// completed, in which case there is no slot at all).
+///
+/// NOTE: there is still a small race window between the health check and a
+/// concurrent transfer, and a full re-setup does not stop the previous FUSE
+/// thread; a complete device lifecycle rework is tracked separately.
+async fn ensure_device_ready(
+    state: &Arc<Mutex<State>>,
+    id: &DeviceId,
+    mount_base: &std::path::Path,
+    no_fuse: bool,
+    proxy_conns: usize,
+) {
+    let existing = state
+        .lock()
+        .devices
+        .get(id)
+        .map(|slot| (slot.client.clone(), slot.setup_ok, slot.host_port));
+    if let Some((client, setup_ok, host_port)) = existing {
+        if setup_ok && device_healthy(&client).await {
+            info!(?id, "existing setup healthy; skipping re-setup");
+            return;
+        }
+        warn!(?id, "existing setup broken; tearing down before re-setup");
+        teardown_device(id.as_str(), host_port).await;
+        state.lock().devices.remove(id);
+    }
+
+    let mp = mountpoint_for(mount_base, id.as_str(), no_fuse);
+    if let Some(ref p) = mp {
+        if let Err(_e) = std::fs::create_dir_all(p) {
+            // Probably a stale mount from a previous run — try to clear it.
+            let p_str = p.to_string_lossy().into_owned();
+            let _ = Command::new("fusermount3").args(["-u", "-z", &p_str]).status().await;
+            let _ = Command::new("umount").args(["-l", &p_str]).status().await;
+            if let Err(e2) = std::fs::create_dir_all(p) {
+                error!(?e2, "create mountpoint");
+                return;
+            }
+        }
+    }
+    match setup(id.clone(), mp.clone(), proxy_conns).await {
+        Ok((client, host_port)) => {
+            state.lock().devices.insert(
+                id.clone(),
+                DeviceSlot {
+                    mountpoint: mp,
+                    client: Arc::new(client),
+                    host_port,
+                    setup_ok: true,
+                },
+            );
+            info!(?id, "device ready");
+        }
+        Err(e) => {
+            error!(?id, ?e, "setup/mount");
+        }
+    }
 }
 
 async fn setup(
