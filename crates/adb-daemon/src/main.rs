@@ -225,6 +225,29 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Timeout for a single file-transfer-sized adb command (e.g. pushing the
+/// proxy binary to the device).
+const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for quick adb commands (shell one-liners, forward, getprop).
+const ADB_CMD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `adb <args>` with a hard timeout so a hung device or adb server can't
+/// stall the single watcher task. Returns the command's exit status.
+async fn adb_run(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
+    tokio::time::timeout(timeout, Command::new("adb").args(args).status())
+        .await
+        .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
+        .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
+}
+
+/// `adb_run` variant that captures stdout/stderr.
+async fn adb_run_output(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::Output> {
+    tokio::time::timeout(timeout, Command::new("adb").args(args).output())
+        .await
+        .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
+        .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
+}
+
 async fn setup(
     device: DeviceId,
     mountpoint: Option<PathBuf>,
@@ -233,91 +256,141 @@ async fn setup(
     let proxy_src = locate_proxy_binary(&device).await?;
     info!(?proxy_src, ?PROXY_BIN_PATH, "pushing proxy binary");
     // The device may still be waiting for the user to accept the USB
-    // debugging prompt ("device still authorizing") — retry briefly.
-    let mut status = None;
+    // debugging prompt ("device still authorizing") — retry briefly. Each
+    // push attempt is hard-timeboxed so one hung device can't stall the
+    // watcher; transport-level errors (timeouts) give up after 3 attempts.
+    let proxy_src_str = proxy_src.to_string_lossy().into_owned();
+    let mut push_status = None;
+    let mut push_err: Option<String> = None;
     for attempt in 0..15 {
-        let st = Command::new("adb")
-            .args(["-s", device.as_str(), "push", proxy_src.to_str().unwrap(), PROXY_BIN_PATH])
-            .status()
-            .await?;
-        if st.success() {
-            status = Some(st);
-            break;
-        }
-        if attempt == 14 {
-            status = Some(st);
+        match adb_run(
+            &["-s", device.as_str(), "push", &proxy_src_str, PROXY_BIN_PATH],
+            ADB_PUSH_TIMEOUT,
+        )
+        .await
+        {
+            Ok(st) if st.success() => {
+                push_status = Some(st);
+                break;
+            }
+            Ok(st) => {
+                // Usually "device still authorizing" — keep retrying.
+                push_status = Some(st);
+            }
+            Err(e) => {
+                push_err = Some(e.to_string());
+                if attempt >= 2 {
+                    break;
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
-    let status = status.unwrap();
+    if let Some(e) = push_err {
+        anyhow::bail!("adb push failed: {e}");
+    }
+    let status = push_status.expect("push loop set a status or bailed");
     if !status.success() {
         anyhow::bail!("adb push failed: {status}");
     }
-    let _ = Command::new("adb")
-        .args(["-s", device.as_str(), "shell", "chmod", "755", PROXY_BIN_PATH])
-        .status()
-        .await?;
+    if let Err(e) = adb_run(
+        &["-s", device.as_str(), "shell", "chmod", "755", PROXY_BIN_PATH],
+        ADB_CMD_TIMEOUT,
+    )
+    .await
+    {
+        warn!(?e, "chmod on device failed (continuing)");
+    }
 
     // Each device gets its own host-side port (a second device reusing the
     // same host port would fail `adb forward` with "address already in use",
     // and could misroute on older adb). The device side stays on
     // DEFAULT_PROXY_PORT; only the host half of the forward varies.
     let host_port = allocate_host_port()?;
-    let status = Command::new("adb")
-        .args([
+    let status = adb_run(
+        &[
             "-s",
             device.as_str(),
             "forward",
             &format!("tcp:{host_port}"),
             &format!("tcp:{DEFAULT_PROXY_PORT}"),
-        ])
-        .status()
-        .await?;
+        ],
+        ADB_CMD_TIMEOUT,
+    )
+    .await?;
     if !status.success() {
         anyhow::bail!("adb forward failed: {status}");
     }
 
-    let _ = Command::new("adb")
-        .args(["-s", device.as_str(), "shell", "pkill", "-f", PROXY_BIN_PATH])
-        .status().await.ok();
+    let _ = adb_run(
+        &["-s", device.as_str(), "shell", "pkill", "-f", PROXY_BIN_PATH],
+        ADB_CMD_TIMEOUT,
+    )
+    .await
+    .ok();
 
     let proxy_cmd = format!(
         "setsid sh -c '{} {} >/data/local/tmp/adbshare-proxy.log 2>&1 &' </dev/null",
         PROXY_BIN_PATH, DEFAULT_PROXY_PORT
     );
-    let _ = Command::new("adb")
-        .args(["-s", device.as_str(), "shell", &proxy_cmd])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status().await.ok();
+    // Stdio is nulled on the host side; the proxy's output is redirected to a
+    // log file on the device itself.
+    let launch = tokio::time::timeout(
+        ADB_CMD_TIMEOUT,
+        Command::new("adb")
+            .args(["-s", device.as_str(), "shell", &proxy_cmd])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+    if let Err(_) = launch {
+        warn!("proxy launch timed out (continuing; health check will decide)");
+    }
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let addr = format!("127.0.0.1:{host_port}");
-    let mut last_err = None;
+    let mut last_err: Option<String> = None;
     for _ in 0..25 {
-        match ProxyClient::connect(&addr, 1).await {
-            Ok(c) => match c.stat("/").await {
-                Ok(_) => { last_err = None; break; }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+        let attempt_err: Option<String>;
+        match tokio::time::timeout(Duration::from_secs(3), ProxyClient::connect(&addr, 1)).await {
+            Ok(Ok(c)) => match tokio::time::timeout(Duration::from_secs(3), c.stat("/")).await {
+                Ok(Ok(_)) => {
+                    attempt_err = None;
                 }
+                Ok(Err(e)) => attempt_err = Some(e.to_string()),
+                Err(_) => attempt_err = Some("proxy stat timed out".into()),
             },
-            Err(e) => {
+            Ok(Err(e)) => attempt_err = Some(e.to_string()),
+            Err(_) => attempt_err = Some("proxy connect timed out".into()),
+        }
+        match attempt_err {
+            None => {
+                last_err = None;
+                break;
+            }
+            Some(e) => {
                 last_err = Some(e);
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     }
     if let Some(e) = last_err {
-        let log = Command::new("adb")
-            .args(["-s", device.as_str(), "shell", "cat", "/data/local/tmp/adbshare-proxy.log"])
-            .output().await.ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+        let log = adb_run_output(
+            &["-s", device.as_str(), "shell", "cat", "/data/local/tmp/adbshare-proxy.log"],
+            ADB_CMD_TIMEOUT,
+        )
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
         anyhow::bail!("proxy never came up: {e}. Device log: {log}");
     }
 
-    let client = ProxyClient::connect(&addr, proxy_conns).await?;
+    let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(&addr, proxy_conns))
+        .await
+        .map_err(|_| anyhow::anyhow!("proxy connect timed out"))??;
 
     if let Some(mp) = mountpoint {
         let device_for_thread = device.clone();
@@ -360,13 +433,14 @@ async fn locate_proxy_binary(device: &DeviceId) -> anyhow::Result<PathBuf> {
         if env_path.exists() { return Ok(env_path); }
     }
 
-    let abi_output = Command::new("adb")
-        .args(["-s", device.as_str(), "shell", "getprop", "ro.product.cpu.abi"])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
+    let abi_output = adb_run_output(
+        &["-s", device.as_str(), "shell", "getprop", "ro.product.cpu.abi"],
+        ADB_CMD_TIMEOUT,
+    )
+    .await
+    .ok()
+    .and_then(|o| String::from_utf8(o.stdout).ok())
+    .unwrap_or_default();
     let abi = abi_output.trim().to_string();
     let is_arm = abi.contains("arm") || abi.contains("aarch64");
 
