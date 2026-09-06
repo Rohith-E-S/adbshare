@@ -443,6 +443,9 @@ impl AdbshareApp {
             {
                 let tp = trans_pop.clone();
                 let click = gtk4::GestureClick::new();
+                // Primary button only: right-/middle-clicks must not open the
+                // transfers popover.
+                click.set_button(1);
                 click.connect_released(move |_, _, _, _| tp.popup());
                 handles.dock.root.add_controller(click);
             }
