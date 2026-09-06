@@ -26,16 +26,20 @@ async fn main() -> ExitCode {
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(31337);
 
     let _ = std::fs::File::create(LOG_PATH);
-    wlog(format!("proxy starting on 0.0.0.0:{}", port));
+    // Bind loopback only: the sole intended client is `adb forward`, which
+    // connects to this port via localhost *on the device*. Binding a public
+    // interface would expose an unauthenticated file RPC to every host on
+    // the phone's network.
+    wlog(format!("proxy starting on 127.0.0.1:{}", port));
 
-    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
-            wlog(format!("bind {}: {}", port, e));
+            wlog(format!("bind 127.0.0.1:{}: {}", port, e));
             return ExitCode::from(1);
         }
     };
-    wlog(format!("listening on 0.0.0.0:{}", port));
+    wlog(format!("listening on 127.0.0.1:{} (loopback only)", port));
 
     loop {
         wlog(format!("[main] waiting for connection"));
