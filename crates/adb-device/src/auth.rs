@@ -58,6 +58,40 @@ impl Drop for AdbKey {
     }
 }
 
+/// Write a private key file directly with 0600 permissions. Creating the file
+/// with default umask and chmod'ing afterwards leaves a brief window where
+/// other users can read the key (and fails outright if a umask breaks chmod).
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut opts = fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.write(true).create(true).truncate(true).open(path)?;
+    f.write_all(contents)?;
+    Ok(())
+}
+
+/// Persist a parsed RSA key to `store_path` as PKCS#8 PEM and build the AdbKey.
+fn store_key(key: RsaPrivateKey, store_path: &Path) -> Result<AdbKey> {
+    let pem = key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| AdbError::Other(format!("encode pkcs8 pem: {e}")))?;
+    write_private_file(store_path, pem.as_bytes())?;
+    let pkcs8_der = key
+        .to_pkcs8_der()
+        .map_err(|e| AdbError::Other(format!("re-encode pkcs8: {e}")))?
+        .as_bytes()
+        .to_vec();
+    let ssh_pub = ssh_pub_from_pkcs8(&pkcs8_der)?;
+    Ok(AdbKey { pkcs8_der, ssh_pub, path: store_path.to_path_buf() })
+}
+
 pub fn generate_key(path: &Path) -> Result<AdbKey> {
     let mut rng = rand::thread_rng();
     let key = RsaPrivateKey::new(&mut rng, 2048)
@@ -67,18 +101,8 @@ pub fn generate_key(path: &Path) -> Result<AdbKey> {
         .map_err(|e| AdbError::Other(format!("encode pkcs8: {e}")))?;
     let pkcs8_der = pkcs8_doc.as_bytes().to_vec();
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let pem = pkcs8_doc.to_pem("PRIVATE KEY", LineEnding::LF)?;
-    fs::write(path, pem.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(path, perms)?;
-    }
+    write_private_file(path, pem.as_bytes())?;
 
     let ssh_pub = ssh_pub_from_pkcs8(&pkcs8_der)?;
     Ok(AdbKey { pkcs8_der, ssh_pub, path: path.to_path_buf() })
@@ -88,14 +112,33 @@ pub fn load_or_create_key() -> Result<AdbKey> {
     let our_path = default_key_path();
 
     if our_path.exists() {
-        return load_pkcs8_pem(&our_path, &our_path);
+        match load_pkcs8_pem(&our_path, &our_path) {
+            Ok(k) => return Ok(k),
+            Err(e) => {
+                // Don't abort startup on a corrupt/unreadable key file.
+                tracing::warn!(?e, path = %our_path.display(), "failed to load existing adbshare key");
+            }
+        }
     }
 
     if let Some(android_path) = android_adb_key_path() {
         if android_path.exists() {
-            // Try OpenSSH first (old adb), then PKCS#8 (new adb since 2017).
-            if let Ok(k) = import_openssh(&android_path, &our_path) { return Ok(k); }
-            return import_pkcs8_pem(&android_path, &our_path);
+            // Try OpenSSH first (old adb), then PKCS#8 (new adb since 2017),
+            // then PKCS#1 ("BEGIN RSA PRIVATE KEY", the classic ~/.android/adbkey).
+            const IMPORTERS: [fn(&Path, &Path) -> Result<AdbKey>; 3] =
+                [import_openssh, import_pkcs8_pem, import_pkcs1_pem];
+            for import in IMPORTERS {
+                match import(&android_path, &our_path) {
+                    Ok(k) => return Ok(k),
+                    Err(e) => {
+                        tracing::debug!(?e, path = %android_path.display(), "key import attempt failed");
+                    }
+                }
+            }
+            tracing::warn!(
+                path = %android_path.display(),
+                "could not import existing adb key; generating a fresh one"
+            );
         }
     }
 
@@ -104,42 +147,31 @@ pub fn load_or_create_key() -> Result<AdbKey> {
 
 fn load_pkcs8_pem(pem_path: &Path, store_path: &Path) -> Result<AdbKey> {
     let pem = fs::read(pem_path)?;
-    let key = RsaPrivateKey::from_pkcs8_pem(&String::from_utf8_lossy(&pem))
-        .map_err(|e| AdbError::Other(format!("parse pkcs8 pem: {e}")))?;
-    let pkcs8_der = key
-        .to_pkcs8_der()
-        .map_err(|e| AdbError::Other(format!("re-encode pkcs8: {e}")))?
-        .as_bytes()
-        .to_vec();
-    let ssh_pub = ssh_pub_from_pkcs8(&pkcs8_der)?;
-    Ok(AdbKey { pkcs8_der, ssh_pub, path: store_path.to_path_buf() })
+    let pem_str = String::from_utf8_lossy(&pem);
+    let key = match RsaPrivateKey::from_pkcs8_pem(&pem_str) {
+        Ok(k) => k,
+        Err(e) => {
+            // Tolerate a PKCS#1 file that ended up at our store path too.
+            tracing::debug!(?e, "not pkcs8 pem; trying pkcs1");
+            RsaPrivateKey::from_pkcs1_pem(&pem_str)
+                .map_err(|e1| AdbError::Other(format!("parse pkcs8 pem: {e}; parse pkcs1 pem: {e1}")))?
+        }
+    };
+    store_key(key, store_path)
 }
 
 fn import_pkcs8_pem(pem_path: &Path, store_path: &Path) -> Result<AdbKey> {
     let pem = fs::read(pem_path)?;
     let key = RsaPrivateKey::from_pkcs8_pem(&String::from_utf8_lossy(&pem))
         .map_err(|e| AdbError::Other(format!("parse pkcs8 pem: {e}")))?;
-    if let Some(parent) = store_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let out = key
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| AdbError::Other(format!("encode pkcs8 pem: {e}")))?;
-    fs::write(store_path, out.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(store_path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(store_path, perms)?;
-    }
-    let pkcs8_der = key
-        .to_pkcs8_der()
-        .map_err(|e| AdbError::Other(format!("re-encode pkcs8: {e}")))?
-        .as_bytes()
-        .to_vec();
-    let ssh_pub = ssh_pub_from_pkcs8(&pkcs8_der)?;
-    Ok(AdbKey { pkcs8_der, ssh_pub, path: store_path.to_path_buf() })
+    store_key(key, store_path)
+}
+
+fn import_pkcs1_pem(pem_path: &Path, store_path: &Path) -> Result<AdbKey> {
+    let pem = fs::read(pem_path)?;
+    let key = RsaPrivateKey::from_pkcs1_pem(&String::from_utf8_lossy(&pem))
+        .map_err(|e| AdbError::Other(format!("parse pkcs1 pem: {e}")))?;
+    store_key(key, store_path)
 }
 
 fn import_openssh(openssh_path: &Path, store_path: &Path) -> Result<AdbKey> {
@@ -153,29 +185,7 @@ fn import_openssh(openssh_path: &Path, store_path: &Path) -> Result<AdbKey> {
     let key: RsaPrivateKey = rsa_data
         .try_into()
         .map_err(|e: ssh_key::Error| AdbError::Other(format!("openssh -> rsa: {e}")))?;
-
-    if let Some(parent) = store_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let pem = key
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| AdbError::Other(format!("encode pkcs8 pem: {e}")))?;
-    fs::write(store_path, pem.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(store_path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(store_path, perms)?;
-    }
-
-    let pkcs8_der = key
-        .to_pkcs8_der()
-        .map_err(|e| AdbError::Other(format!("re-encode pkcs8: {e}")))?
-        .as_bytes()
-        .to_vec();
-    let ssh_pub = ssh_pub_from_pkcs8(&pkcs8_der)?;
-    Ok(AdbKey { pkcs8_der, ssh_pub, path: store_path.to_path_buf() })
+    store_key(key, store_path)
 }
 
 pub fn default_key_path() -> PathBuf {
