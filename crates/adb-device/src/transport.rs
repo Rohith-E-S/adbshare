@@ -192,10 +192,19 @@ fn open_usb_pump(
         .find(|d| d.bus_number() == bus && d.address() == addr)
         .ok_or_else(|| AdbError::DeviceNotFound(format!("usb:{}:{}", bus, addr)))?;
     let mut handle = device.open()?;
-    handle.claim_interface(iface)?;
-    if handle.kernel_driver_active(iface).unwrap_or(false) {
-        let _ = handle.detach_kernel_driver(iface);
+    // Detach any kernel driver BEFORE claiming: claim_interface fails with
+    // Busy if a kernel driver (e.g. usbfs-bound adbd helper or a modem
+    // driver) still holds the interface.
+    if handle.set_auto_detach_kernel_driver(true).is_err() {
+        // libusb may not support auto-detach on this platform; fall back to
+        // a manual detach.
+        if handle.kernel_driver_active(iface).unwrap_or(false) {
+            if let Err(e) = handle.detach_kernel_driver(iface) {
+                tracing::warn!(error = ?e, interface = iface, "failed to detach kernel driver");
+            }
+        }
     }
+    handle.claim_interface(iface)?;
 
     // Channels: pump -> app (bytes from device), app -> pump (bytes to device).
     let (tx_to_app, rx_to_app) = mpsc::channel::<bytes::Bytes>(256);
