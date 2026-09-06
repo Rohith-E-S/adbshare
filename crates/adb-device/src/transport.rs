@@ -209,9 +209,28 @@ fn open_usb_pump(
         .spawn(move || {
             use std::io::Write;
             let mut buf = vec![0u8; 64 * 1024];
-            let read_timeout = std::time::Duration::from_millis(50);
+            let read_timeout = std::time::Duration::from_millis(2);
             let write_timeout = std::time::Duration::from_millis(5_000);
-            loop {
+            'pump: loop {
+                // Drain ALL pending outgoing writes before blocking on a read.
+                // The previous single-chunk-per-iteration design capped write
+                // throughput at ~20 chunks x 4KB per 50ms loop (~1.25 MB/s) and
+                // a blocking write_bulk delayed incoming reads as well.
+                loop {
+                    match rx_from_app.try_recv() {
+                        Ok(chunk) => {
+                            if handle_for_thread
+                                .write_bulk(out_ep, &chunk, write_timeout)
+                                .is_err()
+                            {
+                                break 'pump;
+                            }
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break 'pump,
+                    }
+                }
+
                 // Read from device -> channel.
                 match handle_for_thread.read_bulk(in_ep, &mut buf, read_timeout) {
                     Ok(0) => continue,
@@ -224,17 +243,6 @@ fn open_usb_pump(
                     Err(rusb::Error::Timeout) => {}
                     Err(rusb::Error::Io) | Err(rusb::Error::Overflow) | Err(rusb::Error::Other) => break,
                     Err(_) => break,
-                }
-
-                // Read from channel -> device (non-blocking try_recv).
-                match rx_from_app.try_recv() {
-                    Ok(chunk) => {
-                        if handle_for_thread.write_bulk(out_ep, &chunk, write_timeout).is_err() {
-                            break;
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => {}
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
                 }
             }
             drop(context_for_thread);
