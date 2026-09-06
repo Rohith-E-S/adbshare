@@ -141,6 +141,7 @@ impl AdbConnection {
             Arc::new(PlMutex::new(HashMap::new()));
         let streams_r = streams.clone();
         let pending_opens_r = pending_opens.clone();
+        let write_tx_r = write_tx.clone();
 
         // Reader task: dispatch frames to per-stream channels; resolve OPEN replies.
         tokio::spawn(async move {
@@ -182,8 +183,35 @@ impl AdbConnection {
                     }
                     Command::Write => {
                         let local = msg.arg1;
-                        if let Some(tx) = streams_r.lock().get(&local) {
-                            let _ = tx.try_send(msg.payload);
+                        // Clone the sender out so the map lock (a blocking
+                        // parking_lot lock) is never held across an await.
+                        let Some(tx) = streams_r.lock().get(&local).cloned() else {
+                            continue;
+                        };
+                        // Apply backpressure: wait for a slot in the stream's
+                        // data channel instead of silently dropping the
+                        // payload when all 256 slots are full. Note this
+                        // head-of-line blocks the connection on a slow
+                        // consumer, which mirrors how a single ADB transport
+                        // is flow-controlled.
+                        if tx.send(msg.payload).await.is_err() {
+                            // The Stream end went away without closing:
+                            // unregister the stream and tell the device.
+                            streams_r.lock().remove(&local);
+                            let clse = Message::new(Command::Close, local, msg.arg0, Bytes::new());
+                            if write_tx_r.send(WriteReq::Frame(clse)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        // ADB flow control: every received WRTE must be
+                        // acknowledged with an OKAY, otherwise adbd stalls
+                        // after sending a single data packet per stream.
+                        // arg0 = our local (source) id, arg1 = the device's
+                        // (destination) id, which is the WRTE's arg0.
+                        let okay = Message::new(Command::Okay, local, msg.arg0, Bytes::new());
+                        if write_tx_r.send(WriteReq::Frame(okay)).await.is_err() {
+                            break;
                         }
                     }
                     _ => {}
