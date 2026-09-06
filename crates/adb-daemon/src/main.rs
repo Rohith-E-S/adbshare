@@ -67,6 +67,51 @@ struct State {
     devices: HashMap<DeviceId, DeviceSlot>,
 }
 
+/// Mountpoint for a device under `mount_base`, or None if the serial can't be
+/// safely used as a path component (or FUSE is disabled).
+fn mountpoint_for(mount_base: &std::path::Path, serial: &str, no_fuse: bool) -> Option<PathBuf> {
+    if no_fuse {
+        return None;
+    }
+    match sanitize_mount_name(serial) {
+        Some(name) => Some(mount_base.join(name)),
+        None => {
+            warn!(serial, "serial is not usable as a mount directory; skipping FUSE mount");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_keeps_safe_characters() {
+        assert_eq!(sanitize_mount_name("abc-123_XY.09"), Some("abc-123_XY.09".into()));
+    }
+
+    #[test]
+    fn sanitize_replaces_unsafe_characters() {
+        assert_eq!(sanitize_mount_name("a/b\\c d"), Some("a_b_c_d".into()));
+    }
+
+    #[test]
+    fn sanitize_rejects_dangerous_components() {
+        assert_eq!(sanitize_mount_name(""), None);
+        assert_eq!(sanitize_mount_name("."), None);
+        assert_eq!(sanitize_mount_name(".."), None);
+    }
+
+    #[test]
+    fn sanitize_cannot_escape_mount_base() {
+        // A traversal attempt collapses to harmless underscores.
+        let cleaned = sanitize_mount_name("../../etc").unwrap();
+        assert!(!cleaned.contains('/'));
+        assert_ne!(cleaned, "..");
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -108,11 +153,12 @@ async fn main() -> anyhow::Result<()> {
             match ev {
                 adb_device::watcher::WatchEvent::Added(id) => {
                     info!(?id, "device added");
-                    let mp = if no_fuse { None } else { Some(mount_base_clone.join(id.as_str())) };
+                    let mp = mountpoint_for(&mount_base_clone, id.as_str(), no_fuse);
                     if let Some(ref p) = mp {
                         if let Err(_e) = std::fs::create_dir_all(p) {
-                            let _ = Command::new("fusermount3").args(["-u", "-z", p.to_str().unwrap()]).status().await;
-                            let _ = Command::new("umount").args(["-l", p.to_str().unwrap()]).status().await;
+                            let p_str = p.to_string_lossy().into_owned();
+                            let _ = Command::new("fusermount3").args(["-u", "-z", &p_str]).status().await;
+                            let _ = Command::new("umount").args(["-l", &p_str]).status().await;
                             if let Err(e2) = std::fs::create_dir_all(p) {
                                 error!(?e2, "create mountpoint");
                                 continue;
@@ -153,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
                     // retry for anything not registered yet.
                     let already = state_clone.lock().devices.contains_key(&id);
                     if !already {
-                        let mp = if no_fuse { None } else { Some(mount_base_clone.join(id.as_str())) };
+                        let mp = mountpoint_for(&mount_base_clone, id.as_str(), no_fuse);
                         match setup(id.clone(), mp.clone(), proxy_conns).await {
                             Ok((client, host_port)) => {
                                 state_clone.lock().devices.insert(id.clone(), DeviceSlot {
@@ -504,6 +550,28 @@ async fn teardown_device(serial: &str, host_port: u16) {
     {
         tracing::debug!(serial, host_port, %e, "forward --remove (best-effort) failed");
     }
+}
+
+/// Sanitize a device serial for use as a mountpoint path component. A crafted
+/// USB serial could contain `/` or `..` and escape the mount base directory.
+/// Keep alphanumerics, `-`, `_`, `.`; replace everything else with `_`; reject
+/// names that would be dangerous path components. The raw serial is still
+/// used for `adb -s`.
+fn sanitize_mount_name(serial: &str) -> Option<String> {
+    let cleaned: String = serial
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return None;
+    }
+    Some(cleaned)
 }
 
 /// Serial looks like host:port (wireless pairing) vs a plain USB serial.
