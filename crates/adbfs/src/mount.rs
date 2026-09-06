@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use adb_device::DeviceId;
 use adb_proxy::ProxyClient;
@@ -17,36 +16,22 @@ pub fn run(device: DeviceId, client: ProxyClient, mountpoint: PathBuf) -> Result
         MountOption::NoExec,
     ];
 
-    // Build a per-mount tokio runtime for the SyncProxy. The proxy client
-    // uses tokio I/O and the SyncProxy thread will drive it.
-    let rt = Arc::new(
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| FsError::Other(e.to_string()))?
-    );
-    let rt_thread = std::thread::Builder::new()
-        .name(format!("adbfs-rt-{}", device))
-        .spawn({
-            let rt = rt.clone();
-            move || {
-                rt.block_on(async {
-                    std::future::pending::<()>().await;
-                });
-            }
-        })
-        .map_err(|e| FsError::Other(e.to_string()))?;
-    // Keep the runtime alive alongside the mount.
-    std::mem::forget(rt_thread);
-    let _rt = rt;
-
-    let fs = Adbfs::new(client, _rt.handle().clone());
+    // The SyncProxy thread builds and owns its own tokio runtime; nothing
+    // async is needed on this thread.
+    let fs = Adbfs::new(client);
     let session = Session::new(fs, &mountpoint, &options).map_err(FsError::Fuse)?;
     eprintln!("adbfs: BackgroundSession starting on {:?}", mountpoint);
     let _bg = fuser::BackgroundSession::new(session).map_err(FsError::Fuse)?;
     eprintln!("adbfs: waiting for unmount");
-    // Keep the Session alive. BackgroundSession holds the mount internally;
-    // dropping _bg would unmount. We park forever.
-    std::thread::park();
-    Ok(())
+    // Keep the Session alive. BackgroundSession holds the mount
+    // internally; dropping _bg would unmount. `park` can return
+    // spuriously, so re-park in a loop — we never expect a real wake-up
+    // here. The mount stays up until the process exits or this thread is
+    // killed; unmounting is done externally (fusermount3 / the daemon
+    // tearing the thread down). Signalling this thread to return cleanly
+    // on external unmount would need a shared handle across crates and is
+    // left as a follow-up.
+    loop {
+        std::thread::park();
+    }
 }

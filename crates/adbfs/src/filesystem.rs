@@ -72,10 +72,9 @@ fn path_to_string(p: &Path) -> Option<String> {
 }
 
 /// Synchronous proxy wrapper. Spawns a dedicated thread that owns a
-/// tokio current-thread runtime, and dispatches all proxy calls through
-/// that runtime. The FUSE callback threads (which are NOT tokio
-/// workers) call into this wrapper synchronously via `Handle::block_on`,
-/// which the tokio runtime supports from any thread.
+/// tokio current-thread runtime and drives the proxy client on it. FUSE
+/// callback threads (which are NOT tokio workers) dispatch requests to
+/// that thread over an mpsc channel and block on the reply channel.
 #[derive(Clone)]
 struct SyncProxy {
     tx: tokio::sync::mpsc::UnboundedSender<ProxyRequest>,
@@ -190,10 +189,6 @@ impl SyncProxy {
                 });
             })
             .expect("spawn proxy thread");
-        // The FUSE callback's `call` method uses a std::sync::mpsc to
-        // dispatch requests synchronously. No tokio runtime needed.
-        // Wait — we need async to wait on the oneshot. Use a blocking
-        // recv with timeout? No, just use std_mpsc for the response.
         Self { tx }
     }
 
@@ -250,7 +245,7 @@ impl Adbfs {
     /// Create the FS. `client` is moved into a dedicated background
     /// thread that owns a tokio runtime; the FUSE callbacks stay
     /// synchronous and issue blocking requests through the SyncProxy.
-    pub fn new(client: ProxyClient, _rt: tokio::runtime::Handle) -> Self {
+    pub fn new(client: ProxyClient) -> Self {
         let proxy = SyncProxy::start(client);
         let mut ino_to_path = HashMap::new();
         let mut path_to_ino = HashMap::new();
