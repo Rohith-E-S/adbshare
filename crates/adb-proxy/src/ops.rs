@@ -73,11 +73,41 @@ bitflags! {
 }
 
 impl OpenFlags {
+    /// Derive read/write flags from a unix octal mode. Every class is
+    /// considered: owner (0o400/0o200), group (0o40/0o20) and other
+    /// (0o4/0o2) — previously the owner bits were ignored, so mode 0o600
+    /// produced no READ flag at all.
     pub fn from_octal(mode: u32) -> OpenFlags {
         let mut f = OpenFlags::empty();
-        if mode & 0o4 != 0 { f |= OpenFlags::READ; }
-        if mode & 0o2 != 0 { f |= OpenFlags::WRITE; }
+        if mode & 0o444 != 0 { f |= OpenFlags::READ; }
+        if mode & 0o222 != 0 { f |= OpenFlags::WRITE; }
         f
+    }
+}
+
+#[cfg(test)]
+mod openflags_tests {
+    use super::OpenFlags;
+
+    #[test]
+    fn owner_class_bits() {
+        assert_eq!(OpenFlags::from_octal(0o600), OpenFlags::READ | OpenFlags::WRITE);
+        assert_eq!(OpenFlags::from_octal(0o400), OpenFlags::READ);
+        assert_eq!(OpenFlags::from_octal(0o200), OpenFlags::WRITE);
+    }
+
+    #[test]
+    fn group_and_other_class_bits() {
+        assert!(OpenFlags::from_octal(0o040).contains(OpenFlags::READ));
+        assert!(OpenFlags::from_octal(0o020).contains(OpenFlags::WRITE));
+        assert!(OpenFlags::from_octal(0o004).contains(OpenFlags::READ));
+        assert!(OpenFlags::from_octal(0o002).contains(OpenFlags::WRITE));
+    }
+
+    #[test]
+    fn no_bits_means_no_access() {
+        assert_eq!(OpenFlags::from_octal(0o000), OpenFlags::empty());
+        assert_eq!(OpenFlags::from_octal(0o100), OpenFlags::empty());
     }
 }
 
