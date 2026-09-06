@@ -15,13 +15,12 @@ mod transfer_view;
 use clap::Parser;
 use app::AdbshareApp;
 
+/// Kept only so `adb-gui --version` / `--help` work before GTK loads.
+/// (The old, advertised-but-ignored `--pair` flag was removed: no pairing
+/// wizard is implemented and silently discarding it was misleading.)
 #[derive(Parser, Debug)]
 #[command(name = "adb-gui", version, about = "GUI frontend for adbshare")]
-struct Cli {
-    /// Open the pairing wizard at startup.
-    #[arg(long)]
-    pair: bool,
-}
+struct Cli {}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
