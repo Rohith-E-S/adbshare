@@ -87,6 +87,10 @@ impl Worker {
         // error is treated as "does not exist" (only a successful stat
         // triggers SkipExisting/Rename handling).
         let existing = self.client.stat(&dest).await.ok();
+        // True when this job is about to create a brand-new file; a
+        // pre-existing destination (Always/SkipExisting/Resume) must never
+        // be removed on cancel.
+        let mut created = existing.is_none();
 
         let flags = match (&existing, job.options.overwrite) {
             (Some(st), OverwriteMode::SkipExisting) => {
@@ -104,6 +108,7 @@ impl Worker {
             }
             (Some(_), OverwriteMode::Rename) => {
                 dest = self.pick_remote_rename(&dest).await;
+                created = true;
                 OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNC
             }
             // Always (and Resume when the destination is already at least as
@@ -124,8 +129,11 @@ impl Worker {
         loop {
             if job.is_cancelled() || self.wait_while_paused(job).await {
                 let _ = dst.close().await;
-                // Don't leave a partial file behind on the device.
-                let _ = self.client.unlink(&dest).await;
+                // Don't leave a partial file behind on the device — but only
+                // if this job created it; never unlink a pre-existing file.
+                if created {
+                    let _ = self.client.unlink(&dest).await;
+                }
                 return Err(ProxyError::Other("cancelled".into()));
             }
             let n = src.read(&mut buf).await.map_err(|e| ProxyError::Other(e.to_string()))?;
@@ -154,6 +162,10 @@ impl Worker {
         // A successful local stat means the destination exists. A stat
         // error is treated as "does not exist".
         let existing = tokio::fs::metadata(&dest).await.ok();
+        // True when this job is about to create a brand-new file; a
+        // pre-existing destination (Always/SkipExisting/Resume) must never
+        // be removed on cancel.
+        let mut created = existing.is_none();
 
         let mut dst: tokio::fs::File = match (&existing, job.options.overwrite) {
             (Some(st), OverwriteMode::SkipExisting) => {
@@ -180,6 +192,7 @@ impl Worker {
             }
             (Some(_), OverwriteMode::Rename) => {
                 dest = self.pick_local_rename(&dest).await;
+                created = true;
                 tokio::fs::File::create(&dest).await
                     .map_err(|e| ProxyError::Other(format!("create destination: {e}")))?
             }
@@ -199,10 +212,13 @@ impl Worker {
         while offset < total || total == 0 {
             if job.is_cancelled() || self.wait_while_paused(job).await {
                 let _ = src.close().await;
-                // Don't leave a partial file behind locally.
-                let _ = dst.flush().await;
-                drop(dst);
-                let _ = tokio::fs::remove_file(&dest).await;
+                // Don't leave a partial file behind locally — but only if
+                // this job created it; never remove a pre-existing file.
+                if created {
+                    let _ = dst.flush().await;
+                    drop(dst);
+                    let _ = tokio::fs::remove_file(&dest).await;
+                }
                 return Err(ProxyError::Other("cancelled".into()));
             }
             let want = self.chunk_size as u32;
