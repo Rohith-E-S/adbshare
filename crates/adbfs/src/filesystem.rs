@@ -751,6 +751,11 @@ impl Filesystem for Adbfs {
 
     fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
         let _ = ino;
-        reply.statfs(1 << 30, 1 << 20, 1 << 20, 1 << 10, 1 << 10, BLOCK_SIZE, 256, 4096);
+        // The proxy protocol has no statfs op, so report large practical
+        // values the way network filesystems commonly do. Adding a real
+        // statfs op to the protocol is a possible follow-up.
+        const TOTAL_BLOCKS: u64 = 1 << 32; // 16 TiB at 4 KiB blocks
+        const FREE_BLOCKS: u64 = 1 << 31; // 8 TiB
+        reply.statfs(TOTAL_BLOCKS, FREE_BLOCKS, FREE_BLOCKS, 1 << 20, 1 << 20, BLOCK_SIZE, 256, 4096);
     }
 }
