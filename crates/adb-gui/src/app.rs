@@ -109,57 +109,88 @@ impl AdbshareApp {
                 .build();
             window.add_css_class("background");
 
-            // --- Top Level Layout: Full-width Headerbar + Horizontal Body ---
+            // --- Layout: native header + sidebar/content body ---
+            // One window, one header, one job list. The header owns navigation
+            // (back/forward/up), the location (breadcrumbs), and the primary
+            // actions (send/save/new folder/view/search/transfers/menu) so no
+            // action is hidden behind a right-click.
             let main_layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-
-            // --- Top toolbar (Stitch "Centered Dock" clone): compact bar,
-            // nav arrows left, centered breadcrumb chips, right cluster with
-            // search field + view toggle + kebab + close.
-            let unified_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-            unified_header.add_css_class("app-headerbar");
-            unified_header.set_height_request(44);
 
             let browser = FileBrowser::new();
             browser.root.set_vexpand(true);
             browser.root.set_hexpand(true);
 
-            // Live search field sits in the toolbar (Stitch), not in a
-            // collapsible bar below the sub-header.
-            browser.search_bar.set_visible(false);
+            let header = adw::HeaderBar::new();
 
-            // Left: navigation arrows in a linked group.
-            let nav_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-            nav_box.add_css_class("nav-arrows-box");
+            // Left: back / forward / up.
+            let nav_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
             nav_box.set_valign(gtk4::Align::Center);
-            browser.back_button.add_css_class("flat");
-            browser.forward_button.add_css_class("flat");
-            nav_box.append(&browser.back_button);
-            nav_box.append(&browser.forward_button);
-            unified_header.append(&nav_box);
+            for btn in [&browser.back_button, &browser.forward_button, &browser.up_button] {
+                btn.add_css_class("flat");
+                btn.set_valign(gtk4::Align::Center);
+                nav_box.append(btn);
+            }
+            header.pack_start(&nav_box);
 
-            // Center: breadcrumb chips at natural width, centered in the
-            // remaining space. The browser renders crumbs as chips; the
-            // current folder is the mono mount chip (.current).
-            let center_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-            center_box.set_hexpand(true);
-            center_box.set_halign(gtk4::Align::Center);
-            browser.path_stack.set_hexpand(false);
-            center_box.append(&browser.path_stack);
-            unified_header.append(&center_box);
+            // Center: breadcrumbs (the location). Left-aligned inside the
+            // title area so paths scan like a file manager.
+            browser.path_stack.set_hexpand(true);
+            browser.breadcrumb_container.set_halign(gtk4::Align::Start);
+            header.set_title_widget(Some(&browser.path_stack));
 
-            // Right cluster: search field, view toggle, kebab, close.
-            let header_end = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            // Full transfer queue lives in one popover, opened from the
+            // header badge or by clicking the bottom status bar.
+            let transfer = TransferView::new();
+            let trans_pop = gtk4::Popover::new();
+            trans_pop.set_size_request(460, 340);
+            let trans_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let trans_hdr = gtk4::Label::builder()
+                .label("Transfers")
+                .xalign(0.0)
+                .margin_start(14)
+                .margin_top(10)
+                .margin_bottom(6)
+                .build();
+            trans_hdr.add_css_class("heading");
+            trans_box.append(&trans_hdr);
+            let trans_sub = gtk4::Label::builder()
+                .label("Copies between this computer and the phone.")
+                .xalign(0.0)
+                .margin_start(14)
+                .margin_bottom(6)
+                .wrap(true)
+                .build();
+            trans_sub.add_css_class("dim-label");
+            trans_box.append(&trans_sub);
+            transfer.transfer_attach(&trans_box);
+            trans_pop.set_child(Some(&trans_box));
+
+            // Right: primary actions first, overflow last.
+            let header_end = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
             header_end.set_valign(gtk4::Align::Center);
 
-            // Always-visible compact search field (Stitch toolbar).
-            browser.search_entry.set_width_chars(20);
-            browser.search_entry.add_css_class("header-search");
-            header_end.append(&browser.search_entry);
+            // "Send to phone" is the primary action.
+            browser.upload_button.add_css_class("suggested-action");
+            browser.upload_button.set_valign(gtk4::Align::Center);
+            header_end.append(&browser.upload_button);
+            browser.download_button.set_valign(gtk4::Align::Center);
+            header_end.append(&browser.download_button);
+            browser.new_folder_button.set_has_frame(false);
+            // Icon-only in the header (the button already carries an
+            // icon+label child; keep just the icon so the header stays roomy).
+            browser.new_folder_button.set_child(Some(
+                &gtk4::Image::from_icon_name("folder-new-symbolic"),
+            ));
+            browser.new_folder_button.set_tooltip_text(Some("New folder"));
+            browser.new_folder_button.set_valign(gtk4::Align::Center);
+            header_end.append(&browser.new_folder_button);
 
-            // Single toggle button: grid <-> list (icon shows the target view).
-            let view_toggle = gtk4::Button::from_icon_name("view-list-symbolic");
+            // Grid <-> list. Icon always shows the CURRENT view; the tooltip
+            // names the action, so it never reads backwards.
+            let view_toggle = gtk4::Button::from_icon_name("view-grid-symbolic");
             view_toggle.add_css_class("flat");
-            view_toggle.set_tooltip_text(Some("Toggle Grid / List View"));
+            view_toggle.set_tooltip_text(Some("Switch to list view"));
+            view_toggle.set_valign(gtk4::Align::Center);
             {
                 let browser_vt = browser.clone();
                 let vt = view_toggle.clone();
@@ -170,75 +201,81 @@ impl AdbshareApp {
                         ViewMode::Grid
                     };
                     browser_vt.set_view_mode(new_mode);
-                    vt.set_icon_name(if new_mode == ViewMode::Grid {
-                        "view-list-symbolic"
+                    if new_mode == ViewMode::Grid {
+                        vt.set_icon_name("view-grid-symbolic");
+                        vt.set_tooltip_text(Some("Switch to list view"));
                     } else {
-                        "view-grid-symbolic"
-                    });
+                        vt.set_icon_name("view-list-symbolic");
+                        vt.set_tooltip_text(Some("Switch to grid view"));
+                    }
                 });
             }
-            view_toggle.set_valign(gtk4::Align::Center);
             header_end.append(&view_toggle);
 
-            let flat_item = |icon: &str, label: &str| {
-                let btn = gtk4::Button::new();
-                btn.set_has_frame(true);
-                let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
-                hbox.set_margin_start(6);
-                hbox.set_margin_end(6);
-                let img = gtk4::Image::from_icon_name(icon);
-                hbox.append(&img);
-                let lbl = gtk4::Label::new(Some(label));
-                lbl.set_xalign(0.0);
-                lbl.set_hexpand(true);
-                hbox.append(&lbl);
-                btn.set_child(Some(&hbox));
-                btn
-            };
+            // Search toggle reveals the search row under the header.
+            browser.search_button.set_valign(gtk4::Align::Center);
+            header_end.append(&browser.search_button);
 
-            // Single kebab menu (Stitch): folder actions, view options,
-            // transfers, and app actions in one overflow.
+            // Transfers badge button: icon + live count.
+            let transfers_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            let transfers_icon = gtk4::Image::from_icon_name("emblem-synchronizing-symbolic");
+            transfers_box.append(&transfers_icon);
+            let transfers_count = gtk4::Label::new(Some("Transfers"));
+            transfers_box.append(&transfers_count);
+            let transfers_btn = gtk4::MenuButton::new();
+            transfers_btn.set_child(Some(&transfers_box));
+            transfers_btn.set_tooltip_text(Some("Show transfers"));
+            transfers_btn.set_valign(gtk4::Align::Center);
+            transfers_btn.set_popover(Some(&trans_pop));
+            header_end.append(&transfers_btn);
+
+            // Overflow menu: secondary actions only. Primary actions already
+            // have header buttons, so they are NOT duplicated here.
             let kebab = gtk4::MenuButton::new();
             kebab.set_icon_name("view-more-symbolic");
             kebab.add_css_class("flat");
-            kebab.set_tooltip_text(Some("Menu"));
+            kebab.set_tooltip_text(Some("More options"));
             kebab.set_valign(gtk4::Align::Center);
-
-            let kebab_menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let kebab_menu = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
             kebab_menu.set_margin_top(6);
             kebab_menu.set_margin_bottom(6);
             kebab_menu.set_margin_start(6);
             kebab_menu.set_margin_end(6);
-            kebab_menu.set_size_request(240, -1);
-
-            let refresh_item = flat_item("view-refresh-symbolic", "Refresh");
-            refresh_item.add_css_class("flat");
+            kebab_menu.set_size_request(250, -1);
+            let menu_item = |icon: &str, label: &str| {
+                let btn = gtk4::Button::new();
+                btn.set_has_frame(false);
+                let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+                hbox.set_margin_start(6);
+                hbox.set_margin_end(6);
+                hbox.append(&gtk4::Image::from_icon_name(icon));
+                let lbl = gtk4::Label::builder().label(label).xalign(0.0).hexpand(true).build();
+                hbox.append(&lbl);
+                btn.set_child(Some(&hbox));
+                btn
+            };
+            let refresh_item = menu_item("view-refresh-symbolic", "Refresh");
             {
                 let rb = browser.refresh_button.clone();
                 refresh_item.connect_clicked(move |_| rb.emit_clicked());
             }
             kebab_menu.append(&refresh_item);
-
-            let select_all_item = flat_item("edit-select-all-symbolic", "Select All");
-            select_all_item.add_css_class("flat");
+            let select_all_item = menu_item("edit-select-all-symbolic", "Select all");
             {
                 let browser_sa = browser.clone();
                 select_all_item.connect_clicked(move |_| browser_sa.select_all_active());
             }
             kebab_menu.append(&select_all_item);
-
             kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-            let new_folder_item = flat_item("folder-new-symbolic", "New Folder");
-            new_folder_item.add_css_class("flat");
+            let files_item = menu_item("system-file-manager-symbolic", "Open in Files");
             {
-                let nb = browser.new_folder_button.clone();
-                new_folder_item.connect_clicked(move |_| nb.emit_clicked());
+                let browser_f = browser.clone();
+                files_item.connect_clicked(move |_| {
+                    browser_f.emit(crate::file_browser::BrowserEvent::OpenExternal(browser_f.current_path()));
+                });
             }
-            kebab_menu.append(&new_folder_item);
-
-            let terminal_item = flat_item("utilities-terminal-symbolic", "Open in Terminal");
-            terminal_item.add_css_class("flat");
+            kebab_menu.append(&files_item);
+            let terminal_item = menu_item("utilities-terminal-symbolic", "Open in terminal");
             {
                 let browser_t = browser.clone();
                 terminal_item.connect_clicked(move |_| {
@@ -246,9 +283,8 @@ impl AdbshareApp {
                 });
             }
             kebab_menu.append(&terminal_item);
-
             let hidden_check = gtk4::CheckButton::builder()
-                .label("Show Hidden Files")
+                .label("Show hidden files")
                 .margin_start(6)
                 .margin_end(6)
                 .build();
@@ -261,47 +297,15 @@ impl AdbshareApp {
                 });
             }
             kebab_menu.append(&hidden_check);
-
             kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-            // Transfers popover (full queue/history), opened from the kebab
-            // and from the floating dock.
-            let transfer = TransferView::new();
-            let trans_pop = gtk4::Popover::new();
-            trans_pop.set_size_request(440, 320);
-            let trans_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-            let trans_hdr = gtk4::Label::builder()
-                .label("Operations & Transfers")
-                .xalign(0.0)
-                .margin_start(12)
-                .margin_top(8)
-                .margin_bottom(8)
-                .build();
-            trans_hdr.add_css_class("heading");
-            trans_box.append(&trans_hdr);
-            transfer.transfer_attach(&trans_box);
-            trans_pop.set_child(Some(&trans_box));
-            trans_pop.set_parent(&kebab);
-
-            let transfers_item = flat_item("emblem-synchronizing-symbolic", "Transfers");
-            transfers_item.add_css_class("flat");
-            {
-                let tp = trans_pop.clone();
-                transfers_item.connect_clicked(move |_| tp.popup());
-            }
-            kebab_menu.append(&transfers_item);
-
-            kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-            let app_about = flat_item("help-about-symbolic", "About ADBShare");
-            app_about.add_css_class("flat");
+            let app_about = menu_item("help-about-symbolic", "About ADBShare");
             {
                 let win_about = window.clone();
                 app_about.connect_clicked(move |_| {
                     let dialog = adw::MessageDialog::builder()
                         .heading("ADBShare Files")
                         .body(format!(
-                            "ADB file manager for Linux\nVersion {} (pre-alpha)\nGTK4 + libadwaita",
+                            "Copy files between Linux and Android over ADB.\nVersion {} (pre-alpha)",
                             env!("CARGO_PKG_VERSION")
                         ))
                         .modal(true)
@@ -312,83 +316,39 @@ impl AdbshareApp {
                 });
             }
             kebab_menu.append(&app_about);
-
-            let app_quit = flat_item("application-exit-symbolic", "Quit");
-            app_quit.add_css_class("flat");
-            {
-                let app_handle = app.clone();
-                app_quit.connect_clicked(move |_| app_handle.quit());
-            }
-            kebab_menu.append(&app_quit);
-
             let kebab_pop = gtk4::Popover::new();
             kebab_pop.set_child(Some(&kebab_menu));
             kebab.set_popover(Some(&kebab_pop));
             header_end.append(&kebab);
 
-            // Circular close button.
-            let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-            close_btn.add_css_class("window-close-circle");
-            close_btn.set_tooltip_text(Some("Close"));
-            {
-                let win_close = window.clone();
-                close_btn.connect_clicked(move |_| win_close.close());
-            }
-            header_end.append(&close_btn);
+            header.pack_end(&header_end);
+            main_layout.append(&header);
 
-            unified_header.append(&header_end);
+            // Search row: hidden until the header search toggle is on.
+            browser.search_entry.set_placeholder_text(Some("Search this folder..."));
+            browser.search_entry.set_hexpand(true);
+            let search_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            search_row.set_margin_start(12);
+            search_row.set_margin_end(12);
+            search_row.set_margin_top(6);
+            search_row.set_margin_bottom(6);
+            search_row.append(&browser.search_entry);
+            browser.search_bar.set_child(Some(&search_row));
+            main_layout.append(&browser.search_bar);
 
-            let header_handle = gtk4::WindowHandle::new();
-            header_handle.set_child(Some(&unified_header));
-            main_layout.append(&header_handle);
-
-            // Signature element: 2px signal rail under the header.
-            // Mint at rest, amber while transfers are running.
-            let signal_rail = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-            signal_rail.add_css_class("signal-rail");
-            main_layout.append(&signal_rail);
-
-            // --- Body: resizable sidebar (Nautilus-style) + content ---
+            // --- Body: resizable sidebar + content ---
             let body_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
             body_paned.set_vexpand(true);
+            body_paned.set_hexpand(true);
             body_paned.add_css_class("sidebar-paned");
 
             let sidebar_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             sidebar_box.add_css_class("navigation-sidebar");
-            sidebar_box.set_size_request(200, -1);
+            sidebar_box.set_size_request(240, -1);
             body_paned.set_start_child(Some(&sidebar_box));
-            // Allow the pane to shrink to the set position: if the sidebar's
-            // minimum width exceeds the position, GTK paints the start child
-            // shifted left by the overflow instead of clipping it, which is
-            // what made the sidebar's left edge look cut off. Overflow is now
-            // handled inside the ScrolledWindow (clips right, never scrolls
-            // left thanks to the hadjustment guard).
             body_paned.set_shrink_start_child(true);
 
-
             let device_list = std::rc::Rc::new(DeviceList::new());
-            // Rail brand header (Stitch: "adbshare v1.0.0-alpha" at the
-            // top-left of the device rail).
-            let brand_box = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
-            let brand_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            let brand_icon = gtk4::Image::from_icon_name("phone-symbolic");
-            brand_icon.add_css_class("rail-brand-icon");
-            brand_icon.set_pixel_size(18);
-            brand_row.append(&brand_icon);
-            let brand_label = gtk4::Label::new(Some("adbshare"));
-            brand_label.add_css_class("rail-brand");
-            brand_row.append(&brand_label);
-            brand_box.append(&brand_row);
-            let brand_version = gtk4::Label::new(Some(&format!(
-                "v{} · signal deck",
-                env!("CARGO_PKG_VERSION")
-            )));
-            brand_version.add_css_class("rail-brand-version");
-            brand_box.append(&brand_version);
-            brand_box.set_margin_start(14);
-            brand_box.set_margin_top(10);
-            brand_box.set_margin_bottom(2);
-            sidebar_box.append(&brand_box);
             device_list.populate_defaults();
             device_list.attach(&sidebar_box);
 
@@ -397,13 +357,11 @@ impl AdbshareApp {
             content_box.set_hexpand(true);
             content_box.append(&browser.root);
             body_paned.set_end_child(Some(&content_box));
-            // Sidebar: 248px default (Stitch rail); user can drag narrower.
             body_paned.set_position(SIDEBAR_DEFAULT_WIDTH);
             main_layout.append(&body_paned);
 
-            // Floating centered transfer dock (Stitch "Centered Dock"
-            // variant): overlaid at the bottom-center of the window,
-            // above everything the main layout contains.
+            // Bottom status bar owns transfer progress; the small dock card
+            // only appears while jobs run and opens the full list on click.
             let window_overlay = gtk4::Overlay::new();
             window_overlay.set_child(Some(&main_layout));
 
@@ -658,18 +616,60 @@ impl AdbshareApp {
                 });
             }
 
-            // --- Drain jobs -> TransferView & Header Operations Badge & ADB Banner ---
+            // --- Drain mountpoint results -> drag & drop out of the app ---
+            {
+                let browser_mp = handles.browser.clone();
+                glib::spawn_future_local(async move {
+                    while let Ok(res) = mp_rx.recv().await {
+                        match res {
+                            Ok(mp) => browser_mp.set_fuse_mount(Some(&mp)),
+                            Err(e) => tracing::warn!(error=%e, "mountpoint_for failed"),
+                        }
+                    }
+                });
+            }
+
+            // --- Drain operation results -> dialogs the user can act on ---
+            {
+                let window_op = window.clone();
+                glib::spawn_future_local(async move {
+                    while let Ok((title, res)) = op_rx.recv().await {
+                        match res {
+                            Ok(msg) => {
+                                let dialog = adw::MessageDialog::builder()
+                                    .heading(title.as_deref().unwrap_or("Done"))
+                                    .body(&msg)
+                                    .modal(true)
+                                    .transient_for(&window_op)
+                                    .build();
+                                dialog.add_response("ok", "OK");
+                                dialog.present();
+                            }
+                            Err(msg) => show_error_dialog(&window_op, title.as_deref().unwrap_or("Something went wrong"), &msg),
+                        }
+                    }
+                });
+            }
+
+            // --- Drain jobs -> status bar, dock card, header count, full list ---
+            // One job list, three views of it. The status bar owns progress.
             let handles_jobs = handles.clone();
             let browser_drain = handles.browser.clone();
-            let rail_drain = signal_rail.clone();
+            let count_drain = transfers_count.clone();
             glib::spawn_future_local(async move {
                 while let Ok(result) = jobs_rx.recv().await {
                     match result {
                         Ok(jobs) => {
                             let active: Vec<_> = jobs.iter().filter(|j| j.state == "Running" || j.state == "Pending").collect();
                             *handles_jobs.active_jobs.lock() = active.iter().map(|j| j.id).collect();
+                            if active.len() == 1 {
+                                count_drain.set_label("1 transfer");
+                            } else if active.is_empty() {
+                                count_drain.set_label("Transfers");
+                            } else {
+                                count_drain.set_label(&format!("{} transfers", active.len()));
+                            }
                             if !active.is_empty() {
-                                rail_drain.add_css_class("transferring");
                                 let total_speed: u64 = active.iter().map(|j| j.speed_bps).sum();
                                 let transferred_bytes: u64 = active.iter().map(|j| j.bytes_done).sum();
                                 let total_bytes: u64 = active.iter().map(|j| j.bytes_total).sum();
@@ -684,17 +684,25 @@ impl AdbshareApp {
                                     0.5
                                 };
 
-                                let banner_str = format!(
-                                    "Transferring {} item{} ({:.1} MB of {:.1} MB — {:.1} MB/s)",
-                                    active.len(),
-                                    if active.len() > 1 { "s" } else { "" },
-                                    trans_mb,
-                                    tot_mb,
-                                    speed_mb
-                                );
+                                let banner_str = if tot_mb > 0.0 {
+                                    format!(
+                                        "Copying {} file{} — {:.1} of {:.1} MB ({:.1} MB/s)",
+                                        active.len(),
+                                        if active.len() > 1 { "s" } else { "" },
+                                        trans_mb,
+                                        tot_mb,
+                                        speed_mb
+                                    )
+                                } else {
+                                    format!(
+                                        "Copying {} file{} — {:.1} MB/s",
+                                        active.len(),
+                                        if active.len() > 1 { "s" } else { "" },
+                                        speed_mb
+                                    )
+                                };
                                 browser_drain.update_transfer_banner(true, &banner_str, fraction);
                             } else {
-                                rail_drain.remove_css_class("transferring");
                                 browser_drain.update_transfer_banner(false, "", 0.0);
                             }
                             handles_jobs.dock.update(&jobs);
@@ -787,10 +795,10 @@ fn select_device(
         *sel = Some(serial.to_string());
     }
     let cached = handles.devices.lock().iter().find(|d| d.serial == serial).cloned();
+    handles.browser.set_device(Some(serial));
     if let Some(ref entry) = cached {
         handles.browser.set_device_info(entry);
     }
-    handles.browser.set_device(Some(serial));
     handles.browser.show_path(PathBuf::from("/sdcard/Download"));
 
     // Fetch the FUSE mountpoint for drag & drop out of the app; the result

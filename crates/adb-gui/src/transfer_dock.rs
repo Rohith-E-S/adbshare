@@ -1,8 +1,7 @@
-//! Floating centered transfer dock — the signature element of the
-//! Stitch "Signal Deck (Centered Dock)" variant. Sits at the bottom
-//! of the window as an overlay: aggregate throughput in large mono
-//! type, mini per-file progress rows, and pause/cancel controls.
-//! Hidden entirely when nothing is running.
+//! Bottom transfer bar: a slim full-width strip pinned to the bottom of
+//! the window while copies run. Aggregate speed + up to MAX_ROWS mini rows
+//! + pause/cancel. Clicking it opens the full Transfers list. Hidden
+//! entirely when nothing is running, so it never covers files.
 
 use gtk4::prelude::*;
 
@@ -25,11 +24,18 @@ impl TransferDock {
     pub fn new() -> Self {
         let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
         root.add_css_class("transfer-dock");
-        root.set_halign(gtk4::Align::Center);
+        root.set_halign(gtk4::Align::Fill);
         root.set_valign(gtk4::Align::End);
-        root.set_margin_bottom(12);
+        root.set_margin_start(12);
+        root.set_margin_end(12);
+        root.set_margin_bottom(8);
         root.set_visible(false);
 
+        // Left: icon + "2 files copying" above the aggregate speed readout.
+        let left_icon = gtk4::Image::from_icon_name("emblem-synchronizing-symbolic");
+        left_icon.set_pixel_size(20);
+        left_icon.set_valign(gtk4::Align::Center);
+        root.append(&left_icon);
         // Left: "2 files copying" above the aggregate speed readout.
         let left = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
         left.set_valign(gtk4::Align::Center);

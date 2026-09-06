@@ -24,8 +24,17 @@ impl JobInfo {
             (self.bytes_done * 100 / self.bytes_total) as u64
         } else { 0 };
 
+        let state = match self.state.as_str() {
+            "Running" => "Copying",
+            "Pending" => "Waiting",
+            "Paused" => "Paused",
+            "Done" => "Done",
+            "Failed" => "Failed",
+            "Cancelled" => "Cancelled",
+            other => other,
+        };
         let mut parts = vec![
-            self.state.clone(),
+            state.to_string(),
             format!("{}/{} ({}%)", done, total, pct),
         ];
 
@@ -75,8 +84,8 @@ impl TransferView {
 
         let status = adw::StatusPage::builder()
             .title("No transfers yet")
-            .description("Connect a device to start transferring files.")
-            .icon_name("phone-symbolic")
+            .description("Send files to the phone or save them to this computer and they will show up here.")
+            .icon_name("emblem-synchronizing-symbolic")
             .vexpand(true)
             .build();
 
@@ -143,8 +152,8 @@ impl TransferView {
 
 fn arrow(direction: &str) -> &'static str {
     match direction {
-        "Push" => "↑",
-        "Pull" => "↓",
+        "Push" => "↑ to phone",
+        "Pull" => "↓ to computer",
         _ => "•",
     }
 }

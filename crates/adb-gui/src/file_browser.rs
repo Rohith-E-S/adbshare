@@ -87,6 +87,31 @@ fn asset_icon_for(entry: &DirEntry) -> Option<&'static str> {
         Some("zip.svg")
     } else if lower.ends_with(".tar") || lower.ends_with(".gz") || lower.ends_with(".tgz") || lower.ends_with(".xz") {
         Some("tar.svg")
+    } else if lower.ends_with(".pdf")
+        || lower.ends_with(".doc")
+        || lower.ends_with(".docx")
+        || lower.ends_with(".xls")
+        || lower.ends_with(".xlsx")
+        || lower.ends_with(".ppt")
+        || lower.ends_with(".pptx")
+        || lower.ends_with(".odt")
+        || lower.ends_with(".ods")
+        || lower.ends_with(".odg")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".epub")
+    {
+        // Office docs share the full-bleed documents asset so they render at
+        // exactly the same size as every other tile (symbolic theme icons
+        // carry built-in padding and would look smaller).
+        Some("documents.svg")
+    } else if lower.ends_with(".mp3")
+        || lower.ends_with(".flac")
+        || lower.ends_with(".ogg")
+        || lower.ends_with(".wav")
+        || lower.ends_with(".m4a")
+        || lower.ends_with(".aac")
+    {
+        Some("podcasts.svg")
     } else if lower.ends_with(".txt") || lower.ends_with(".log") || lower.ends_with(".json") || lower.ends_with(".xml") {
         Some("txt.svg")
     } else if lower.ends_with(".mp4") || lower.ends_with(".mkv") || lower.ends_with(".avi") || lower.ends_with(".webm") || lower.ends_with(".mov") {
@@ -201,6 +226,29 @@ impl DirEntry {
     }
 }
 
+/// Human folder names for well-known phone paths; falls back to the raw name.
+fn friendly_folder(folder: &str, path: &PathBuf) -> String {
+    let p = path.to_string_lossy();
+    if p == "/sdcard" || p == "/sdcard/" {
+        return "Internal storage".to_string();
+    }
+    match folder {
+        "DCIM" => "Camera".to_string(),
+        "Download" => "Download".to_string(),
+        "/" => "Internal storage".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Shorten a serial for the subtitle line ("R5CR…1234" instead of 16 chars).
+fn dev_short(serial: &str) -> String {
+    if serial.len() > 12 {
+        format!("{}…{}", &serial[..4], &serial[serial.len() - 4..])
+    } else {
+        serial.to_string()
+    }
+}
+
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let z = days + 719468;
     let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
@@ -283,7 +331,22 @@ pub struct FileBrowser {
     pub search_entry: gtk4::SearchEntry,
     pub search_button: gtk4::ToggleButton,
 
-    // Banner widgets
+    // Single context bar: where am I + what is selected (replaces the
+    // old banner + sub-header double strip).
+    pub info_bar: gtk4::Box,
+    pub info_icon: gtk4::Image,
+    pub info_title: gtk4::Label,
+    pub info_subtitle: gtk4::Label,
+    pub info_count: gtk4::Label,
+    // Bottom status bar: selection summary normally, transfer progress
+    // while jobs run. One place for progress — no competing banners.
+    pub status_bar: gtk4::Box,
+    pub status_label: gtk4::Label,
+    pub status_progress: gtk4::ProgressBar,
+    pub status_pause_btn: gtk4::Button,
+    pub status_cancel_btn: gtk4::Button,
+    // Compat shims: app.rs used to touch the banner/sub-header directly.
+    // They now alias the widgets above so call sites keep compiling.
     pub banner_box: gtk4::Box,
     pub banner_status_label: gtk4::Label,
     pub banner_transport_label: gtk4::Label,
@@ -291,13 +354,13 @@ pub struct FileBrowser {
     pub banner_progress: gtk4::ProgressBar,
     pub banner_pause_btn: gtk4::Button,
     pub banner_cancel_btn: gtk4::Button,
-
-    // Subheader widgets
     pub sub_header_count_label: gtk4::Label,
     pub sub_header_path_label: gtk4::Label,
 
     current_path: Rc<RefCell<PathBuf>>,
     device: Rc<RefCell<Option<String>>>,
+    /// Friendly phone name for breadcrumbs (model when known, else serial).
+    device_display: Rc<RefCell<String>>,
     /// True while browsing the local Linux filesystem instead of a device.
     local_mode: Rc<RefCell<bool>>,
     /// FUSE mountpoint of the selected device (for drag & drop out of the
@@ -326,100 +389,50 @@ impl FileBrowser {
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         root.add_css_class("file-canvas");
 
-        // --- ADB Connected Banner (hidden until a device is actually selected) ---
-        let banner_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-        banner_box.add_css_class("adb-connected-banner");
+        // --- Context bar: one line that answers "where am I?" ---
+        // Left: device icon + "Phone name — folder" + dimmed meta line.
+        // Right: item count + refresh. Always visible, never two strips.
+        let info_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+        info_bar.add_css_class("context-bar");
+        info_bar.set_margin_start(14);
+        info_bar.set_margin_end(10);
+        info_bar.set_margin_top(8);
+        info_bar.set_margin_bottom(6);
 
-        let banner_top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        banner_top.set_valign(gtk4::Align::Center);
+        let info_icon = gtk4::Image::from_icon_name("phone-symbolic");
+        info_icon.set_pixel_size(20);
+        info_icon.add_css_class("context-icon");
+        info_icon.set_valign(gtk4::Align::Center);
+        info_bar.append(&info_icon);
 
-        let usb_icon = gtk4::Image::from_icon_name("drive-removable-media-symbolic");
-        usb_icon.add_css_class("sidebar-icon-places");
-        usb_icon.set_pixel_size(18);
-        banner_top.append(&usb_icon);
-
-        let banner_title = gtk4::Label::builder()
-            .label("Link active")
-            .build();
-        banner_title.add_css_class("heading");
-        banner_top.append(&banner_title);
-
-        let banner_transport_label = gtk4::Label::new(None);
-        banner_transport_label.add_css_class("sub-header-path");
-        banner_transport_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        banner_top.append(&banner_transport_label);
-
-        let banner_status_label = gtk4::Label::builder()
-            .label("Ready")
+        let info_text = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        info_text.set_hexpand(true);
+        let info_title = gtk4::Label::builder()
+            .label("No phone connected")
             .xalign(0.0)
-            .hexpand(true)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
-        banner_status_label.add_css_class("adb-speed-label");
-        banner_top.append(&banner_status_label);
-
-        let banner_battery_label = gtk4::Label::new(None);
-        banner_battery_label.add_css_class("adb-pill-tag");
-        banner_battery_label.set_visible(false);
-        banner_top.append(&banner_battery_label);
-
-        let banner_pause_btn = gtk4::Button::builder()
-            .label("Pause")
-            .icon_name("media-playback-pause-symbolic")
-            .tooltip_text("Pause Transfer")
-            .sensitive(false)
-            .visible(false)
-            .build();
-        banner_pause_btn.add_css_class("raised-btn");
-        banner_top.append(&banner_pause_btn);
-
-        let banner_cancel_btn = gtk4::Button::builder()
-            .label("Cancel")
-            .icon_name("process-stop-symbolic")
-            .tooltip_text("Cancel Transfer")
-            .sensitive(false)
-            .visible(false)
-            .build();
-        banner_cancel_btn.add_css_class("raised-btn");
-        banner_cancel_btn.add_css_class("destructive-hover");
-        banner_top.append(&banner_cancel_btn);
-
-        banner_box.append(&banner_top);
-
-        let banner_progress = gtk4::ProgressBar::new();
-        banner_progress.add_css_class("progress-slim");
-        banner_progress.set_visible(false);
-        banner_box.append(&banner_progress);
-
-        banner_box.set_visible(false);
-        root.append(&banner_box);
-
-        // --- Sub-header Strip (File count & ADB Permissions) ---
-        let sub_header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        sub_header_box.add_css_class("sub-header-bar");
-
-        let sub_header_count_label = gtk4::Label::builder()
-            .label("Files & Folders (0 items)")
-            .build();
-        sub_header_count_label.add_css_class("sub-header-title");
-        sub_header_box.append(&sub_header_count_label);
-
-        let sub_sep = gtk4::Label::new(Some("/"));
-        sub_sep.add_css_class("nav-pill-sep");
-        sub_header_box.append(&sub_sep);
-
-        let sub_header_path_label = gtk4::Label::builder()
-            .label("device:none:/")
+        info_title.add_css_class("context-title");
+        info_text.append(&info_title);
+        let info_subtitle = gtk4::Label::builder()
+            .label("Connect a phone with USB or Wi-Fi to get started.")
             .xalign(0.0)
-            .hexpand(true)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
-        sub_header_path_label.add_css_class("sub-header-path");
-        sub_header_box.append(&sub_header_path_label);
+        info_subtitle.add_css_class("context-subtitle");
+        info_text.append(&info_subtitle);
+        info_bar.append(&info_text);
 
-        root.append(&sub_header_box);
+        let info_count = gtk4::Label::builder()
+            .label("")
+            .xalign(1.0)
+            .build();
+        info_count.add_css_class("context-count");
+        info_count.set_valign(gtk4::Align::Center);
+        info_bar.append(&info_count);
+        root.append(&info_bar);
 
-        // --- Search (entry lives in the toolbar; see app.rs) ---
+        // --- Search (entry lives in the header; see app.rs) ---
         let search_bar = gtk4::SearchBar::new();
         let search_entry = gtk4::SearchEntry::new();
         search_entry.set_placeholder_text(Some("Search files and folders..."));
@@ -457,7 +470,7 @@ impl FileBrowser {
         breadcrumb_container.set_valign(gtk4::Align::Center);
         // Center the crumbs when the window is wide; the scroll window above
         // clamps the minimum so a deep path scrolls instead of overflowing.
-        breadcrumb_container.set_halign(gtk4::Align::Center);
+        breadcrumb_container.set_halign(gtk4::Align::Start);
         breadcrumb_scroll.set_child(Some(&breadcrumb_container));
         path_stack.add_named(&breadcrumb_scroll, Some("breadcrumbs"));
 
@@ -476,18 +489,40 @@ impl FileBrowser {
             .tooltip_text("Search files (Ctrl+F)")
             .build();
 
-        let new_folder_button = gtk4::Button::from_icon_name("folder-new-symbolic");
-        new_folder_button.set_tooltip_text(Some("New Folder"));
+        // NOTE: GTK4 shows either a button's icon-name OR its label, never
+        // both — so primary actions get an explicit icon+label child box.
+        fn action_button(icon: &str, label: &str, tooltip: &str) -> gtk4::Button {
+            let btn = gtk4::Button::new();
+            let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            let img = gtk4::Image::from_icon_name(icon);
+            hbox.append(&img);
+            hbox.append(&gtk4::Label::new(Some(label)));
+            btn.set_child(Some(&hbox));
+            btn.set_tooltip_text(Some(tooltip));
+            btn
+        }
 
-        let upload_button = gtk4::Button::from_icon_name("list-add-symbolic");
-        upload_button.set_tooltip_text(Some("Upload files to this folder (ADB Push)"));
+        let new_folder_button = action_button(
+            "folder-new-symbolic",
+            "New folder",
+            "Create a new folder here",
+        );
 
-        let download_button = gtk4::Button::from_icon_name("folder-download-symbolic");
-        download_button.set_tooltip_text(Some("Download selected file (ADB Pull)"));
+        let upload_button = action_button(
+            "document-send-symbolic",
+            "Send to phone",
+            "Copy files from this computer to the current phone folder (Ctrl+U)",
+        );
+
+        let download_button = action_button(
+            "folder-download-symbolic",
+            "Save to computer",
+            "Save the selected files to this computer (Ctrl+Shift+C)",
+        );
         download_button.set_sensitive(false);
 
         let open_external_button = gtk4::Button::from_icon_name("system-file-manager-symbolic");
-        open_external_button.set_tooltip_text(Some("Open in Nautilus / File Manager"));
+        open_external_button.set_tooltip_text(Some("Open this folder in Files"));
 
         let refresh_button = gtk4::Button::from_icon_name("view-refresh-symbolic");
         refresh_button.set_tooltip_text(Some("Reload (F5)"));
@@ -497,9 +532,9 @@ impl FileBrowser {
         // MULTIPLE enables Ctrl+click, Shift+click and rubber-band selection.
         grid_box.set_selection_mode(gtk4::SelectionMode::Multiple);
         grid_box.set_activate_on_single_click(false);
-        grid_box.set_homogeneous(true);
-        grid_box.set_column_spacing(10);
-        grid_box.set_row_spacing(10);
+        grid_box.set_homogeneous(false);
+        grid_box.set_column_spacing(8);
+        grid_box.set_row_spacing(12);
         // Let the row fill the viewport: many narrow columns on wide
         // windows, fewer on narrow ones. min 1 (not 3) so a half-tiled
         // window reflows to fewer columns instead of clipping the last one.
@@ -545,8 +580,8 @@ impl FileBrowser {
         file_view_stack.set_visible_child_name("grid");
 
         let status = adw::StatusPage::builder()
-            .title("No device selected")
-            .description("Select a device from the sidebar to browse its files.")
+            .title("Connect your phone")
+            .description("Plug it in with USB, allow USB debugging on the phone, then pick it in the sidebar. Or browse This computer on the left.")
             .icon_name("phone-symbolic")
             .vexpand(true)
             .build();
@@ -559,12 +594,55 @@ impl FileBrowser {
         main_stack.set_visible_child_name("empty");
         root.append(&main_stack);
 
+        // --- Bottom status bar: selection summary, or the one transfer
+        // progress indicator. Never floats over files.
+        let status_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        status_bar.add_css_class("status-bar");
+        let status_label = gtk4::Label::builder()
+            .label("No folder open")
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk4::pango::EllipsizeMode::End)
+            .build();
+        status_label.add_css_class("status-label");
+        status_bar.append(&status_label);
+        let status_progress = gtk4::ProgressBar::new();
+        status_progress.add_css_class("status-progress");
+        status_progress.set_size_request(160, -1);
+        status_progress.set_valign(gtk4::Align::Center);
+        status_progress.set_visible(false);
+        status_bar.append(&status_progress);
+        let status_pause_btn = gtk4::Button::from_icon_name("media-playback-pause-symbolic");
+        status_pause_btn.set_tooltip_text(Some("Pause transfers"));
+        status_pause_btn.set_visible(false);
+        status_bar.append(&status_pause_btn);
+        let status_cancel_btn = gtk4::Button::from_icon_name("process-stop-symbolic");
+        status_cancel_btn.set_tooltip_text(Some("Cancel transfers"));
+        status_cancel_btn.add_css_class("destructive-action");
+        status_cancel_btn.set_visible(false);
+        status_bar.append(&status_cancel_btn);
+        root.append(&status_bar);
+
+        // Aliases so older call sites keep working: the banner widgets are
+        // now the status-bar widgets, the sub-header labels are the context
+        // bar labels.
+        let banner_box = status_bar.clone();
+        let banner_status_label = status_label.clone();
+        let banner_transport_label = info_subtitle.clone();
+        let banner_battery_label = info_count.clone();
+        let banner_progress = status_progress.clone();
+        let banner_pause_btn = status_pause_btn.clone();
+        let banner_cancel_btn = status_cancel_btn.clone();
+        let sub_header_count_label = info_count.clone();
+        let sub_header_path_label = info_subtitle.clone();
+
         let current_path = Rc::new(RefCell::new(PathBuf::from("/")));
         let device = Rc::new(RefCell::new(None));
+        let device_display = Rc::new(RefCell::new(String::new()));
         let local_mode = Rc::new(RefCell::new(false));
         let fuse_mount: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let show_hidden = Rc::new(RefCell::new(false));
-        let zoom = Rc::new(Cell::new(64));
+        let zoom = Rc::new(Cell::new(48));
         let entries = Rc::new(RefCell::new(Vec::new()));
         let history_back = Rc::new(RefCell::new(Vec::new()));
         let history_forward = Rc::new(RefCell::new(Vec::new()));
@@ -595,6 +673,16 @@ impl FileBrowser {
             search_bar,
             search_entry,
             search_button,
+            info_bar,
+            info_icon,
+            info_title,
+            info_subtitle,
+            info_count,
+            status_bar,
+            status_label,
+            status_progress,
+            status_pause_btn,
+            status_cancel_btn,
             banner_box,
             banner_status_label,
             banner_transport_label,
@@ -606,6 +694,7 @@ impl FileBrowser {
             sub_header_path_label,
             current_path,
             device,
+            device_display,
             local_mode,
             fuse_mount,
             show_hidden,
@@ -647,43 +736,101 @@ impl FileBrowser {
         }
     }
 
-    /// Show/hide the "Connected via ADB" banner (only real devices).
-    pub fn set_connected(&self, on: bool) {
-        self.banner_box.set_visible(on);
+    /// The context bar is always visible; "connected" just changes what it says.
+    pub fn set_connected(&self, _on: bool) {}
+
+    /// Fill the context bar from live `adb` data: plain words, no jargon.
+    pub fn set_device_info(&self, info: &crate::device_list::DeviceEntry) {
+        let name = info.display_name();
+        *self.device_display.borrow_mut() = name.to_string();
+        self.info_title.set_label(name);
+        let mut meta = if info.transport == "wifi" {
+            format!("Connected over Wi-Fi • {}", info.serial)
+        } else {
+            format!("Connected over USB • {}", info.serial)
+        };
+        if let Some(pct) = info.battery_pct {
+            meta.push_str(&format!(" • Battery {}%", pct));
+        }
+        if let Some((used, total)) = info.storage.filter(|(_, t)| *t > 0) {
+            meta.push_str(&format!(
+                " • {:.1}/{:.0} GB used",
+                used as f64 / 1_073_741_824.0,
+                total as f64 / 1_073_741_824.0
+            ));
+        }
+        self.info_subtitle.set_label(&meta);
+        self.info_icon.set_icon_name(Some("phone-symbolic"));
     }
 
-    /// Fill the banner + storage metadata from live `adb` data.
-    pub fn set_device_info(&self, info: &crate::device_list::DeviceEntry) {
-        let transport_text = match info.transport {
-            "wifi" => format!("Wi-Fi • {}", info.serial),
-            _ => "USB".to_string(),
-        };
-        self.banner_transport_label.set_label(&transport_text);
-        match info.battery_pct {
-            Some(pct) => {
-                self.banner_battery_label.set_label(&format!("BAT {pct}%"));
-                self.banner_battery_label.set_visible(true);
-            }
-            None => self.banner_battery_label.set_visible(false),
+    /// Bottom status bar: transfer progress while busy, selection summary
+    /// when idle. This is the ONLY progress indicator in the content area.
+    pub fn update_transfer_banner(&self, active: bool, text: &str, fraction: f64) {
+        if active {
+            self.status_label.set_label(text);
+            self.status_progress.set_fraction(fraction);
+            self.status_progress.set_visible(true);
+            self.status_pause_btn.set_visible(true);
+            self.status_cancel_btn.set_visible(true);
+            self.status_pause_btn.set_sensitive(true);
+            self.status_cancel_btn.set_sensitive(true);
+        } else {
+            self.refresh_selection_status();
+            self.status_progress.set_fraction(0.0);
+            self.status_progress.set_visible(false);
+            self.status_pause_btn.set_visible(false);
+            self.status_cancel_btn.set_visible(false);
         }
     }
 
-    pub fn update_transfer_banner(&self, active: bool, text: &str, fraction: f64) {
-        if active {
-            self.banner_status_label.set_label(text);
-            self.banner_progress.set_fraction(fraction);
-            self.banner_progress.set_visible(true);
-            // Only take up banner space while there is something to pause.
-            self.banner_pause_btn.set_visible(true);
-            self.banner_cancel_btn.set_visible(true);
-            self.banner_pause_btn.set_sensitive(true);
-            self.banner_cancel_btn.set_sensitive(true);
+    /// (visible folders, visible files, hidden entries). Single source of
+    /// truth for the context bar and the status bar so they can never
+    /// disagree with each other.
+    fn visible_stats(&self) -> (usize, usize, usize) {
+        let show_hidden = *self.show_hidden.borrow();
+        let entries = self.entries.borrow();
+        let mut folders = 0;
+        let mut files = 0;
+        let mut hidden = 0;
+        for e in entries.iter() {
+            if !show_hidden && e.name.starts_with('.') {
+                hidden += 1;
+                continue;
+            }
+            if e.is_dir {
+                folders += 1;
+            } else {
+                files += 1;
+            }
+        }
+        (folders, files, hidden)
+    }
+
+    /// Idle status text: what is selected / how many items are here.
+    pub fn refresh_selection_status(&self) {
+        let (folders, files, hidden) = self.visible_stats();
+        let total = folders + files;
+        let sel = self.selected_entries().len();
+        if sel > 0 {
+            self.status_label.set_label(&format!(
+                "{} of {} selected",
+                sel, total
+            ));
+        } else if total == 0 {
+            self.status_label.set_label("This folder is empty");
+        } else if hidden > 0 {
+            self.status_label.set_label(&format!(
+                "{} item{} · {} hidden",
+                total,
+                if total == 1 { "" } else { "s" },
+                hidden
+            ));
         } else {
-            self.banner_status_label.set_label("Ready");
-            self.banner_progress.set_fraction(0.0);
-            self.banner_progress.set_visible(false);
-            self.banner_pause_btn.set_visible(false);
-            self.banner_cancel_btn.set_visible(false);
+            self.status_label.set_label(&format!(
+                "{} item{}",
+                total,
+                if total == 1 { "" } else { "s" }
+            ));
         }
     }
 
@@ -697,24 +844,31 @@ impl FileBrowser {
 
         if let Some(dev) = device {
             self.set_buttons_sensitive(true);
-            self.set_connected(true);
             self.show_list();
-            self.sub_header_path_label.set_label(&format!("device:{dev}:/"));
+            self.info_title.set_label(dev);
+            self.info_subtitle.set_label(&format!("Connected • {}", dev));
+            self.info_icon.set_icon_name(Some("phone-symbolic"));
             self.render_breadcrumbs(&PathBuf::from("/"));
         } else {
             self.set_buttons_sensitive(false);
-            self.set_connected(false);
             self.clear();
             self.show_empty();
-            self.sub_header_path_label.set_label("device:none:/");
+            self.info_title.set_label("No phone connected");
+            self.info_subtitle
+                .set_label("Connect a phone with USB or Wi-Fi to get started.");
             self.render_breadcrumbs(&PathBuf::from("/"));
         }
+    }
+
+    /// Override the breadcrumb phone name (e.g. with the model name).
+    pub fn set_device_display_name(&self, name: &str) {
+        *self.device_display.borrow_mut() = name.to_string();
     }
 
     pub fn current_path(&self) -> PathBuf { self.current_path.borrow().clone() }
     pub fn device(&self) -> Option<String> { self.device.borrow().clone() }
 
-    /// Switch to browsing the local Linux filesystem, starting at `/`.
+    /// Switch to browsing this computer's files.
     pub fn set_local_mode(&self) {
         *self.local_mode.borrow_mut() = true;
         *self.device.borrow_mut() = None;
@@ -723,7 +877,9 @@ impl FileBrowser {
         self.history_back.borrow_mut().clear();
         self.history_forward.borrow_mut().clear();
         self.set_buttons_sensitive(true);
-        self.set_connected(false);
+        self.info_icon.set_icon_name(Some("drive-harddisk-symbolic"));
+        self.info_title.set_label("This computer");
+        self.info_subtitle.set_label("Your Linux files — pick a folder in the sidebar.");
         self.show_list();
         self.update_nav_buttons();
     }
@@ -764,8 +920,8 @@ impl FileBrowser {
 
     pub fn zoom_out(&self) {
         let cur = self.zoom.get();
-        if cur > 48 {
-            self.zoom.set((cur / 2).max(48));
+        if cur > 32 {
+            self.zoom.set((cur / 2).max(32));
             let all = self.entries.borrow().clone();
             self.set_entries(all);
         }
@@ -864,9 +1020,15 @@ impl FileBrowser {
         self.clear();
         *self.entries.borrow_mut() = entries.clone();
 
-        let count = entries.len();
-
-        self.sub_header_count_label.set_label(&format!("Files & Folders ({} items)", count));
+        let (folders, files, _) = self.visible_stats();
+        self.info_count.set_label(&format!(
+            "{} folder{}, {} file{}",
+            folders,
+            if folders == 1 { "" } else { "s" },
+            files,
+            if files == 1 { "" } else { "s" }
+        ));
+        self.refresh_selection_status();
 
         for e in entries {
             // Hide dotfiles unless toggled on (entries vec keeps everything).
@@ -958,13 +1120,13 @@ impl FileBrowser {
             // width, so the card must FILL its cell (not center a fixed
             // 78px box inside it) — otherwise the leftover becomes the
             // huge dead gutters seen in screenshots.
-            let card = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            let card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
             card.add_css_class("grid-item-card");
             card.set_valign(gtk4::Align::Start);
             let icon_px = self.zoom.get();
             // Minimum width only: the card expands with its cell, and the
             // height stays natural so labels never clip.
-            card.set_size_request(108, -1);
+            card.set_size_request(104, -1);
             card.set_halign(gtk4::Align::Fill);
             card.set_hexpand(true);
             card.set_valign(gtk4::Align::Start);
@@ -1013,16 +1175,7 @@ impl FileBrowser {
             grid_title.add_css_class("grid-item-title");
             card.append(&grid_title);
 
-            let sub_text = if e.is_dir { "Folder".to_string() } else { e.display_size() };
-            let grid_sub = gtk4::Label::builder()
-                .label(sub_text)
-                .justify(gtk4::Justification::Center)
-                .xalign(0.5)
-                .hexpand(true)
-                .build();
-            grid_sub.set_halign(gtk4::Align::Fill);
-            grid_sub.add_css_class("grid-item-sub");
-            card.append(&grid_sub);
+
 
             // Right-click: select-under-cursor, then selection-aware menu.
             let card_rc = gtk4::GestureClick::new();
@@ -1085,17 +1238,39 @@ impl FileBrowser {
         self.render_breadcrumbs(&path);
         self.path_entry.set_text(&path.to_string_lossy());
 
-        let dev_str = self.device.borrow().clone().unwrap_or_else(|| "device".to_string());
+        // Context bar keeps the human-readable location: folder name as the
+        // title, full path as the subtitle. No "device:x:" prefixes.
+        let folder = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("/");
         if self.is_local_mode() {
-            self.sub_header_path_label.set_label(&format!("local:{}", path.display()));
-        } else {
-            self.sub_header_path_label.set_label(&format!("device:{}:{}", dev_str, path.display()));
+            self.info_icon.set_icon_name(Some("drive-harddisk-symbolic"));
+            if path.as_os_str() == "/" {
+                self.info_title.set_label("This computer");
+            } else {
+                self.info_title.set_label(folder);
+            }
+            self.info_subtitle.set_label(&path.to_string_lossy());
+        } else if let Some(dev) = self.device.borrow().clone() {
+            let pretty = friendly_folder(folder, &path);
+            self.info_title.set_label(&pretty);
+            self.info_subtitle
+                .set_label(&format!("{} • {}", dev_short(&dev), path.to_string_lossy()));
         }
         self.update_nav_buttons();
     }
 
     pub fn set_loading(&self, loading: bool) {
         self.refresh_button.set_sensitive(!loading);
+        self.up_button.set_sensitive(!loading && *self.current_path.borrow() != PathBuf::from("/"));
+        // Visible feedback: the refresh action lives in the overflow menu, so
+        // mirror the state in the status bar (unless a transfer owns it).
+        if loading && !self.status_progress.is_visible() {
+            self.status_label.set_label("Loading…");
+        } else if !loading && !self.status_progress.is_visible() {
+            self.refresh_selection_status();
+        }
     }
 
     pub fn is_loading(&self) -> bool {
@@ -1147,11 +1322,11 @@ impl FileBrowser {
         let path_str = path.to_string_lossy();
 
         if self.is_local_mode() {
-            // Local Linux filesystem: root pill is "Linux Root".
+            // This computer: first crumb names the source, not a raw "/".
             let root_btn = gtk4::Button::builder()
                 .icon_name("drive-harddisk-symbolic")
-                .label("Linux Root")
-                .tooltip_text("Linux filesystem root")
+                .label("This computer")
+                .tooltip_text("Your Linux files")
                 .build();
             root_btn.add_css_class("nav-pill-btn");
             if path_str == "/" {
@@ -1178,11 +1353,7 @@ impl FileBrowser {
                 let target_path = accum.clone();
                 let is_last = i == comps.len() - 1;
 
-                let label_text = if is_last {
-                    format!("{} ▾", comp.to_string_lossy())
-                } else {
-                    comp.to_string_lossy().to_string()
-                };
+                let label_text = comp.to_string_lossy().to_string();
 
                 let seg_btn = gtk4::Button::with_label(&label_text);
                 seg_btn.add_css_class("nav-pill-btn");
@@ -1200,13 +1371,23 @@ impl FileBrowser {
             return;
         }
 
-        let dev_name = self.device.borrow().clone().unwrap_or_else(|| "No device".to_string());
+        // First crumb names the phone (model when known), never a raw dump.
+        let friendly = self.device_display.borrow().clone();
+        let dev_name = if friendly.is_empty() {
+            self.device
+                .borrow()
+                .clone()
+                .map(|s| dev_short(&s))
+                .unwrap_or_else(|| "Phone".to_string())
+        } else {
+            friendly
+        };
 
         // 1. Device pill button
         let dev_btn = gtk4::Button::builder()
             .icon_name("phone-symbolic")
             .label(&dev_name)
-            .tooltip_text("Device Storage")
+            .tooltip_text("Phone storage")
             .build();
         dev_btn.add_css_class("nav-pill-btn");
         let on_event = self.on_event.clone();
@@ -1229,7 +1410,7 @@ impl FileBrowser {
 
         if path_str.starts_with("/sdcard") {
             let is_storage_root = path_str == "/sdcard" || path_str == "/sdcard/";
-            let storage_btn = gtk4::Button::with_label(if is_storage_root { "Internal Storage ▾" } else { "Internal Storage" });
+            let storage_btn = gtk4::Button::with_label("Internal storage");
             storage_btn.add_css_class("nav-pill-btn");
             if is_storage_root {
                 storage_btn.add_css_class("current");
@@ -1254,11 +1435,7 @@ impl FileBrowser {
                 let target_path = accum.clone();
                 let is_last = i == comps.len() - 1;
 
-                let label_text = if is_last {
-                    format!("{} ▾", comp.to_string_lossy())
-                } else {
-                    comp.to_string_lossy().to_string()
-                };
+                let label_text = comp.to_string_lossy().to_string();
 
                 let seg_btn = gtk4::Button::with_label(&label_text);
                 seg_btn.add_css_class("nav-pill-btn");
@@ -1285,11 +1462,7 @@ impl FileBrowser {
                 let target_path = accum.clone();
                 let is_last = i == comps.len() - 1;
 
-                let label_text = if is_last {
-                    format!("{} ▾", comp.to_string_lossy())
-                } else {
-                    comp.to_string_lossy().to_string()
-                };
+                let label_text = comp.to_string_lossy().to_string();
 
                 let seg_btn = gtk4::Button::with_label(&label_text);
                 seg_btn.add_css_class("nav-pill-btn");
@@ -1375,7 +1548,7 @@ impl FileBrowser {
             }
         });
 
-        // Banner Pause & Cancel
+        // Status-bar Pause & Cancel (same widgets as the old banner names)
         let on_ev_pause = self.on_event.clone();
         self.banner_pause_btn.connect_clicked(move |_| {
             if let Some(cb) = on_ev_pause.borrow().as_ref() {
@@ -1467,9 +1640,11 @@ impl FileBrowser {
             let entries_sel = self.entries.clone();
             let dl_btn = self.download_button.clone();
             let on_event_sel = self.on_event.clone();
+            let status_refresh = self.clone();
             self.list_box.connect_selected_rows_changed(move |_lb| {
                 let files = selected_entries_from_list(&lb_sel, &entries_sel);
                 dl_btn.set_sensitive(files.iter().any(|e| !e.is_dir));
+                status_refresh.refresh_selection_status();
                 if let Some(cb) = on_event_sel.borrow().as_ref() {
                     cb(BrowserEvent::Selected(files.first().cloned()));
                 }
@@ -1505,9 +1680,11 @@ impl FileBrowser {
             let grid_sel = self.grid_box.clone();
             let entries_gsel = self.entries.clone();
             let dl_btn_g = self.download_button.clone();
+            let status_refresh_g = self.clone();
             self.grid_box.connect_selected_children_changed(move |_fb| {
                 let files = selected_entries_from_grid(&grid_sel, &entries_gsel);
                 dl_btn_g.set_sensitive(files.iter().any(|e| !e.is_dir));
+                status_refresh_g.refresh_selection_status();
             });
         }
 
@@ -1933,7 +2110,7 @@ fn show_context_menu(
     // 2. Open With Other Application... (single)
     let (open_with_btn, _) = create_menu_button(
         "system-file-manager-symbolic",
-        "Open With Other Application...",
+        "Open with…",
         None,
         false,
         false,
@@ -1952,10 +2129,10 @@ fn show_context_menu(
 
     menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-    // 3. Copy to Linux Home (ADB Pull) — the whole selection
+    // Copy between phone and computer — plain words, whole selection.
     let (pull_btn, _) = create_menu_button(
         "folder-download-symbolic",
-        "Copy to Linux Home (ADB Pull)",
+        if local { "Copy to Downloads" } else { "Save to computer" },
         Some("Ctrl+Shift+C"),
         true,
         false,
@@ -1972,10 +2149,9 @@ fn show_context_menu(
     }
     menu_box.append(&pull_btn);
 
-    // 4. Push File to Device (ADB Push)...
     let (push_btn, _) = create_menu_button(
-        "list-add-symbolic",
-        "Push File to Device (ADB Push)...",
+        "send-to-symbolic",
+        "Send files to phone…",
         Some("Ctrl+U"),
         false,
         false,
@@ -1990,10 +2166,10 @@ fn show_context_menu(
     }
     menu_box.append(&push_btn);
 
-    // 5. Install APK via ADB (only when the selection contains APKs)
+    // Install APK (only when the selection contains APKs)
     let (apk_btn, _) = create_menu_button(
         "application-x-executable-symbolic",
-        "Install APK via ADB",
+        "Install app from APK",
         None,
         false,
         false,
@@ -2014,30 +2190,13 @@ fn show_context_menu(
 
     menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-    // 6. Cut / 7. Copy — clipboard gets every selected path.
-    let clipboard_paths = |entries: &[DirEntry], curr: &PathBuf| -> String {
-        entries
+    let (copy_btn, _) = create_menu_button("edit-copy-symbolic", "Copy path", Some("Ctrl+C"), false, false);
+    {
+        let paths = selected
             .iter()
-            .map(|e| curr.join(&e.name).to_string_lossy().to_string())
+            .map(|e| curr_path.join(&e.name).to_string_lossy().to_string())
             .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let (cut_btn, _) = create_menu_button("edit-cut-symbolic", "Cut", Some("Ctrl+X"), false, false);
-    {
-        let paths = clipboard_paths(selected, curr_path);
-        let p = popover.clone();
-        cut_btn.connect_clicked(move |_| {
-            p.popdown();
-            if let Some(display) = gdk4::Display::default() {
-                display.clipboard().set_text(&paths);
-            }
-        });
-    }
-    menu_box.append(&cut_btn);
-
-    let (copy_btn, _) = create_menu_button("edit-copy-symbolic", "Copy", Some("Ctrl+C"), false, false);
-    {
-        let paths = clipboard_paths(selected, curr_path);
+            .join("\n");
         let p = popover.clone();
         copy_btn.connect_clicked(move |_| {
             p.popdown();
@@ -2075,7 +2234,7 @@ fn show_context_menu(
 
     let (del_btn, _) = create_menu_button(
         "edit-delete-symbolic",
-        "Delete Permanently from Android",
+        if local { "Delete permanently" } else { "Delete from phone" },
         Some("Shift+Del"),
         false,
         true,
@@ -2095,21 +2254,10 @@ fn show_context_menu(
 
     menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-    // 10. Compress... (single)
-    let (comp_btn, _) = create_menu_button("package-x-generic-symbolic", "Compress...", None, false, false);
-    comp_btn.set_sensitive(single);
-    {
-        let p = popover.clone();
-        comp_btn.connect_clicked(move |_| {
-            p.popdown();
-        });
-    }
-    menu_box.append(&comp_btn);
-
-    // 11. Open in Terminal (single)
+    // Open in Terminal (single)
     let (term_btn, _) = create_menu_button(
         "utilities-terminal-symbolic",
-        "Open in Terminal (ADB Shell)",
+        "Open in terminal",
         Some("Alt+T"),
         false,
         false,
