@@ -1615,6 +1615,24 @@ impl FileBrowser {
             }
         });
 
+        // Escape in the path entry returns to breadcrumb (title) mode. The
+        // toggle button is not packed in any container: app.rs shows the
+        // entry by swapping the header title widget to the path stack, so
+        // deactivating the toggle here is what restores the title.
+        {
+            let edit_toggle_esc = self.path_edit_toggle.clone();
+            let esc = gtk4::EventControllerKey::new();
+            esc.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            esc.connect_key_pressed(move |_, key, _, _| {
+                if key == gdk4::Key::Escape {
+                    edit_toggle_esc.set_active(false);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            self.path_entry.add_controller(esc);
+        }
+
         // Search bar toggle
         let search_bar = self.search_bar.clone();
         self.search_button.connect_toggled(move |btn| {
@@ -1964,10 +1982,19 @@ impl FileBrowser {
             let on_ev = self.on_event.clone();
             add_shortcut("F5", gtk4::CallbackAction::new(move |_, _| { emit_ev(&on_ev, BrowserEvent::Refresh); glib::Propagation::Proceed }));
         }
-        // Ctrl+F / Ctrl+L — search / path entry
+        // Ctrl+F — reveal the search bar and focus its entry. The entry only
+        // receives key events while the SearchBar is in search mode, so
+        // grabbing focus without revealing the bar was a no-op.
         {
+            let btn = self.search_button.clone();
             let entry = self.search_entry.clone();
-            add_shortcut("<Control>f", gtk4::CallbackAction::new(move |_, _| { entry.grab_focus(); glib::Propagation::Proceed }));
+            add_shortcut("<Control>f", gtk4::CallbackAction::new(move |_, _| {
+                if !btn.is_active() {
+                    btn.set_active(true); // toggled handler sets search mode
+                }
+                entry.grab_focus();
+                glib::Propagation::Proceed
+            }));
         }
         {
             let btn = self.path_edit_toggle.clone();
