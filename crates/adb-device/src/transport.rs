@@ -315,7 +315,6 @@ fn open_usb_pump(
     std::thread::Builder::new()
         .name("adb-usb-pump".into())
         .spawn(move || {
-            use std::io::Write;
             let mut buf = vec![0u8; 64 * 1024];
             let read_timeout = std::time::Duration::from_millis(2);
             let write_timeout = std::time::Duration::from_millis(5_000);
