@@ -811,16 +811,24 @@ fn client_for(state: &Arc<Mutex<State>>, device: &str) -> Result<Arc<ProxyClient
         .ok_or_else(|| zbus::fdo::Error::ServiceUnknown("device not connected".into()))
 }
 
+/// Maximum recursion depth for `delete_recursive`; beyond this we assume a
+/// cycle or a pathological tree and refuse rather than recurse forever.
+const DELETE_MAX_DEPTH: u32 = 64;
+
 /// Recursively delete `path` on the device via proxy ops (there is no
-/// server-side `rm -r` in the proxy protocol).
-async fn delete_recursive(client: &ProxyClient, path: &str) -> anyhow::Result<()> {
+/// server-side `rm -r` in the proxy protocol). `depth` is capped at
+/// `DELETE_MAX_DEPTH`.
+async fn delete_recursive(client: &ProxyClient, path: &str, depth: u32) -> anyhow::Result<()> {
+    if depth > DELETE_MAX_DEPTH {
+        anyhow::bail!("delete: recursion deeper than {DELETE_MAX_DEPTH} levels at '{path}'");
+    }
     let st = client.lstat(path).await?;
     if st.mode.is_symlink() || !st.mode.is_dir() {
         return client.unlink(path).await.map_err(|e| anyhow::anyhow!("{e}"));
     }
     for entry in client.listdir(path).await? {
         let child = format!("{}/{}", path.trim_end_matches('/'), entry.name);
-        Box::pin(delete_recursive(client, &child)).await?;
+        Box::pin(delete_recursive(client, &child, depth + 1)).await?;
     }
     client.rmdir(path).await.map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -973,8 +981,19 @@ impl ManagerInterface {
 
     /// Delete a file or directory tree on the device.
     async fn delete(&self, device: &str, path: &str) -> zbus::fdo::Result<()> {
+        // Refuse to delete the device root (directly or via `..` / `//`
+        // trickery) — D-Bus callers must delete concrete subtrees.
+        let normalized: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        if normalized.is_empty() || normalized.contains(&"..") {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "refusing to delete the device root".into(),
+            ));
+        }
         let client = client_for(&self.state, device)?;
-        delete_recursive(&client, path).await
+        delete_recursive(&client, path, 0).await
             .map_err(|e| zbus::fdo::Error::Failed(format!("delete: {e}")))
     }
 
