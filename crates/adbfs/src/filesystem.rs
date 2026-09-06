@@ -628,8 +628,64 @@ impl Filesystem for Adbfs {
         };
         match self.proxy.rename(&src_str, &dst_str) {
             Ok(()) => {
-                self.cache.invalidate(&src);
-                self.cache.invalidate(&dst);
+                // Was src a directory? Prefer the cached stat, fall back to
+                // a fresh one; if neither is available assume a plain file.
+                let is_dir = self
+                    .cache
+                    .get(&src)
+                    .map(|s| s.mode.is_dir())
+                    .unwrap_or_else(|| {
+                        self.proxy.stat(&src_str).ok().map(|s| s.mode.is_dir()).unwrap_or(false)
+                    });
+
+                // Move the inode mappings from src to dst so existing inode
+                // numbers (and therefore the kernel's cached nodeids) stay
+                // valid across the rename. For a directory rename, rewrite
+                // every descendant path too.
+                {
+                    let mut p2i = self.path_to_ino.lock();
+                    let mut i2p = self.ino_to_path.lock();
+
+                    // If the rename overwrote an existing destination, its
+                    // old inode is gone; drop it so a later lookup at that
+                    // path allocates a fresh inode.
+                    if let Some(dst_ino) = p2i.remove(&dst) {
+                        i2p.remove(&dst_ino);
+                    }
+
+                    let mut moved: Vec<(u64, PathBuf)> = Vec::new();
+                    if let Some(ino) = p2i.remove(&src) {
+                        moved.push((ino, dst.clone()));
+                    }
+                    if is_dir {
+                        let stale: Vec<PathBuf> = p2i
+                            .keys()
+                            .filter(|p| p.starts_with(&src))
+                            .cloned()
+                            .collect();
+                        for old in stale {
+                            if let Some(ino) = p2i.remove(&old) {
+                                let rel = old.strip_prefix(&src).unwrap_or_else(|_| Path::new(""));
+                                moved.push((ino, dst.join(rel)));
+                            }
+                        }
+                    }
+                    for (ino, new_path) in moved {
+                        i2p.insert(ino, new_path.clone());
+                        p2i.insert(new_path, ino);
+                    }
+                }
+
+                // Drop cached stats for the old location (and, for a
+                // directory rename, its whole subtree) and for the
+                // destination, which may have been overwritten.
+                if is_dir {
+                    self.cache.invalidate_prefix(&src);
+                    self.cache.invalidate_prefix(&dst);
+                } else {
+                    self.cache.invalidate(&src);
+                    self.cache.invalidate(&dst);
+                }
                 reply.ok();
             }
             Err(e) => reply.error(Self::proxy_to_errno(e)),
