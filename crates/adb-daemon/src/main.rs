@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:5037")]
     adb_server: String,
 
-    /// Number of concurrent proxy connections per device.
+    /// Number of concurrent proxy connections per device (1-64).
     #[arg(long, default_value_t = 4)]
     proxy_conns: usize,
 
@@ -55,12 +55,99 @@ struct DeviceSlot {
     mountpoint: Option<PathBuf>,
     /// Pooled client to the device-side proxy binary.
     client: Arc<ProxyClient>,
+    /// Host-side TCP port of this device's `adb forward`. Each device gets its
+    /// own port so several devices can be connected simultaneously; the
+    /// device-side port stays fixed at `DEFAULT_PROXY_PORT`.
+    host_port: u16,
+    /// Whether a full setup (push, forward, proxy start) completed for this
+    /// device. Re-add/Changed events use it to decide between a health check
+    /// and a full (proxy-killing) re-setup.
+    setup_ok: bool,
 }
 
 #[derive(Debug, Default)]
 struct State {
     /// serial -> slot
     devices: HashMap<DeviceId, DeviceSlot>,
+}
+
+/// Mountpoint for a device under `mount_base`, or None if the serial can't be
+/// safely used as a path component (or FUSE is disabled).
+fn mountpoint_for(mount_base: &std::path::Path, serial: &str, no_fuse: bool) -> Option<PathBuf> {
+    if no_fuse {
+        return None;
+    }
+    match sanitize_mount_name(serial) {
+        Some(name) => Some(mount_base.join(name)),
+        None => {
+            warn!(serial, "serial is not usable as a mount directory; skipping FUSE mount");
+            None
+        }
+    }
+}
+
+/// Parse an `--adb-server` "host:port" spec. Handles bracketed IPv6 hosts
+/// like `[::1]:5037`, which a naive `split(':')` would shred. Falls back to
+/// the adb default port 5037 when no (valid) port is present.
+fn parse_adb_server(spec: &str) -> (String, u16) {
+    if let Some(rest) = spec.strip_prefix('[') {
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5037);
+            return (host.to_string(), port);
+        }
+    }
+    match spec.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.parse().unwrap_or(5037)),
+        None => (spec.to_string(), 5037),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adb_server_parses_ipv4_and_default() {
+        assert_eq!(parse_adb_server("127.0.0.1:5037"), ("127.0.0.1".into(), 5037));
+        assert_eq!(parse_adb_server("127.0.0.1:5555"), ("127.0.0.1".into(), 5555));
+        assert_eq!(parse_adb_server("localhost"), ("localhost".into(), 5037));
+        assert_eq!(parse_adb_server("localhost:abc"), ("localhost".into(), 5037));
+    }
+
+    #[test]
+    fn adb_server_parses_bracketed_ipv6() {
+        assert_eq!(parse_adb_server("[::1]:5037"), ("::1".into(), 5037));
+        assert_eq!(parse_adb_server("[::1]:5555"), ("::1".into(), 5555));
+        assert_eq!(parse_adb_server("[fe80::1]"), ("fe80::1".into(), 5037));
+    }
+
+    #[test]
+    fn sanitize_keeps_safe_characters() {
+        assert_eq!(sanitize_mount_name("abc-123_XY.09"), Some("abc-123_XY.09".into()));
+    }
+
+    #[test]
+    fn sanitize_replaces_unsafe_characters() {
+        assert_eq!(sanitize_mount_name("a/b\\c d"), Some("a_b_c_d".into()));
+    }
+
+    #[test]
+    fn sanitize_rejects_dangerous_components() {
+        assert_eq!(sanitize_mount_name(""), None);
+        assert_eq!(sanitize_mount_name("."), None);
+        assert_eq!(sanitize_mount_name(".."), None);
+    }
+
+    #[test]
+    fn sanitize_cannot_escape_mount_base() {
+        // A traversal attempt collapses to harmless underscores.
+        let cleaned = sanitize_mount_name("../../etc").unwrap();
+        assert!(!cleaned.contains('/'));
+        assert_ne!(cleaned, "..");
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -73,6 +160,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // `--proxy-conns 0` would create a zero-permit semaphore that deadlocks
+    // every RPC; refuse it (and absurd values) with a clear error.
+    if !(1..=64).contains(&cli.proxy_conns) {
+        anyhow::bail!(
+            "--proxy-conns must be between 1 and 64 (got {})",
+            cli.proxy_conns
+        );
+    }
     let mount_base = cli.mount_base.clone().unwrap_or_else(|| {
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
@@ -89,10 +184,8 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(Mutex::new(State::default()));
     let (queue, mut queue_rx) = JobQueue::new(transfer_engine::DEFAULT_PARALLELISM);
-    let watcher = DeviceWatcher::from_adb_server(
-        &cli.adb_server.split(':').next().unwrap_or("127.0.0.1"),
-        cli.adb_server.split(':').nth(1).and_then(|s| s.parse().ok()).unwrap_or(5037),
-    );
+    let (adb_host, adb_port) = parse_adb_server(&cli.adb_server);
+    let watcher = DeviceWatcher::from_adb_server(&adb_host, adb_port);
     let mut events = watcher.subscribe();
     let state_clone = state.clone();
     let mount_base_clone = mount_base.clone();
@@ -104,58 +197,32 @@ async fn main() -> anyhow::Result<()> {
             match ev {
                 adb_device::watcher::WatchEvent::Added(id) => {
                     info!(?id, "device added");
-                    let mp = if no_fuse { None } else { Some(mount_base_clone.join(id.as_str())) };
-                    if let Some(ref p) = mp {
-                        if let Err(_e) = std::fs::create_dir_all(p) {
-                            let _ = Command::new("fusermount3").args(["-u", "-z", p.to_str().unwrap()]).status().await;
-                            let _ = Command::new("umount").args(["-l", p.to_str().unwrap()]).status().await;
-                            if let Err(e2) = std::fs::create_dir_all(p) {
-                                error!(?e2, "create mountpoint");
-                                continue;
-                            }
-                        }
-                    }
-                    match setup(id.clone(), mp.clone(), proxy_conns).await {
-                        Ok(client) => {
-                            state_clone.lock().devices.insert(id.clone(), DeviceSlot {
-                                mountpoint: mp,
-                                client: Arc::new(client),
-                            });
-                            info!(?id, "device ready");
-                        }
-                        Err(e) => {
-                            error!(?id, ?e, "setup/mount");
-                        }
-                    }
+                    ensure_device_ready(&state_clone, &id, &mount_base_clone, no_fuse, proxy_conns)
+                        .await;
                 }
                 adb_device::watcher::WatchEvent::Removed(id) => {
                     info!(?id, "device removed");
                     let slot = state_clone.lock().devices.remove(&id);
-                    if let Some(DeviceSlot { mountpoint: Some(mp), .. }) = slot {
-                        let _ = Command::new("fusermount3").args(["-u", "-z", mp.to_str().unwrap()]).status().await;
+                    if let Some(slot) = slot {
+                        // Kill the on-device proxy and drop our forward
+                        // (only ours — never the user's other forwards).
+                        teardown_device(id.as_str(), slot.host_port).await;
+                        if let Some(mp) = slot.mountpoint {
+                            let mp_str = mp.to_string_lossy().into_owned();
+                            let _ = Command::new("fusermount3").args(["-u", "-z", &mp_str]).status().await;
+                        }
                     }
                 }
                 adb_device::watcher::WatchEvent::Changed(id) => {
                     info!(?id, "device state changed");
                     // If the device was added while still authorizing, setup
                     // failed; the user accepting the prompt fires this event —
-                    // retry for anything not registered yet.
-                    let already = state_clone.lock().devices.contains_key(&id);
-                    if !already {
-                        let mp = if no_fuse { None } else { Some(mount_base_clone.join(id.as_str())) };
-                        match setup(id.clone(), mp.clone(), proxy_conns).await {
-                            Ok(client) => {
-                                state_clone.lock().devices.insert(id.clone(), DeviceSlot {
-                                    mountpoint: mp,
-                                    client: Arc::new(client),
-                                });
-                                info!(?id, "device ready (post-authorize retry)");
-                            }
-                            Err(e) => {
-                                error!(?id, ?e, "setup retry failed");
-                            }
-                        }
-                    }
+                    // ensure_device_ready retries, but only tears down and
+                    // re-runs setup when the existing setup is actually broken
+                    // (a healthy setup is just health-checked, so active
+                    // transfers aren't killed by a re-add/Changed event).
+                    ensure_device_ready(&state_clone, &id, &mount_base_clone, no_fuse, proxy_conns)
+                        .await;
                 }
             }
         }
@@ -207,104 +274,258 @@ async fn main() -> anyhow::Result<()> {
     // Idle loop.
     tokio::signal::ctrl_c().await?;
     info!("shutting down");
-    {
-        let devices = state.lock().devices.drain().collect::<Vec<_>>();
-        for (_id, slot) in devices {
-            if let Some(mp) = slot.mountpoint {
-                let _ = std::process::Command::new("fusermount3").args(["-u", "-z", mp.to_str().unwrap()]).status();
-            }
+    for (id, slot) in state.lock().devices.drain().collect::<Vec<_>>() {
+        // Kill the on-device proxy and drop our host-side forward.
+        teardown_device(id.as_str(), slot.host_port).await;
+        if let Some(mp) = slot.mountpoint {
+            let mp_str = mp.to_string_lossy().into_owned();
+            let _ = Command::new("fusermount3").args(["-u", "-z", &mp_str]).status().await;
         }
     }
     drop(conn);
     Ok(())
 }
 
+/// Timeout for a single file-transfer-sized adb command (e.g. pushing the
+/// proxy binary to the device).
+const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for quick adb commands (shell one-liners, forward, getprop).
+const ADB_CMD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `adb <args>` with a hard timeout so a hung device or adb server can't
+/// stall the single watcher task. Returns the command's exit status.
+async fn adb_run(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
+    tokio::time::timeout(timeout, Command::new("adb").args(args).kill_on_drop(true).status())
+        .await
+        .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
+        .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
+}
+
+/// `adb_run` variant that captures stdout/stderr.
+async fn adb_run_output(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::Output> {
+    tokio::time::timeout(timeout, Command::new("adb").args(args).kill_on_drop(true).output())
+        .await
+        .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
+        .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
+}
+
+/// True if the pooled client can still serve requests (proxy reachable).
+async fn device_healthy(client: &ProxyClient) -> bool {
+    tokio::time::timeout(Duration::from_secs(3), client.stat("/"))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// Handle a device appearing (Added) or changing state (Changed).
+///
+/// If a setup already exists for this device we must NOT blindly re-run
+/// `setup()`: it `pkill`s the on-device proxy, killing any in-flight
+/// transfers. Instead, an existing setup is health-checked and only torn
+/// down + re-set-up when it is actually broken (or `setup()` never
+/// completed, in which case there is no slot at all).
+///
+/// NOTE: there is still a small race window between the health check and a
+/// concurrent transfer, and a full re-setup does not stop the previous FUSE
+/// thread; a complete device lifecycle rework is tracked separately.
+async fn ensure_device_ready(
+    state: &Arc<Mutex<State>>,
+    id: &DeviceId,
+    mount_base: &std::path::Path,
+    no_fuse: bool,
+    proxy_conns: usize,
+) {
+    let existing = state
+        .lock()
+        .devices
+        .get(id)
+        .map(|slot| (slot.client.clone(), slot.setup_ok, slot.host_port));
+    if let Some((client, setup_ok, host_port)) = existing {
+        if setup_ok && device_healthy(&client).await {
+            info!(?id, "existing setup healthy; skipping re-setup");
+            return;
+        }
+        warn!(?id, "existing setup broken; tearing down before re-setup");
+        teardown_device(id.as_str(), host_port).await;
+        state.lock().devices.remove(id);
+    }
+
+    let mp = mountpoint_for(mount_base, id.as_str(), no_fuse);
+    if let Some(ref p) = mp {
+        if let Err(_e) = std::fs::create_dir_all(p) {
+            // Probably a stale mount from a previous run — try to clear it.
+            let p_str = p.to_string_lossy().into_owned();
+            let _ = Command::new("fusermount3").args(["-u", "-z", &p_str]).status().await;
+            let _ = Command::new("umount").args(["-l", &p_str]).status().await;
+            if let Err(e2) = std::fs::create_dir_all(p) {
+                error!(?e2, "create mountpoint");
+                return;
+            }
+        }
+    }
+    match setup(id.clone(), mp.clone(), proxy_conns).await {
+        Ok((client, host_port)) => {
+            state.lock().devices.insert(
+                id.clone(),
+                DeviceSlot {
+                    mountpoint: mp,
+                    client: Arc::new(client),
+                    host_port,
+                    setup_ok: true,
+                },
+            );
+            info!(?id, "device ready");
+        }
+        Err(e) => {
+            error!(?id, ?e, "setup/mount");
+        }
+    }
+}
+
 async fn setup(
     device: DeviceId,
     mountpoint: Option<PathBuf>,
     proxy_conns: usize,
-) -> anyhow::Result<ProxyClient> {
+) -> anyhow::Result<(ProxyClient, u16)> {
     let proxy_src = locate_proxy_binary(&device).await?;
     info!(?proxy_src, ?PROXY_BIN_PATH, "pushing proxy binary");
     // The device may still be waiting for the user to accept the USB
-    // debugging prompt ("device still authorizing") — retry briefly.
-    let mut status = None;
+    // debugging prompt ("device still authorizing") — retry briefly. Each
+    // push attempt is hard-timeboxed so one hung device can't stall the
+    // watcher; transport-level errors (timeouts) give up after 3 attempts.
+    let proxy_src_str = proxy_src.to_string_lossy().into_owned();
+    let mut push_status = None;
+    let mut push_err: Option<String> = None;
     for attempt in 0..15 {
-        let st = Command::new("adb")
-            .args(["-s", device.as_str(), "push", proxy_src.to_str().unwrap(), PROXY_BIN_PATH])
-            .status()
-            .await?;
-        if st.success() {
-            status = Some(st);
-            break;
-        }
-        if attempt == 14 {
-            status = Some(st);
+        match adb_run(
+            &["-s", device.as_str(), "push", &proxy_src_str, PROXY_BIN_PATH],
+            ADB_PUSH_TIMEOUT,
+        )
+        .await
+        {
+            Ok(st) if st.success() => {
+                push_status = Some(st);
+                break;
+            }
+            Ok(st) => {
+                // Usually "device still authorizing" — keep retrying.
+                push_status = Some(st);
+            }
+            Err(e) => {
+                push_err = Some(e.to_string());
+                if attempt >= 2 {
+                    break;
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
-    let status = status.unwrap();
+    if let Some(e) = push_err {
+        anyhow::bail!("adb push failed: {e}");
+    }
+    let status = push_status.expect("push loop set a status or bailed");
     if !status.success() {
         anyhow::bail!("adb push failed: {status}");
     }
-    let _ = Command::new("adb")
-        .args(["-s", device.as_str(), "shell", "chmod", "755", PROXY_BIN_PATH])
-        .status()
-        .await?;
+    if let Err(e) = adb_run(
+        &["-s", device.as_str(), "shell", "chmod", "755", PROXY_BIN_PATH],
+        ADB_CMD_TIMEOUT,
+    )
+    .await
+    {
+        warn!(?e, "chmod on device failed (continuing)");
+    }
 
-    let port = DEFAULT_PROXY_PORT;
-    let _ = Command::new("adb")
-        .args(["-s", device.as_str(), "forward", "--remove-all"])
-        .status().await.ok();
-    let status = Command::new("adb")
-        .args(["-s", device.as_str(), "forward", &format!("tcp:{port}"), &format!("tcp:{port}")])
-        .status()
-        .await?;
+    // Each device gets its own host-side port (a second device reusing the
+    // same host port would fail `adb forward` with "address already in use",
+    // and could misroute on older adb). The device side stays on
+    // DEFAULT_PROXY_PORT; only the host half of the forward varies.
+    let host_port = allocate_host_port()?;
+    let status = adb_run(
+        &[
+            "-s",
+            device.as_str(),
+            "forward",
+            &format!("tcp:{host_port}"),
+            &format!("tcp:{DEFAULT_PROXY_PORT}"),
+        ],
+        ADB_CMD_TIMEOUT,
+    )
+    .await?;
     if !status.success() {
         anyhow::bail!("adb forward failed: {status}");
     }
 
-    let _ = Command::new("adb")
-        .args(["-s", device.as_str(), "shell", "pkill", "-f", PROXY_BIN_PATH])
-        .status().await.ok();
+    let _ = adb_run(
+        &["-s", device.as_str(), "shell", "pkill", "-f", PROXY_BIN_PATH],
+        ADB_CMD_TIMEOUT,
+    )
+    .await
+    .ok();
 
     let proxy_cmd = format!(
         "setsid sh -c '{} {} >/data/local/tmp/adbshare-proxy.log 2>&1 &' </dev/null",
-        PROXY_BIN_PATH, port
+        PROXY_BIN_PATH, DEFAULT_PROXY_PORT
     );
-    let _ = Command::new("adb")
-        .args(["-s", device.as_str(), "shell", &proxy_cmd])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status().await.ok();
+    // Stdio is nulled on the host side; the proxy's output is redirected to a
+    // log file on the device itself.
+    let launch = tokio::time::timeout(
+        ADB_CMD_TIMEOUT,
+        Command::new("adb")
+            .args(["-s", device.as_str(), "shell", &proxy_cmd])
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+    if let Err(_) = launch {
+        warn!("proxy launch timed out (continuing; health check will decide)");
+    }
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let addr = format!("127.0.0.1:{port}");
-    let mut last_err = None;
+    let addr = format!("127.0.0.1:{host_port}");
+    let mut last_err: Option<String> = None;
     for _ in 0..25 {
-        match ProxyClient::connect(&addr, 1).await {
-            Ok(c) => match c.stat("/").await {
-                Ok(_) => { last_err = None; break; }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+        let attempt_err: Option<String>;
+        match tokio::time::timeout(Duration::from_secs(3), ProxyClient::connect(&addr, 1)).await {
+            Ok(Ok(c)) => match tokio::time::timeout(Duration::from_secs(3), c.stat("/")).await {
+                Ok(Ok(_)) => {
+                    attempt_err = None;
                 }
+                Ok(Err(e)) => attempt_err = Some(e.to_string()),
+                Err(_) => attempt_err = Some("proxy stat timed out".into()),
             },
-            Err(e) => {
+            Ok(Err(e)) => attempt_err = Some(e.to_string()),
+            Err(_) => attempt_err = Some("proxy connect timed out".into()),
+        }
+        match attempt_err {
+            None => {
+                last_err = None;
+                break;
+            }
+            Some(e) => {
                 last_err = Some(e);
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     }
     if let Some(e) = last_err {
-        let log = Command::new("adb")
-            .args(["-s", device.as_str(), "shell", "cat", "/data/local/tmp/adbshare-proxy.log"])
-            .output().await.ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
+        let log = adb_run_output(
+            &["-s", device.as_str(), "shell", "cat", "/data/local/tmp/adbshare-proxy.log"],
+            ADB_CMD_TIMEOUT,
+        )
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
         anyhow::bail!("proxy never came up: {e}. Device log: {log}");
     }
 
-    let client = ProxyClient::connect(&addr, proxy_conns).await?;
+    let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(&addr, proxy_conns))
+        .await
+        .map_err(|_| anyhow::anyhow!("proxy connect timed out"))??;
 
     if let Some(mp) = mountpoint {
         let device_for_thread = device.clone();
@@ -317,7 +538,19 @@ async fn setup(
                 }
             })?;
     }
-    Ok(client)
+    Ok((client, host_port))
+}
+
+/// Grab a free host TCP port by binding an ephemeral listener on 127.0.0.1
+/// and immediately dropping it. There is a small TOCTOU window (another
+/// process could claim the port before adb binds it); for dev tooling that
+/// risk is acceptable and a collision surfaces as a loud `adb forward`
+/// failure rather than silent misrouting.
+fn allocate_host_port() -> anyhow::Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
 }
 
 fn is_x86_binary(path: &std::path::Path) -> bool {
@@ -335,13 +568,14 @@ async fn locate_proxy_binary(device: &DeviceId) -> anyhow::Result<PathBuf> {
         if env_path.exists() { return Ok(env_path); }
     }
 
-    let abi_output = Command::new("adb")
-        .args(["-s", device.as_str(), "shell", "getprop", "ro.product.cpu.abi"])
-        .output()
-        .await
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
+    let abi_output = adb_run_output(
+        &["-s", device.as_str(), "shell", "getprop", "ro.product.cpu.abi"],
+        ADB_CMD_TIMEOUT,
+    )
+    .await
+    .ok()
+    .and_then(|o| String::from_utf8(o.stdout).ok())
+    .unwrap_or_default();
     let abi = abi_output.trim().to_string();
     let is_arm = abi.contains("arm") || abi.contains("aarch64");
 
@@ -380,6 +614,48 @@ async fn locate_proxy_binary(device: &DeviceId) -> anyhow::Result<PathBuf> {
     anyhow::bail!("adbshare-proxy binary not found for device ABI '{abi}'. Build with `cargo build --release --target aarch64-unknown-linux-musl --bin adbshare-proxy` or set ADBSHARE_PROXY_BIN.")
 }
 
+/// Best-effort cleanup for a device that is going away (or being torn down):
+/// kill the on-device proxy process and remove our host-side adb forward.
+/// Safe to call more than once; failures are logged, never fatal (the device
+/// may already be unplugged).
+async fn teardown_device(serial: &str, host_port: u16) {
+    match adb_shell(serial, &format!("pkill -f {}", PROXY_BIN_PATH)).await {
+        Ok(_) => {}
+        // pkill exits non-zero when no process matched — that's fine.
+        Err(e) => tracing::debug!(serial, host_port, %e, "pkill proxy (best-effort) failed"),
+    }
+    if let Err(e) = adb_run(
+        &["-s", serial, "forward", "--remove", &format!("tcp:{host_port}")],
+        ADB_CMD_TIMEOUT,
+    )
+    .await
+    {
+        tracing::debug!(serial, host_port, %e, "forward --remove (best-effort) failed");
+    }
+}
+
+/// Sanitize a device serial for use as a mountpoint path component. A crafted
+/// USB serial could contain `/` or `..` and escape the mount base directory.
+/// Keep alphanumerics, `-`, `_`, `.`; replace everything else with `_`; reject
+/// names that would be dangerous path components. The raw serial is still
+/// used for `adb -s`.
+fn sanitize_mount_name(serial: &str) -> Option<String> {
+    let cleaned: String = serial
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return None;
+    }
+    Some(cleaned)
+}
+
 /// Serial looks like host:port (wireless pairing) vs a plain USB serial.
 fn is_wireless_serial(serial: &str) -> bool {
     match serial.rsplit_once(':') {
@@ -393,7 +669,10 @@ fn is_wireless_serial(serial: &str) -> bool {
 async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        Command::new("adb").args(["-s", serial, "shell", cmd]).output(),
+        Command::new("adb")
+            .args(["-s", serial, "shell", cmd])
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("adb shell timed out"))??;
@@ -507,7 +786,7 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
 async fn adb_version() -> anyhow::Result<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        Command::new("adb").arg("version").output(),
+        Command::new("adb").arg("version").kill_on_drop(true).output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("adb version timed out"))??;
@@ -532,16 +811,24 @@ fn client_for(state: &Arc<Mutex<State>>, device: &str) -> Result<Arc<ProxyClient
         .ok_or_else(|| zbus::fdo::Error::ServiceUnknown("device not connected".into()))
 }
 
+/// Maximum recursion depth for `delete_recursive`; beyond this we assume a
+/// cycle or a pathological tree and refuse rather than recurse forever.
+const DELETE_MAX_DEPTH: u32 = 64;
+
 /// Recursively delete `path` on the device via proxy ops (there is no
-/// server-side `rm -r` in the proxy protocol).
-async fn delete_recursive(client: &ProxyClient, path: &str) -> anyhow::Result<()> {
+/// server-side `rm -r` in the proxy protocol). `depth` is capped at
+/// `DELETE_MAX_DEPTH`.
+async fn delete_recursive(client: &ProxyClient, path: &str, depth: u32) -> anyhow::Result<()> {
+    if depth > DELETE_MAX_DEPTH {
+        anyhow::bail!("delete: recursion deeper than {DELETE_MAX_DEPTH} levels at '{path}'");
+    }
     let st = client.lstat(path).await?;
     if st.mode.is_symlink() || !st.mode.is_dir() {
         return client.unlink(path).await.map_err(|e| anyhow::anyhow!("{e}"));
     }
     for entry in client.listdir(path).await? {
         let child = format!("{}/{}", path.trim_end_matches('/'), entry.name);
-        Box::pin(delete_recursive(client, &child)).await?;
+        Box::pin(delete_recursive(client, &child, depth + 1)).await?;
     }
     client.rmdir(path).await.map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -694,8 +981,19 @@ impl ManagerInterface {
 
     /// Delete a file or directory tree on the device.
     async fn delete(&self, device: &str, path: &str) -> zbus::fdo::Result<()> {
+        // Refuse to delete the device root (directly or via `..` / `//`
+        // trickery) — D-Bus callers must delete concrete subtrees.
+        let normalized: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        if normalized.is_empty() || normalized.contains(&"..") {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "refusing to delete the device root".into(),
+            ));
+        }
         let client = client_for(&self.state, device)?;
-        delete_recursive(&client, path).await
+        delete_recursive(&client, path, 0).await
             .map_err(|e| zbus::fdo::Error::Failed(format!("delete: {e}")))
     }
 
@@ -710,7 +1008,10 @@ impl ManagerInterface {
         }
         let out = tokio::time::timeout(
             Duration::from_secs(10),
-            Command::new("adb").args(["connect", address]).output(),
+            Command::new("adb")
+                .args(["connect", address])
+                .kill_on_drop(true)
+                .output(),
         )
         .await
         .map_err(|_| zbus::fdo::Error::Failed(format!("adb connect {address} timed out")))?
