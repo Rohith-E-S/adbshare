@@ -122,30 +122,32 @@ impl NetstatWatcher {
         Self { host, port, state: PlMutex::new(NetstatState::default()) }
     }
 
-    fn fetch(&self) -> Vec<DeviceInfo> {
+    fn fetch(&self) -> std::io::Result<Vec<DeviceInfo>> {
         // Run the async query on a fresh current-thread runtime. This
         // poll() is called from a blocking task, so we own this thread
         // for the duration.
         let host = self.host.clone();
         let port = self.port;
-        let rt = match tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(_) => return Vec::new(),
-        };
-        let res = rt.block_on(async move { query_adb_server(&host, port).await });
-        if let Err(ref e) = res {
-            tracing::warn!(?e, "adb-server query failed");
-        }
-        res.unwrap_or_default()
+            .build()?;
+        rt.block_on(async move { query_adb_server(&host, port).await })
     }
 }
 
 impl WatcherImpl for NetstatWatcher {
     fn poll(&self) -> Vec<WatchEvent> {
-        let current = self.fetch();
+        // On a transient query failure (adb server restarting, busy, ...)
+        // keep the previous device set instead of treating it as empty;
+        // emitting Removed for every device and re-Adding them next poll
+        // makes clients flap.
+        let current = match self.fetch() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(?e, "adb-server query failed; keeping previous device set");
+                return Vec::new();
+            }
+        };
         let mut events = Vec::new();
         let mut state = self.state.lock();
         let prev: Vec<DeviceInfo> = std::mem::take(&mut state.last);
@@ -172,8 +174,17 @@ impl WatcherImpl for NetstatWatcher {
 }
 
 async fn query_adb_server(host: &str, port: u16) -> std::io::Result<Vec<DeviceInfo>> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    let mut stream = TcpStream::connect((host, port)).await?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+    // Resolve the address and bound the connect attempt: without a timeout a
+    // half-up adb server can stall the watcher thread indefinitely.
+    let addr = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| std::io::Error::other(format!("resolve {host}:{port}: {e}")))?
+        .next()
+        .ok_or_else(|| std::io::Error::other(format!("no address for {host}:{port}")))?;
+    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(1), TcpStream::connect(addr))
+        .await
+        .map_err(|_| std::io::Error::other(format!("connect to {host}:{port} timed out")))??;
     let payload = b"host:devices-l";
     let length_hex = format!("{:04x}", payload.len());
     stream.write_all(length_hex.as_bytes()).await?;
@@ -233,17 +244,61 @@ impl UsbWatcher {
     fn new() -> Self { Self { state: PlMutex::new(Vec::new()) } }
 }
 
-const VENDOR_ANDROID: u16 = 0x18d1;
-const VENDOR_GOOGLE: u16 = 0x04e8;
+// Google's USB vendor ID (0x18d1). Samsung (0x04e8) is included because many
+// Galaxy devices expose the ADB interface under Samsung's own VID; a device
+// only counts as an ADB device if it also exposes an ADB interface (see
+// is_adb_device below).
+const VENDOR_GOOGLE: u16 = 0x18d1;
+const VENDOR_SAMSUNG: u16 = 0x04e8;
+
+// ADB interface class/subclass/protocol as used by adbd (vendor-specific
+// class 0xFF, subclass 0x42, protocol 0x01).
+const ADB_CLASS: u8 = 0xff;
+const ADB_SUBCLASS: u8 = 0x42;
+const ADB_PROTOCOL: u8 = 0x01;
+
+/// True if the device exposes an interface with the ADB class/subclass/protocol
+/// triple, rather than merely being made by a known vendor.
+fn is_adb_device(device: &rusb::Device<rusb::Context>) -> bool {
+    let Ok(desc) = device.device_descriptor() else { return false; };
+    if desc.vendor_id() != VENDOR_GOOGLE && desc.vendor_id() != VENDOR_SAMSUNG {
+        return false;
+    }
+    for cfg_idx in 0..desc.num_configurations() {
+        let Ok(cfg) = device.config_descriptor(cfg_idx) else { continue; };
+        for iface in cfg.interfaces() {
+            for iface_desc in iface.descriptors() {
+                if iface_desc.class_code() == ADB_CLASS
+                    && iface_desc.sub_class_code() == ADB_SUBCLASS
+                    && iface_desc.protocol_code() == ADB_PROTOCOL
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 impl WatcherImpl for UsbWatcher {
     fn poll(&self) -> Vec<WatchEvent> {
         use rusb::UsbContext;
         let Ok(context) = rusb::Context::new() else { return Vec::new() };
+        // A panic or error in enumeration used to either poison state or,
+        // worse, be swallowed by unwrap_or_default() upstream, silently
+        // killing the watcher. Log it and keep the previous device list.
+        let devices = match context.devices() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(?e, "usb device enumeration failed; keeping previous device set");
+                return Vec::new();
+            }
+        };
         let mut current = Vec::new();
-        for device in context.devices().unwrap().iter() {
-            let Ok(desc) = device.device_descriptor() else { continue; };
-            if desc.vendor_id() != VENDOR_ANDROID && desc.vendor_id() != VENDOR_GOOGLE { continue; }
+        for device in devices.iter() {
+            if !is_adb_device(&device) {
+                continue;
+            }
             let bus = device.bus_number();
             let addr = device.address();
             current.push(DeviceInfo {

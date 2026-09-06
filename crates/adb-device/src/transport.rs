@@ -50,25 +50,76 @@ pub struct StreamTransport {
     serial: String,
     reader: Arc<Mutex<BoxedReader>>,
     writer: Arc<Mutex<BoxedWriter>>,
+    /// RSA key used for the AUTH handshake. `None` means AUTH TOKEN replies
+    /// surface as [`AdbError::Unauthorized`].
+    key: Option<Arc<crate::auth::AdbKey>>,
 }
+
+/// Maximum ADB payload we are willing to buffer when reading a message body.
+const MAX_PAYLOAD: usize = 1024 * 1024;
 
 impl std::fmt::Debug for StreamTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamTransport")
             .field("kind", &self.kind)
             .field("serial", &self.serial)
+            .field("has_key", &self.key.is_some())
             .finish()
     }
 }
 
 impl StreamTransport {
     pub fn new(kind: TransportKind, serial: String, reader: BoxedReader, writer: BoxedWriter) -> Self {
+        Self::with_key(kind, serial, reader, writer, None)
+    }
+
+    /// Like [`StreamTransport::new`], but with an RSA key for the AUTH
+    /// handshake. When the device sends an AUTH TOKEN, the token is signed and
+    /// an AUTH SIGNATURE is sent; if the device still doesn't accept us, an
+    /// AUTH RSAPUBLICKEY (Android public-key text format) is sent so the user
+    /// can authorize the host.
+    pub fn with_key(
+        kind: TransportKind,
+        serial: String,
+        reader: BoxedReader,
+        writer: BoxedWriter,
+        key: Option<Arc<crate::auth::AdbKey>>,
+    ) -> Self {
         Self {
             kind,
             serial,
             reader: Arc::new(Mutex::new(reader)),
             writer: Arc::new(Mutex::new(writer)),
+            key,
         }
+    }
+
+    /// Read one full ADB message (header + payload) from `reader`.
+    async fn read_message(reader: &mut BoxedReader) -> Result<Option<Message>> {
+        let mut header = [0u8; Message::HEADER_LEN];
+        match reader.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let data_len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        if data_len > MAX_PAYLOAD {
+            return Err(AdbError::InvalidResponse(format!(
+                "ADB payload too large: {data_len}"
+            )));
+        }
+        let mut payload = vec![0u8; data_len];
+        reader.read_exact(&mut payload).await?;
+        Ok(Some(Message::decode(&header, Bytes::from(payload))?))
+    }
+
+    async fn write_message(
+        writer: &mut BoxedWriter,
+        msg: &Message,
+    ) -> Result<()> {
+        writer.write_all(&msg.encode()).await?;
+        writer.flush().await?;
+        Ok(())
     }
 }
 
@@ -86,23 +137,71 @@ impl Transport for StreamTransport {
             1 << 20,
             Bytes::from(banner),
         );
-        writer.write_all(&connect.encode()).await?;
-        writer.flush().await?;
+        Self::write_message(&mut writer, &connect).await?;
         drop(writer);
 
         let mut reader = self.reader.lock().await;
-        let mut header = [0u8; Message::HEADER_LEN];
-        reader.read_exact(&mut header).await?;
-        let reply = Message::decode(&header, Bytes::new())?;
-        if reply.command == crate::packet::Command::Auth {
-            return Err(AdbError::Unauthorized);
+        let mut msg = match Self::read_message(&mut reader).await? {
+            Some(m) => m,
+            None => return Err(AdbError::Disconnected),
+        };
+
+        // AUTH handshake: the device sends AUTH TOKEN; we answer with
+        // AUTH SIGNATURE, and if the device still doesn't know us, with
+        // AUTH RSAPUBLICKEY so the user can authorize this host. The
+        // handshake ends when the device sends CNXN.
+        while msg.command == crate::packet::Command::Auth {
+            let key = self.key.as_ref().ok_or(AdbError::Unauthorized)?;
+            if msg.arg0 != crate::packet::AUTH_TOKEN {
+                return Err(AdbError::InvalidResponse(format!(
+                    "unexpected AUTH type {}",
+                    msg.arg0
+                )));
+            }
+            let token = msg.payload.clone();
+            let sig = key.sign(&token)?;
+            let sig_msg = Message::new(
+                crate::packet::Command::Auth,
+                crate::packet::AUTH_SIGNATURE,
+                0,
+                Bytes::from(sig),
+            );
+            {
+                let mut writer = self.writer.lock().await;
+                Self::write_message(&mut writer, &sig_msg).await?;
+            }
+
+            msg = match Self::read_message(&mut reader).await? {
+                Some(m) => m,
+                None => return Err(AdbError::Disconnected),
+            };
+
+            if msg.command == crate::packet::Command::Auth && msg.arg0 == crate::packet::AUTH_TOKEN {
+                // Signature rejected: send our public key (Android public-key
+                // text format, NUL-terminated) and wait for CNXN.
+                let pk_msg = Message::new(
+                    crate::packet::Command::Auth,
+                    crate::packet::AUTH_RSAPUBLICKEY,
+                    0,
+                    Bytes::from(key.ssh_public().to_vec()),
+                );
+                let mut writer = self.writer.lock().await;
+                Self::write_message(&mut writer, &pk_msg).await?;
+                msg = match Self::read_message(&mut reader).await? {
+                    Some(m) => m,
+                    None => return Err(AdbError::Disconnected),
+                };
+            }
         }
-        if reply.command != crate::packet::Command::Connect {
+
+        if msg.command != crate::packet::Command::Connect {
             return Err(AdbError::InvalidResponse(format!(
-                "expected CNXN, got {:?}", reply.command
+                "expected CNXN, got {:?}",
+                msg.command
             )));
         }
 
+        drop(reader);
         AdbConnection::from_parts(self.serial.clone(), self.reader.clone(), self.writer.clone()).await
     }
 }
@@ -192,10 +291,19 @@ fn open_usb_pump(
         .find(|d| d.bus_number() == bus && d.address() == addr)
         .ok_or_else(|| AdbError::DeviceNotFound(format!("usb:{}:{}", bus, addr)))?;
     let mut handle = device.open()?;
-    handle.claim_interface(iface)?;
-    if handle.kernel_driver_active(iface).unwrap_or(false) {
-        let _ = handle.detach_kernel_driver(iface);
+    // Detach any kernel driver BEFORE claiming: claim_interface fails with
+    // Busy if a kernel driver (e.g. usbfs-bound adbd helper or a modem
+    // driver) still holds the interface.
+    if handle.set_auto_detach_kernel_driver(true).is_err() {
+        // libusb may not support auto-detach on this platform; fall back to
+        // a manual detach.
+        if handle.kernel_driver_active(iface).unwrap_or(false) {
+            if let Err(e) = handle.detach_kernel_driver(iface) {
+                tracing::warn!(error = ?e, interface = iface, "failed to detach kernel driver");
+            }
+        }
     }
+    handle.claim_interface(iface)?;
 
     // Channels: pump -> app (bytes from device), app -> pump (bytes to device).
     let (tx_to_app, rx_to_app) = mpsc::channel::<bytes::Bytes>(256);
@@ -207,14 +315,38 @@ fn open_usb_pump(
     std::thread::Builder::new()
         .name("adb-usb-pump".into())
         .spawn(move || {
-            use std::io::Write;
             let mut buf = vec![0u8; 64 * 1024];
-            let read_timeout = std::time::Duration::from_millis(50);
+            let read_timeout = std::time::Duration::from_millis(2);
             let write_timeout = std::time::Duration::from_millis(5_000);
-            loop {
+            'pump: loop {
+                // Drain ALL pending outgoing writes before blocking on a read.
+                // The previous single-chunk-per-iteration design capped write
+                // throughput at ~20 chunks x 4KB per 50ms loop (~1.25 MB/s) and
+                // a blocking write_bulk delayed incoming reads as well.
+                loop {
+                    match rx_from_app.try_recv() {
+                        Ok(chunk) => {
+                            if let Err(e) =
+                                handle_for_thread.write_bulk(out_ep, &chunk, write_timeout)
+                            {
+                                tracing::error!(error = ?e, "adb-usb-pump: write_bulk failed");
+                                break 'pump;
+                            }
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break 'pump,
+                    }
+                }
+
                 // Read from device -> channel.
                 match handle_for_thread.read_bulk(in_ep, &mut buf, read_timeout) {
-                    Ok(0) => continue,
+                    Ok(0) => {
+                        // Zero-length transfer: log it and back off briefly so we
+                        // don't spin the pump thread in a tight loop.
+                        tracing::warn!("adb-usb-pump: zero-length bulk read");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
                     Ok(n) => {
                         let chunk = bytes::Bytes::copy_from_slice(&buf[..n]);
                         if tx_to_app.blocking_send(chunk).is_err() {
@@ -222,32 +354,26 @@ fn open_usb_pump(
                         }
                     }
                     Err(rusb::Error::Timeout) => {}
-                    Err(rusb::Error::Io) | Err(rusb::Error::Overflow) | Err(rusb::Error::Other) => break,
-                    Err(_) => break,
-                }
-
-                // Read from channel -> device (non-blocking try_recv).
-                match rx_from_app.try_recv() {
-                    Ok(chunk) => {
-                        if handle_for_thread.write_bulk(out_ep, &chunk, write_timeout).is_err() {
-                            break;
-                        }
+                    Err(e) => {
+                        tracing::error!(error = ?e, "adb-usb-pump: read_bulk failed");
+                        break;
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => {}
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
                 }
             }
             drop(context_for_thread);
         })?;
 
     // Wrap mpsc receivers/senders as AsyncRead/AsyncWrite.
-    let reader = ChannelReader { rx: rx_to_app };
+    let reader = ChannelReader { rx: rx_to_app, pending: None };
     let writer = ChannelWriter { tx: tx_from_app };
     Ok((Box::new(reader), Box::new(writer)))
 }
 
 struct ChannelReader {
     rx: mpsc::Receiver<bytes::Bytes>,
+    /// Leftover bytes from a USB chunk that exceeded the caller's read buffer.
+    /// These must be served before pulling a new chunk, otherwise data is lost.
+    pending: Option<bytes::Bytes>,
 }
 
 impl tokio::io::AsyncRead for ChannelReader {
@@ -257,49 +383,34 @@ impl tokio::io::AsyncRead for ChannelReader {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let mut total = 0usize;
-        loop {
-            let unfilled = buf.remaining();
-            if unfilled == 0 {
+        // Serve leftover bytes from a previously oversized chunk first.
+        if buf.remaining() > 0 {
+            if let Some(mut pending) = this.pending.take() {
+                let take = pending.len().min(buf.remaining());
+                buf.put_slice(&pending[..take]);
+                if take < pending.len() {
+                    this.pending = Some(pending.split_off(take));
+                }
                 return Poll::Ready(Ok(()));
             }
-            match this.rx.try_recv() {
-                Ok(mut chunk) => {
-                    let take = chunk.len().min(unfilled);
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(mut chunk)) => {
+                    let take = chunk.len().min(buf.remaining());
                     buf.put_slice(&chunk[..take]);
-                    total += take;
                     if take < chunk.len() {
-                        // Buffer the rest for next poll by re-sending; but try_recv is
-                        // one-shot, so instead, store the remainder.
-                        let rest = chunk.split_off(take);
-                        // If there's still a pending remainder, prepend by sending it
-                        // back to ourselves. We use a oneshot for simplicity.
-                        let _ = rest;
-                        // Just drop the rest for now (extremely rare; packets are 64KB).
-                        return Poll::Ready(Ok(()));
+                        // Keep the remainder for the next poll_read; every 24-byte
+                        // ADB header read leaves ~4KB of a 64KB USB transfer behind.
+                        this.pending = Some(chunk.split_off(take));
                     }
-                    if total >= unfilled {
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    // Need to wait for more data.
-                    let waker = cx.waker().clone();
-                    let rx = &mut this.rx;
-                    tokio::spawn(async move {
-                        // Tiny delay then wake. (ChannelReceiver doesn't have a waker API
-                        // without `tokio::sync::Notify`; this is a pragmatic shim.)
-                        tokio::time::sleep(std::time::Duration::from_micros(500)).await;
-                        waker.wake();
-                    });
-                    let _ = rx;
-                    return Poll::Pending;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
                     return Poll::Ready(Ok(()));
                 }
+                // Pump thread gone: report EOF.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                // Waker registered with the channel; no manual re-poll needed.
+                Poll::Pending => return Poll::Pending,
             }
         }
+        Poll::Ready(Ok(()))
     }
 }
 
