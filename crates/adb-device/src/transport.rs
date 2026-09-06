@@ -50,25 +50,76 @@ pub struct StreamTransport {
     serial: String,
     reader: Arc<Mutex<BoxedReader>>,
     writer: Arc<Mutex<BoxedWriter>>,
+    /// RSA key used for the AUTH handshake. `None` means AUTH TOKEN replies
+    /// surface as [`AdbError::Unauthorized`].
+    key: Option<Arc<crate::auth::AdbKey>>,
 }
+
+/// Maximum ADB payload we are willing to buffer when reading a message body.
+const MAX_PAYLOAD: usize = 1024 * 1024;
 
 impl std::fmt::Debug for StreamTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamTransport")
             .field("kind", &self.kind)
             .field("serial", &self.serial)
+            .field("has_key", &self.key.is_some())
             .finish()
     }
 }
 
 impl StreamTransport {
     pub fn new(kind: TransportKind, serial: String, reader: BoxedReader, writer: BoxedWriter) -> Self {
+        Self::with_key(kind, serial, reader, writer, None)
+    }
+
+    /// Like [`StreamTransport::new`], but with an RSA key for the AUTH
+    /// handshake. When the device sends an AUTH TOKEN, the token is signed and
+    /// an AUTH SIGNATURE is sent; if the device still doesn't accept us, an
+    /// AUTH RSAPUBLICKEY (Android public-key text format) is sent so the user
+    /// can authorize the host.
+    pub fn with_key(
+        kind: TransportKind,
+        serial: String,
+        reader: BoxedReader,
+        writer: BoxedWriter,
+        key: Option<Arc<crate::auth::AdbKey>>,
+    ) -> Self {
         Self {
             kind,
             serial,
             reader: Arc::new(Mutex::new(reader)),
             writer: Arc::new(Mutex::new(writer)),
+            key,
         }
+    }
+
+    /// Read one full ADB message (header + payload) from `reader`.
+    async fn read_message(reader: &mut BoxedReader) -> Result<Option<Message>> {
+        let mut header = [0u8; Message::HEADER_LEN];
+        match reader.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let data_len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        if data_len > MAX_PAYLOAD {
+            return Err(AdbError::InvalidResponse(format!(
+                "ADB payload too large: {data_len}"
+            )));
+        }
+        let mut payload = vec![0u8; data_len];
+        reader.read_exact(&mut payload).await?;
+        Ok(Some(Message::decode(&header, Bytes::from(payload))?))
+    }
+
+    async fn write_message(
+        writer: &mut BoxedWriter,
+        msg: &Message,
+    ) -> Result<()> {
+        writer.write_all(&msg.encode()).await?;
+        writer.flush().await?;
+        Ok(())
     }
 }
 
@@ -86,23 +137,71 @@ impl Transport for StreamTransport {
             1 << 20,
             Bytes::from(banner),
         );
-        writer.write_all(&connect.encode()).await?;
-        writer.flush().await?;
+        Self::write_message(&mut writer, &connect).await?;
         drop(writer);
 
         let mut reader = self.reader.lock().await;
-        let mut header = [0u8; Message::HEADER_LEN];
-        reader.read_exact(&mut header).await?;
-        let reply = Message::decode(&header, Bytes::new())?;
-        if reply.command == crate::packet::Command::Auth {
-            return Err(AdbError::Unauthorized);
+        let mut msg = match Self::read_message(&mut reader).await? {
+            Some(m) => m,
+            None => return Err(AdbError::Disconnected),
+        };
+
+        // AUTH handshake: the device sends AUTH TOKEN; we answer with
+        // AUTH SIGNATURE, and if the device still doesn't know us, with
+        // AUTH RSAPUBLICKEY so the user can authorize this host. The
+        // handshake ends when the device sends CNXN.
+        while msg.command == crate::packet::Command::Auth {
+            let key = self.key.as_ref().ok_or(AdbError::Unauthorized)?;
+            if msg.arg0 != crate::packet::AUTH_TOKEN {
+                return Err(AdbError::InvalidResponse(format!(
+                    "unexpected AUTH type {}",
+                    msg.arg0
+                )));
+            }
+            let token = msg.payload.clone();
+            let sig = key.sign(&token)?;
+            let sig_msg = Message::new(
+                crate::packet::Command::Auth,
+                crate::packet::AUTH_SIGNATURE,
+                0,
+                Bytes::from(sig),
+            );
+            {
+                let mut writer = self.writer.lock().await;
+                Self::write_message(&mut writer, &sig_msg).await?;
+            }
+
+            msg = match Self::read_message(&mut reader).await? {
+                Some(m) => m,
+                None => return Err(AdbError::Disconnected),
+            };
+
+            if msg.command == crate::packet::Command::Auth && msg.arg0 == crate::packet::AUTH_TOKEN {
+                // Signature rejected: send our public key (Android public-key
+                // text format, NUL-terminated) and wait for CNXN.
+                let pk_msg = Message::new(
+                    crate::packet::Command::Auth,
+                    crate::packet::AUTH_RSAPUBLICKEY,
+                    0,
+                    Bytes::from(key.ssh_public().to_vec()),
+                );
+                let mut writer = self.writer.lock().await;
+                Self::write_message(&mut writer, &pk_msg).await?;
+                msg = match Self::read_message(&mut reader).await? {
+                    Some(m) => m,
+                    None => return Err(AdbError::Disconnected),
+                };
+            }
         }
-        if reply.command != crate::packet::Command::Connect {
+
+        if msg.command != crate::packet::Command::Connect {
             return Err(AdbError::InvalidResponse(format!(
-                "expected CNXN, got {:?}", reply.command
+                "expected CNXN, got {:?}",
+                msg.command
             )));
         }
 
+        drop(reader);
         AdbConnection::from_parts(self.serial.clone(), self.reader.clone(), self.writer.clone()).await
     }
 }
