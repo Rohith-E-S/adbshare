@@ -576,6 +576,7 @@ impl AdbshareApp {
 
             // --- Drain dir results ---
             let handles_dir = handles.clone();
+            let op_tx_dir = op_tx.clone();
             glib::spawn_future_local(async move {
                 while let Ok((serial, path, result)) = dir_rx.recv().await {
                     // Drop listings that no longer match what the user is
@@ -605,6 +606,10 @@ impl AdbshareApp {
                         Err(e) => {
                             handles_dir.browser.set_loading(false);
                             tracing::warn!(error=%e, "list_dir failed");
+                            // Surface the failure: without this the user only
+                            // saw the spinner stop, with the old listing and
+                            // breadcrumbs left dangling.
+                            let _ = op_tx_dir.try_send((Some("Could not open folder".to_string()), Err(e)));
                         }
                     }
                 }
