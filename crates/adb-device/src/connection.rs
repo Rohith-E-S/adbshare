@@ -161,14 +161,17 @@ impl AdbConnection {
                 };
                 match msg.command {
                     Command::Okay => {
-                        let local = msg.arg0;
-                        let remote = msg.arg1;
+                        // In device->host messages our local id is in arg1 and
+                        // the device's id is in arg0 (the mirror image of
+                        // host->device frames).
+                        let local = msg.arg1;
+                        let remote = msg.arg0;
                         if let Some(tx) = pending_opens_r.lock().remove(&local) {
                             let _ = tx.send(Ok(StreamId(local, remote)));
                         }
                     }
                     Command::Close => {
-                        let local = msg.arg0;
+                        let local = msg.arg1;
                         if let Some(tx) = pending_opens_r.lock().remove(&local) {
                             let _ = tx.send(Err(AdbError::InvalidResponse("CLSE on OPEN".into())));
                         }
