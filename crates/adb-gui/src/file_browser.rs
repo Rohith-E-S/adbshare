@@ -373,6 +373,10 @@ pub struct FileBrowser {
     entries: Rc<RefCell<Vec<DirEntry>>>,
     history_back: Rc<RefCell<Vec<PathBuf>>>,
     history_forward: Rc<RefCell<Vec<PathBuf>>>,
+    /// Set while a go_back/go_forward-initiated navigation is in flight, so
+    /// show_path does not push the abandoned path back onto the opposite
+    /// stack (which would make Back oscillate between two directories).
+    navigating_history: Rc<Cell<bool>>,
     search_query: Rc<RefCell<String>>,
     on_event: Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>>,
 }
@@ -646,6 +650,7 @@ impl FileBrowser {
         let entries = Rc::new(RefCell::new(Vec::new()));
         let history_back = Rc::new(RefCell::new(Vec::new()));
         let history_forward = Rc::new(RefCell::new(Vec::new()));
+        let navigating_history = Rc::new(Cell::new(false));
         let search_query = Rc::new(RefCell::new(String::new()));
         let on_event: Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>> = Rc::new(RefCell::new(None));
         let view_mode = Rc::new(RefCell::new(ViewMode::Grid));
@@ -702,6 +707,7 @@ impl FileBrowser {
             entries,
             history_back,
             history_forward,
+            navigating_history,
             search_query,
             on_event,
         };
@@ -890,6 +896,8 @@ impl FileBrowser {
     pub fn go_back(&self) {
         if let Some(prev) = self.history_back.borrow_mut().pop() {
             self.history_forward.borrow_mut().push(self.current_path.borrow().clone());
+            // show_path must not re-push the abandoned path onto history_back.
+            self.navigating_history.set(true);
             if let Some(cb) = self.on_event.borrow().as_ref() {
                 cb(BrowserEvent::Navigate(prev));
             }
@@ -901,6 +909,8 @@ impl FileBrowser {
     pub fn go_forward(&self) {
         if let Some(next) = self.history_forward.borrow_mut().pop() {
             self.history_back.borrow_mut().push(self.current_path.borrow().clone());
+            // show_path must not re-push the abandoned path onto history_back.
+            self.navigating_history.set(true);
             if let Some(cb) = self.on_event.borrow().as_ref() {
                 cb(BrowserEvent::Navigate(next));
             }
@@ -1231,8 +1241,16 @@ impl FileBrowser {
 
     pub fn show_path(&self, path: PathBuf) {
         let old_path = self.current_path.borrow().clone();
-        if old_path != path && old_path != PathBuf::from("") {
+        // When the navigation originated from go_back/go_forward, the
+        // abandoned path was already pushed onto the opposite stack there;
+        // pushing it again here would make Back/Forward oscillate between
+        // two directories instead of walking the history.
+        let from_history = self.navigating_history.get();
+        self.navigating_history.set(false);
+        if !from_history && old_path != path && !old_path.as_os_str().is_empty() {
             self.history_back.borrow_mut().push(old_path);
+            // Fresh navigation invalidates everything ahead of us.
+            self.history_forward.borrow_mut().clear();
         }
         *self.current_path.borrow_mut() = path.clone();
         self.render_breadcrumbs(&path);
