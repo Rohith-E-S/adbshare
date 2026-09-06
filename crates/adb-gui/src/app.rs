@@ -660,7 +660,11 @@ impl AdbshareApp {
                 while let Ok(result) = jobs_rx.recv().await {
                     match result {
                         Ok(jobs) => {
-                            let active: Vec<_> = jobs.iter().filter(|j| j.state == "Running" || j.state == "Pending").collect();
+                            // Paused jobs count as active: they must stay
+                            // visible (banner + dock) and resumable.
+                            let active: Vec<_> = jobs.iter().filter(|j| {
+                                j.state == "Running" || j.state == "Pending" || j.state == "Paused"
+                            }).collect();
                             *handles_jobs.active_jobs.lock() = active.iter().map(|j| j.id).collect();
                             if active.len() == 1 {
                                 count_drain.set_label("1 transfer");
@@ -704,8 +708,20 @@ impl AdbshareApp {
                                 browser_drain.update_transfer_banner(true, &banner_str, fraction);
                             } else {
                                 browser_drain.update_transfer_banner(false, "", 0.0);
+                                // Nothing left to resume; reset the toggle so
+                                // the next transfer starts in "pause" state.
+                                *handles_jobs.transfers_paused.lock() = false;
                             }
-                            handles_jobs.dock.update(&jobs);
+                            // The pause button means "resume" while paused.
+                            let paused = *handles_jobs.transfers_paused.lock();
+                            let (icon, tip) = if paused {
+                                ("media-playback-start-symbolic", "Resume all transfers")
+                            } else {
+                                ("media-playback-pause-symbolic", "Pause all transfers")
+                            };
+                            browser_drain.banner_pause_btn.set_icon_name(icon);
+                            browser_drain.banner_pause_btn.set_tooltip_text(Some(tip));
+                            handles_jobs.dock.update(&jobs, paused);
                             handles_jobs.transfer.update_jobs(jobs);
                         }
                         Err(e) => tracing::warn!(error=%e, "list_jobs failed"),
