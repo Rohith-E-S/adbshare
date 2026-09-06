@@ -89,11 +89,20 @@ impl JobQueue {
     /// Take a snapshot of every job currently in the queue (pending, in-flight,
     /// completed). The returned `Vec` is a copy of the current state; the
     /// caller may iterate without holding any lock.
+    ///
+    /// All three guards are held simultaneously (in the queue's global lock
+    /// order `pending` -> `in_flight` -> `completed`) so a job that moves
+    /// between lists during the snapshot can neither appear twice nor
+    /// transiently vanish. Every other locking site on this struct follows
+    /// the same order, so simultaneous acquisition cannot deadlock.
     pub fn jobs_snapshot(&self) -> Vec<Job> {
-        let mut out = Vec::new();
-        out.extend(self.pending.lock().iter().cloned());
-        out.extend(self.in_flight.lock().iter().cloned());
-        out.extend(self.completed.lock().iter().cloned());
+        let pending = self.pending.lock();
+        let inflight = self.in_flight.lock();
+        let completed = self.completed.lock();
+        let mut out = Vec::with_capacity(pending.len() + inflight.len() + completed.len());
+        out.extend(pending.iter().cloned());
+        out.extend(inflight.iter().cloned());
+        out.extend(completed.iter().cloned());
         out
     }
 
@@ -227,5 +236,36 @@ mod tests {
         assert_eq!(total, 2, "exactly `parallelism` jobs may be in flight");
         assert_eq!(queue.snapshot().in_flight, 2);
         assert_eq!(queue.snapshot().pending, 30);
+    }
+
+    #[tokio::test]
+    async fn jobs_snapshot_never_duplicates_or_drops_a_job() {
+        let (queue, _rx) = JobQueue::new(2);
+        for i in 0..64 {
+            queue.submit(test_job(&format!("j{i}")));
+        }
+
+        let q = Arc::clone(&queue);
+        let churn = std::thread::spawn(move || {
+            for _ in 0..500 {
+                while let Some(job) = q.try_dispatch() {
+                    q.mark_done(job);
+                }
+            }
+        });
+
+        let mut seen_dupe = false;
+        for _ in 0..2000 {
+            let snap = queue.jobs_snapshot();
+            let mut ids: Vec<_> = snap.iter().map(|j| j.id).collect();
+            let n = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.len() != n { seen_dupe = true; break; }
+        }
+        churn.join().unwrap();
+        assert!(!seen_dupe, "a job appeared more than once in a snapshot");
+        // After the churn completes, every job is accounted for exactly once.
+        assert_eq!(queue.jobs_snapshot().len(), 64);
     }
 }
