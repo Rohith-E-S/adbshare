@@ -55,6 +55,10 @@ struct DeviceSlot {
     mountpoint: Option<PathBuf>,
     /// Pooled client to the device-side proxy binary.
     client: Arc<ProxyClient>,
+    /// Host-side TCP port of this device's `adb forward`. Each device gets its
+    /// own port so several devices can be connected simultaneously; the
+    /// device-side port stays fixed at `DEFAULT_PROXY_PORT`.
+    host_port: u16,
 }
 
 #[derive(Debug, Default)]
@@ -116,10 +120,11 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     match setup(id.clone(), mp.clone(), proxy_conns).await {
-                        Ok(client) => {
+                        Ok((client, host_port)) => {
                             state_clone.lock().devices.insert(id.clone(), DeviceSlot {
                                 mountpoint: mp,
                                 client: Arc::new(client),
+                                host_port,
                             });
                             info!(?id, "device ready");
                         }
@@ -144,10 +149,11 @@ async fn main() -> anyhow::Result<()> {
                     if !already {
                         let mp = if no_fuse { None } else { Some(mount_base_clone.join(id.as_str())) };
                         match setup(id.clone(), mp.clone(), proxy_conns).await {
-                            Ok(client) => {
+                            Ok((client, host_port)) => {
                                 state_clone.lock().devices.insert(id.clone(), DeviceSlot {
                                     mountpoint: mp,
                                     client: Arc::new(client),
+                                    host_port,
                                 });
                                 info!(?id, "device ready (post-authorize retry)");
                             }
@@ -223,7 +229,7 @@ async fn setup(
     device: DeviceId,
     mountpoint: Option<PathBuf>,
     proxy_conns: usize,
-) -> anyhow::Result<ProxyClient> {
+) -> anyhow::Result<(ProxyClient, u16)> {
     let proxy_src = locate_proxy_binary(&device).await?;
     info!(?proxy_src, ?PROXY_BIN_PATH, "pushing proxy binary");
     // The device may still be waiting for the user to accept the USB
@@ -252,12 +258,19 @@ async fn setup(
         .status()
         .await?;
 
-    let port = DEFAULT_PROXY_PORT;
-    let _ = Command::new("adb")
-        .args(["-s", device.as_str(), "forward", "--remove-all"])
-        .status().await.ok();
+    // Each device gets its own host-side port (a second device reusing the
+    // same host port would fail `adb forward` with "address already in use",
+    // and could misroute on older adb). The device side stays on
+    // DEFAULT_PROXY_PORT; only the host half of the forward varies.
+    let host_port = allocate_host_port()?;
     let status = Command::new("adb")
-        .args(["-s", device.as_str(), "forward", &format!("tcp:{port}"), &format!("tcp:{port}")])
+        .args([
+            "-s",
+            device.as_str(),
+            "forward",
+            &format!("tcp:{host_port}"),
+            &format!("tcp:{DEFAULT_PROXY_PORT}"),
+        ])
         .status()
         .await?;
     if !status.success() {
@@ -270,7 +283,7 @@ async fn setup(
 
     let proxy_cmd = format!(
         "setsid sh -c '{} {} >/data/local/tmp/adbshare-proxy.log 2>&1 &' </dev/null",
-        PROXY_BIN_PATH, port
+        PROXY_BIN_PATH, DEFAULT_PROXY_PORT
     );
     let _ = Command::new("adb")
         .args(["-s", device.as_str(), "shell", &proxy_cmd])
@@ -280,7 +293,7 @@ async fn setup(
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{host_port}");
     let mut last_err = None;
     for _ in 0..25 {
         match ProxyClient::connect(&addr, 1).await {
@@ -317,7 +330,19 @@ async fn setup(
                 }
             })?;
     }
-    Ok(client)
+    Ok((client, host_port))
+}
+
+/// Grab a free host TCP port by binding an ephemeral listener on 127.0.0.1
+/// and immediately dropping it. There is a small TOCTOU window (another
+/// process could claim the port before adb binds it); for dev tooling that
+/// risk is acceptable and a collision surfaces as a loud `adb forward`
+/// failure rather than silent misrouting.
+fn allocate_host_port() -> anyhow::Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
 }
 
 fn is_x86_binary(path: &std::path::Path) -> bool {
