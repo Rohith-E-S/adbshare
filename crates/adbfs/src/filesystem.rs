@@ -630,12 +630,12 @@ impl Filesystem for Adbfs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -654,7 +654,19 @@ impl Filesystem for Adbfs {
             return;
         };
         if let Some(s) = size {
-            let _ = self.proxy.truncate(&path_str, s);
+            // Truncate is the one setattr operation the proxy protocol
+            // supports; propagate failures instead of swallowing them.
+            if let Err(e) = self.proxy.truncate(&path_str, s) {
+                reply.error(Self::proxy_to_errno(e));
+                return;
+            }
+        }
+        if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
+            // The proxy protocol has no chmod/chown/utimens ops. Fail
+            // loudly instead of silently accepting and losing the change;
+            // adding protocol support is a follow-up.
+            reply.error(libc::ENOSYS);
+            return;
         }
         match self.proxy.stat(&path_str) {
             Ok(stat) => {
