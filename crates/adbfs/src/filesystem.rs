@@ -272,13 +272,7 @@ impl Adbfs {
     }
 
     fn attr_from_stat(&self, ino: u64, stat: Stat) -> FileAttr {
-        let kind = if stat.mode.is_dir() {
-            FileType::Directory
-        } else if stat.mode.is_symlink() {
-            FileType::Symlink
-        } else {
-            FileType::RegularFile
-        };
+        let kind = Self::kind_from_mode(&stat.mode);
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.mtime.max(0) as u64);
         let atime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.atime.max(0) as u64);
         let ctime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.ctime.max(0) as u64);
@@ -298,6 +292,16 @@ impl Adbfs {
             rdev: 0,
             blksize: stat.blksize.max(BLOCK_SIZE),
             flags: 0,
+        }
+    }
+
+    fn kind_from_mode(mode: &FileMode) -> FileType {
+        if mode.is_dir() {
+            FileType::Directory
+        } else if mode.is_symlink() {
+            FileType::Symlink
+        } else {
+            FileType::RegularFile
         }
     }
 
@@ -334,7 +338,8 @@ impl Filesystem for Adbfs {
             reply.error(libc::EINVAL);
             return;
         };
-        match self.proxy.stat(&path_str) {
+        let res = self.proxy.stat(&path_str);
+        match res {
             Ok(stat) => {
                 self.cache.put(path.clone(), stat);
                 let ino = self.ino_for(path);
@@ -361,7 +366,8 @@ impl Filesystem for Adbfs {
             reply.error(libc::EINVAL);
             return;
         };
-        match self.proxy.stat(&path_str) {
+        let res = self.proxy.stat(&path_str);
+        match res {
             Ok(stat) => {
                 self.cache.put(path, stat);
                 let attr = self.attr_from_stat(ino, stat);
@@ -401,13 +407,7 @@ impl Filesystem for Adbfs {
             };
             let child_ino = self.ino_for(child_path.clone());
             self.cache.put(child_path, entry.stat);
-            let kind = if entry.stat.mode.is_dir() {
-                FileType::Directory
-            } else if entry.stat.mode.is_symlink() {
-                FileType::Symlink
-            } else {
-                FileType::RegularFile
-            };
+            let kind = Self::kind_from_mode(&entry.stat.mode);
             let _ = reply.add(child_ino, (n as i64) + 3, kind, entry.name);
         }
         reply.ok();
