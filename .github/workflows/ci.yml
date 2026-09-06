@@ -3,18 +3,38 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch/PR so pushes get fresh
+# runner slots instead of queueing behind outdated ones. Never cancel
+# what is already running on main.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
     # The workspace pins gdk4 0.9.x / libadwaita 0.7.x, which require
     # GTK >= 4.17 / libadwaita >= 1.7. ubuntu-latest's apt ships only
-    # GTK 4.14, so build the app in a Fedora container instead, whose
-    # gtk4-devel (4.22.x) and libadwaita-devel (1.9.x) satisfy the sys
-    # crates' pkg-config requirements.
-    container: fedora:latest
+    # GTK 4.14, so build in a Fedora container instead. Pinned to the
+    # major version (44, ships gtk4 4.22 / libadwaita 1.9) rather than
+    # :latest so a Fedora release bump can never silently change what
+    # CI validates — bump the tag deliberately when gdk4 demands it.
+    container: fedora:44
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -29,29 +49,95 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-fedora-cargo-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: build
+          cache-on-failure: true
 
-      - name: Build
-        run: cargo build --release --workspace
+      - name: Build (release)
+        run: cargo build --release --workspace --locked
 
       - name: Test
-        run: cargo test --workspace --lib
+        # Full scope (no --lib): bin-target unit tests (adb-daemon,
+        # adb-gui, test-adbfs) and doc tests were silently skipped by
+        # the old `--lib` invocation.
+        run: cargo test --workspace --locked
 
-      # Advisory for now: the codebase predates rustfmt/clippy enforcement
-      # (~350 fmt hunks and ~85 clippy warnings on main at the time of
-      # writing). Flipping these to blocking is a follow-up after the
-      # in-flight fix PRs merge and a one-shot `cargo fmt` + warning
-      # cleanup lands; until then they report but do not gate merges.
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: adbshare-binaries-${{ github.sha }}
+          path: |
+            target/release/adb-daemon
+            target/release/adb-gui
+            target/release/adbshare-proxy
+          retention-days: 14
+          if-no-files-found: error
+
+  clippy:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc pkgconf-pkg-config \
+            gtk4-devel libadwaita-devel \
+            fuse3-devel libusbx-devel
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+          cache-on-failure: true
+
+      # Advisory for now: the codebase predates lint enforcement (~85
+      # clippy warnings on main at the time of writing). Making this
+      # blocking is a follow-up after the in-flight fix PRs merge and a
+      # one-shot warning cleanup lands; until then it reports but does
+      # not gate merges.
       - name: Lint (advisory)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
         continue-on-error: true
 
+  fmt:
+    runs-on: ubuntu-latest
+    # rustfmt needs no system libraries — skip the container entirely.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Advisory for the same reason as clippy (~350 rustfmt hunks on
+      # main); a one-shot `cargo fmt --all` lands with the follow-up
+      # cleanup PR, then this flips to blocking.
       - name: Format check (advisory)
         run: cargo fmt --all -- --check
+        continue-on-error: true
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # RustSec advisory check against Cargo.lock: flags known
+      # vulnerabilities and unmaintained crates in the dependency tree.
+      # Advisory until the current findings (if any) are triaged.
+      - name: Dependency audit (advisory)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
