@@ -56,8 +56,9 @@ struct UiHandles {
     transfers_paused: parking_lot::Mutex<bool>,
 }
 
-/// Sidebar geometry: divider defaults to this and can be dragged narrower
-/// (min 200 via the pane's size request), never wider.
+/// Sidebar geometry: the divider defaults to this and can be dragged down to
+/// the sidebar's 240px minimum (its size request below). GTK exposes no
+/// maximum for the divider, so it can also be dragged wider.
 const SIDEBAR_DEFAULT_WIDTH: i32 = 248;
 
 pub struct AdbshareApp {
@@ -232,6 +233,9 @@ impl AdbshareApp {
             // Overflow menu: secondary actions only. Primary actions already
             // have header buttons, so they are NOT duplicated here.
             let kebab = gtk4::MenuButton::new();
+            // Declared before the menu items so their handlers can pop it
+            // down after activation.
+            let kebab_pop = gtk4::Popover::new();
             kebab.set_icon_name("view-more-symbolic");
             kebab.add_css_class("flat");
             kebab.set_tooltip_text(Some("More options"));
@@ -257,20 +261,30 @@ impl AdbshareApp {
             let refresh_item = menu_item("view-refresh-symbolic", "Refresh");
             {
                 let rb = browser.refresh_button.clone();
-                refresh_item.connect_clicked(move |_| rb.emit_clicked());
+                let kp = kebab_pop.clone();
+                refresh_item.connect_clicked(move |_| {
+                    kp.popdown();
+                    rb.emit_clicked();
+                });
             }
             kebab_menu.append(&refresh_item);
             let select_all_item = menu_item("edit-select-all-symbolic", "Select all");
             {
                 let browser_sa = browser.clone();
-                select_all_item.connect_clicked(move |_| browser_sa.select_all_active());
+                let kp = kebab_pop.clone();
+                select_all_item.connect_clicked(move |_| {
+                    kp.popdown();
+                    browser_sa.select_all_active();
+                });
             }
             kebab_menu.append(&select_all_item);
             kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
             let files_item = menu_item("system-file-manager-symbolic", "Open in Files");
             {
                 let browser_f = browser.clone();
+                let kp = kebab_pop.clone();
                 files_item.connect_clicked(move |_| {
+                    kp.popdown();
                     browser_f.emit(crate::file_browser::BrowserEvent::OpenExternal(browser_f.current_path()));
                 });
             }
@@ -278,7 +292,9 @@ impl AdbshareApp {
             let terminal_item = menu_item("utilities-terminal-symbolic", "Open in terminal");
             {
                 let browser_t = browser.clone();
+                let kp = kebab_pop.clone();
                 terminal_item.connect_clicked(move |_| {
+                    kp.popdown();
                     browser_t.emit(crate::file_browser::BrowserEvent::OpenTerminal(browser_t.current_path()));
                 });
             }
@@ -290,7 +306,11 @@ impl AdbshareApp {
                 .build();
             {
                 let browser_h = browser.clone();
+                let kp = kebab_pop.clone();
                 hidden_check.connect_toggled(move |btn| {
+                    // Choosing a toggle inside the menu closes it; re-opening
+                    // re-reads the live state.
+                    kp.popdown();
                     if btn.is_active() != browser_h.show_hidden() {
                         browser_h.toggle_show_hidden();
                     }
@@ -301,7 +321,9 @@ impl AdbshareApp {
             let app_about = menu_item("help-about-symbolic", "About ADBShare");
             {
                 let win_about = window.clone();
+                let kp = kebab_pop.clone();
                 app_about.connect_clicked(move |_| {
+                    kp.popdown();
                     let dialog = adw::MessageDialog::builder()
                         .heading("ADBShare Files")
                         .body(format!(
@@ -316,7 +338,6 @@ impl AdbshareApp {
                 });
             }
             kebab_menu.append(&app_about);
-            let kebab_pop = gtk4::Popover::new();
             kebab_pop.set_child(Some(&kebab_menu));
             kebab.set_popover(Some(&kebab_pop));
             header_end.append(&kebab);
@@ -372,17 +393,25 @@ impl AdbshareApp {
             // Drop files from other apps onto the canvas -> push/copy into
             // the directory being browsed.
             let (drop_tx, drop_rx) = async_channel::unbounded::<(PathBuf, Vec<PathBuf>)>();
+            // Accept both a single gio::File and a GdkFileList: multi-file
+            // drags (e.g. from Nautilus) deliver a GdkFileList, and matching
+            // only the File GType dropped every file but the first.
             let drop_target = gtk4::DropTarget::new(gtk4::gio::File::static_type(), gdk4::DragAction::COPY);
+            drop_target.set_types(&[gtk4::gio::File::static_type(), gdk4::FileList::static_type()]);
             let browser_drop = browser.clone();
             drop_target.connect_drop(move |_target, value, _x, _y| {
-                if let Ok(file) = value.get::<gtk4::gio::File>() {
-                    if let Some(src) = file.path() {
-                        let curr = browser_drop.current_path();
-                        let _ = drop_tx.try_send((curr.clone(), vec![src]));
-                        return true;
-                    }
+                let mut paths: Vec<PathBuf> = Vec::new();
+                if let Ok(list) = value.get::<gdk4::FileList>() {
+                    paths.extend(list.files().iter().filter_map(|f| f.path()));
+                } else if let Ok(file) = value.get::<gtk4::gio::File>() {
+                    paths.extend(file.path());
                 }
-                false
+                if paths.is_empty() {
+                    return false;
+                }
+                let curr = browser_drop.current_path();
+                let _ = drop_tx.try_send((curr, paths));
+                true
             });
             browser.root.add_controller(drop_target);
 
@@ -415,6 +444,9 @@ impl AdbshareApp {
             {
                 let tp = trans_pop.clone();
                 let click = gtk4::GestureClick::new();
+                // Primary button only: right-/middle-clicks must not open the
+                // transfers popover.
+                click.set_button(1);
                 click.connect_released(move |_, _, _, _| tp.popup());
                 handles.dock.root.add_controller(click);
             }
@@ -529,6 +561,20 @@ impl AdbshareApp {
                             *handles_dev_drain.devices.lock() = devices.clone();
                             let selected = handles_dev_drain.selected_device.lock().clone();
                             dev_list_drain.set_devices(&devices, selected.as_deref());
+                            // The selected device disappeared (unplugged /
+                            // daemon lost it): drop it as the active selection
+                            // and reset the browser instead of silently
+                            // re-highlighting a different row. Re-plugging the
+                            // same device works via a normal sidebar click (or
+                            // the auto-select below once nothing is selected).
+                            if let Some(ref sel) = selected {
+                                if !devices.iter().any(|d| &d.serial == sel) {
+                                    *handles_dev_drain.selected_device.lock() = None;
+                                    if !handles_dev_drain.browser.is_local_mode() {
+                                        handles_dev_drain.browser.set_device(None);
+                                    }
+                                }
+                            }
                             // Auto-select the first real device if none selected.
                             if selected.is_none() {
                                 if let Some(first) = devices.first() {
@@ -562,8 +608,26 @@ impl AdbshareApp {
 
             // --- Drain dir results ---
             let handles_dir = handles.clone();
+            let op_tx_dir = op_tx.clone();
             glib::spawn_future_local(async move {
-                while let Ok((_serial, path, result)) = dir_rx.recv().await {
+                while let Ok((serial, path, result)) = dir_rx.recv().await {
+                    // Drop listings that no longer match what the user is
+                    // looking at: a slow listing from device A (or from local
+                    // mode) must not overwrite the view after the user
+                    // switched to device B (or to a device from local mode).
+                    let expected = if handles_dir.browser.is_local_mode() {
+                        LOCAL_DEVICE.to_string()
+                    } else {
+                        match handles_dir.selected_device.lock().clone() {
+                            Some(d) => d,
+                            // Nothing selected: nothing may claim the view.
+                            None => continue,
+                        }
+                    };
+                    if serial != expected {
+                        tracing::debug!(stale = %serial, current = %expected, "dropped stale dir listing");
+                        continue;
+                    }
                     match result {
                         Ok(entries) => {
                             handles_dir.browser.show_path(path);
@@ -574,6 +638,10 @@ impl AdbshareApp {
                         Err(e) => {
                             handles_dir.browser.set_loading(false);
                             tracing::warn!(error=%e, "list_dir failed");
+                            // Surface the failure: without this the user only
+                            // saw the spinner stop, with the old listing and
+                            // breadcrumbs left dangling.
+                            let _ = op_tx_dir.try_send((Some("Could not open folder".to_string()), Err(e)));
                         }
                     }
                 }
@@ -660,7 +728,11 @@ impl AdbshareApp {
                 while let Ok(result) = jobs_rx.recv().await {
                     match result {
                         Ok(jobs) => {
-                            let active: Vec<_> = jobs.iter().filter(|j| j.state == "Running" || j.state == "Pending").collect();
+                            // Paused jobs count as active: they must stay
+                            // visible (banner + dock) and resumable.
+                            let active: Vec<_> = jobs.iter().filter(|j| {
+                                j.state == "Running" || j.state == "Pending" || j.state == "Paused"
+                            }).collect();
                             *handles_jobs.active_jobs.lock() = active.iter().map(|j| j.id).collect();
                             if active.len() == 1 {
                                 count_drain.set_label("1 transfer");
@@ -704,8 +776,20 @@ impl AdbshareApp {
                                 browser_drain.update_transfer_banner(true, &banner_str, fraction);
                             } else {
                                 browser_drain.update_transfer_banner(false, "", 0.0);
+                                // Nothing left to resume; reset the toggle so
+                                // the next transfer starts in "pause" state.
+                                *handles_jobs.transfers_paused.lock() = false;
                             }
-                            handles_jobs.dock.update(&jobs);
+                            // The pause button means "resume" while paused.
+                            let paused = *handles_jobs.transfers_paused.lock();
+                            let (icon, tip) = if paused {
+                                ("media-playback-start-symbolic", "Resume all transfers")
+                            } else {
+                                ("media-playback-pause-symbolic", "Pause all transfers")
+                            };
+                            browser_drain.banner_pause_btn.set_icon_name(icon);
+                            browser_drain.banner_pause_btn.set_tooltip_text(Some(tip));
+                            handles_jobs.dock.update(&jobs, paused);
                             handles_jobs.transfer.update_jobs(jobs);
                         }
                         Err(e) => tracing::warn!(error=%e, "list_jobs failed"),
@@ -836,8 +920,10 @@ fn list_local_dir(path: &std::path::Path) -> Result<Vec<FsDirEntry>, String> {
     let read_dir = std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
     for entry in read_dir.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // Hide dotfiles like Nautilus does by default.
-        if name.starts_with('.') { continue; }
+        // Collect ALL entries, dotfiles included: the browser's
+        // "Show hidden files" toggle filters them GUI-side, the same way it
+        // does for device listings. Filtering here made the toggle a no-op
+        // in local mode.
         // DirEntry::metadata() does not follow symlinks; stat the target so
         // symlinked directories (e.g. /bin -> usr/bin) render as folders.
         let meta = std::fs::metadata(entry.path()).or_else(|_| entry.metadata());
@@ -874,21 +960,9 @@ fn handle_browser_event(
     rt: tokio::runtime::Handle,
     window: adw::ApplicationWindow,
 ) {
-    // Refresh the listing of `dir` on `device` after an operation.
-    fn refresh(
-        dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
-        rt: &tokio::runtime::Handle,
-        device: String,
-        dir: PathBuf,
-    ) {
-        let dir_tx = dir_tx.clone();
-        rt.spawn(async move {
-            let res = list_dir(&device, &dir.to_string_lossy()).await.map_err(|e| e.to_string());
-            let _ = dir_tx.send((device, dir, res)).await;
-        });
-    }
-
     // Refresh the local filesystem listing after an operation.
+    // (File operations chain their own refresh at the end of the task so
+    // the listing only updates once the change actually landed.)
     fn refresh_local(
         dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
         rt: &tokio::runtime::Handle,
@@ -944,7 +1018,12 @@ fn handle_browser_event(
                             if src.parent() == Some(target_dir.as_path()) {
                                 continue;
                             }
-                            if let Err(e) = rename(&device, &rel.to_string_lossy(), &dst.to_string_lossy()).await {
+                            // The device proxy resolves paths from the device
+                            // root, so the stripped relative path needs a
+                            // leading '/' (e.g. "sdcard/Download/a" ->
+                            // "/sdcard/Download/a").
+                            let device_src = format!("/{}", rel.to_string_lossy());
+                            if let Err(e) = rename(&device, &device_src, &dst.to_string_lossy()).await {
                                 let _ = op_tx.try_send((None, Err(format!("move: {e}"))));
                             }
                         }
@@ -962,14 +1041,16 @@ fn handle_browser_event(
         }
         BrowserEvent::PauseTransfer => {
             // Toggle: first click pauses every active job, next click resumes.
+            // Check for jobs FIRST: flipping the flag on an empty queue would
+            // invert the polarity of the next real click.
+            let ids = handles.active_jobs.lock().clone();
+            if ids.is_empty() { return; }
             let resume = {
                 let mut paused = handles.transfers_paused.lock();
                 let resume = *paused;
                 *paused = !resume;
                 resume
             };
-            let ids = handles.active_jobs.lock().clone();
-            if ids.is_empty() { return; }
             rt.spawn(async move {
                 for id in ids {
                     let r = if resume { resume_job(id).await } else { pause_job(id).await };
@@ -1264,68 +1345,86 @@ fn handle_browser_event(
         BrowserEvent::NewFolder(name) => {
             let curr = handles.browser.current_path();
             if handles.browser.is_local_mode() {
-                let mut target = curr.clone();
+                let dir = curr.clone();
+                let mut target = curr;
                 target.push(&name);
                 let op_tx = op_tx.clone();
+                let dir_tx = dir_tx.clone();
+                // Refresh AFTER the mkdir completes (success or failure);
+                // refreshing in parallel races and usually wins, showing
+                // stale contents.
                 rt.spawn_blocking(move || {
                     if let Err(e) = std::fs::create_dir_all(&target) {
                         let _ = op_tx.try_send((None, Err(format!("mkdir: {e}"))));
                     }
+                    let res = list_local_dir(&dir);
+                    let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), dir, res));
                 });
-                refresh_local(dir_tx, &rt, curr);
                 return;
             }
             let Some(device) = handles.selected_device.lock().clone() else { return };
-            let mut target = handles.browser.current_path();
+            let dir = handles.browser.current_path();
+            let mut target = dir.clone();
             target.push(&name);
             let target_str = target.to_string_lossy().to_string();
+            let dir_str = dir.to_string_lossy().to_string();
             let op_tx = op_tx.clone();
             let device_for_op = device.clone();
+            let dir_tx = dir_tx.clone();
             rt.spawn(async move {
                 if let Err(e) = mkdir(&device_for_op, &target_str).await {
                     let _ = op_tx.send((None, Err(format!("mkdir {target_str}: {e}")))).await;
                 }
+                let res = list_dir(&device_for_op, &dir_str).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device_for_op, dir, res)).await;
             });
-            refresh(dir_tx, &rt, device, handles.browser.current_path());
         }
         BrowserEvent::Rename(entry, new_name) => {
             let curr = handles.browser.current_path();
             if handles.browser.is_local_mode() {
+                let dir = curr.clone();
                 let mut src = curr.clone(); src.push(&entry.name);
                 let mut dst = curr.clone(); dst.push(&new_name);
                 let op_tx = op_tx.clone();
+                let dir_tx = dir_tx.clone();
+                // Refresh AFTER the rename completes (success or failure).
                 rt.spawn_blocking(move || {
                     if let Err(e) = std::fs::rename(&src, &dst) {
                         let _ = op_tx.try_send((None, Err(format!("rename: {e}"))));
                     }
+                    let res = list_local_dir(&dir);
+                    let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), dir, res));
                 });
-                refresh_local(dir_tx, &rt, curr);
                 return;
             }
             let Some(device) = handles.selected_device.lock().clone() else { return };
-            let curr = handles.browser.current_path();
-            let mut src = curr.clone(); src.push(&entry.name);
-            let mut dst = curr.clone(); dst.push(&new_name);
+            let dir = handles.browser.current_path();
+            let mut src = dir.clone(); src.push(&entry.name);
+            let mut dst = dir.clone(); dst.push(&new_name);
             let src_str = src.to_string_lossy().to_string();
             let dst_str = dst.to_string_lossy().to_string();
             let op_tx = op_tx.clone();
             let device_for_op = device.clone();
+            let dir_tx = dir_tx.clone();
             rt.spawn(async move {
                 if let Err(e) = rename(&device_for_op, &src_str, &dst_str).await {
                     let _ = op_tx.send((None, Err(format!("rename {src_str}: {e}")))).await;
                 }
+                let res = list_dir(&device_for_op, &dir.to_string_lossy()).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device_for_op, dir, res)).await;
             });
-            refresh(dir_tx, &rt, device, curr);
         }
         BrowserEvent::Delete(entries) => {
             if entries.is_empty() { return; }
             let curr = handles.browser.current_path();
             if handles.browser.is_local_mode() {
                 let op_tx = op_tx.clone();
-                let curr_for_task = curr.clone();
+                let dir_tx = dir_tx.clone();
+                let dir = curr.clone();
+                // Refresh AFTER the deletes complete (success or failure).
                 rt.spawn_blocking(move || {
                     for e in entries {
-                        let target = curr_for_task.join(&e.name);
+                        let target = dir.join(&e.name);
                         let r = if e.is_dir {
                             std::fs::remove_dir_all(&target)
                         } else {
@@ -1335,23 +1434,26 @@ fn handle_browser_event(
                             let _ = op_tx.try_send((None, Err(format!("delete {}: {err}", e.name))));
                         }
                     }
+                    let res = list_local_dir(&dir);
+                    let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), dir, res));
                 });
-                refresh_local(dir_tx, &rt, curr);
                 return;
             }
             let Some(device) = handles.selected_device.lock().clone() else { return };
             let op_tx = op_tx.clone();
             let device_for_op = device.clone();
-            let curr_for_task = curr.clone();
+            let dir = curr.clone();
+            let dir_tx = dir_tx.clone();
             rt.spawn(async move {
                 for e in entries {
-                    let target = curr_for_task.join(&e.name).to_string_lossy().to_string();
+                    let target = dir.join(&e.name).to_string_lossy().to_string();
                     if let Err(err) = delete(&device_for_op, &target).await {
                         let _ = op_tx.try_send((None, Err(format!("delete {target}: {err}"))));
                     }
                 }
+                let res = list_dir(&device_for_op, &dir.to_string_lossy()).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device_for_op, dir, res)).await;
             });
-            refresh(dir_tx, &rt, device, curr);
         }
         BrowserEvent::OpenExternal(path) => {
             if handles.browser.is_local_mode() {
