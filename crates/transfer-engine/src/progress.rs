@@ -57,20 +57,20 @@ impl ProgressTracker {
     }
 
     pub fn snapshot(&self, total: u64) -> ProgressSnapshot {
+        let bytes_done = self.history.back().map(|s| s.bytes_done).unwrap_or(0);
         let current_bps = self.history.back().map(|s| s.bps).unwrap_or(0.0);
-        let avg_bps = if total == 0 {
-            0.0
-        } else {
-            (total as f64) / self.started.elapsed().as_secs_f64().max(0.001)
-        };
+        // Average throughput is bytes actually transferred divided by elapsed
+        // time — not the total size (which previously inflated avg_bps for
+        // partially completed transfers).
+        let avg_bps = (bytes_done as f64) / self.started.elapsed().as_secs_f64().max(0.001);
         let eta = if current_bps > 0.0 && total > 0 {
-            let remaining = (total.saturating_sub(self.history.back().map(|s| s.bytes_done).unwrap_or(0))) as f64;
+            let remaining = (total.saturating_sub(bytes_done)) as f64;
             Some(std::time::Duration::from_secs_f64(remaining / current_bps))
         } else {
             None
         };
         ProgressSnapshot {
-            bytes_done: self.history.back().map(|s| s.bytes_done).unwrap_or(0),
+            bytes_done,
             bytes_total: total,
             current_bps,
             avg_bps,
@@ -82,4 +82,29 @@ impl ProgressTracker {
 
 impl Default for ProgressTracker {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avg_bps_uses_bytes_done_not_total() {
+        let mut tracker = ProgressTracker::new();
+        // Simulate a 1-second run that has transferred 250 of 1000 bytes.
+        tracker.tick(250);
+        tracker.started = Instant::now() - std::time::Duration::from_secs(1);
+
+        let snap = tracker.snapshot(1000);
+        assert_eq!(snap.bytes_done, 250);
+        // elapsed is slightly over 1s, so avg must be slightly under 250.
+        assert!(snap.avg_bps < 250.0 && snap.avg_bps > 240.0, "avg_bps = {}", snap.avg_bps);
+    }
+
+    #[test]
+    fn avg_bps_zero_before_any_bytes() {
+        let tracker = ProgressTracker::new();
+        let snap = tracker.snapshot(1000);
+        assert_eq!(snap.avg_bps, 0.0);
+    }
 }

@@ -68,6 +68,10 @@ impl JobQueue {
         inflight.retain(|j| j.id != job.id);
         drop(inflight);
         self.completed.lock().push(job);
+        // A parallelism slot just freed up; wake the dispatcher so a waiting
+        // `try_dispatch` loop re-checks capacity and starts pending jobs.
+        // Best-effort: a closed receiver simply means nobody is dispatching.
+        let _ = self.notify.send(());
     }
 
     pub fn has_capacity(&self) -> bool {
@@ -85,11 +89,20 @@ impl JobQueue {
     /// Take a snapshot of every job currently in the queue (pending, in-flight,
     /// completed). The returned `Vec` is a copy of the current state; the
     /// caller may iterate without holding any lock.
+    ///
+    /// All three guards are held simultaneously (in the queue's global lock
+    /// order `pending` -> `in_flight` -> `completed`) so a job that moves
+    /// between lists during the snapshot can neither appear twice nor
+    /// transiently vanish. Every other locking site on this struct follows
+    /// the same order, so simultaneous acquisition cannot deadlock.
     pub fn jobs_snapshot(&self) -> Vec<Job> {
-        let mut out = Vec::new();
-        out.extend(self.pending.lock().iter().cloned());
-        out.extend(self.in_flight.lock().iter().cloned());
-        out.extend(self.completed.lock().iter().cloned());
+        let pending = self.pending.lock();
+        let inflight = self.in_flight.lock();
+        let completed = self.completed.lock();
+        let mut out = Vec::with_capacity(pending.len() + inflight.len() + completed.len());
+        out.extend(pending.iter().cloned());
+        out.extend(inflight.iter().cloned());
+        out.extend(completed.iter().cloned());
         out
     }
 
@@ -97,10 +110,19 @@ impl JobQueue {
     /// is moved from `pending` into `in_flight` so it remains visible to
     /// `jobs_snapshot` while running. Callers must invoke `mark_done` when
     /// the job finishes.
+    ///
+    /// The capacity check and the move into `in_flight` happen atomically
+    /// under the `in_flight` lock, so concurrent dispatchers can never
+    /// exceed `parallelism`. Guards are acquired in the queue's global lock
+    /// order (`pending` -> `in_flight` -> `completed`, see `jobs_snapshot`).
     pub fn try_dispatch(&self) -> Option<Job> {
-        if !self.has_capacity() { return None; }
-        let job = self.next_pending()?;
-        self.in_flight.lock().push(job.clone());
+        let mut q = self.pending.lock();
+        let mut inflight = self.in_flight.lock();
+        if inflight.len() >= self.parallelism {
+            return None;
+        }
+        let job = q.pop_front()?;
+        inflight.push(job.clone());
         Some(job)
     }
 
@@ -151,4 +173,99 @@ pub struct QueueSnapshot {
     pub pending: usize,
     pub in_flight: usize,
     pub completed: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::{Direction, JobOptions};
+
+    fn test_job(name: &str) -> Job {
+        Job::new(
+            0,
+            Direction::Push,
+            std::path::PathBuf::from(format!("/src/{name}")),
+            std::path::PathBuf::from(format!("/dst/{name}")),
+            JobOptions::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn mark_done_wakes_dispatcher() {
+        let (queue, mut rx) = JobQueue::new(1);
+        queue.submit(test_job("a"));
+        queue.submit(test_job("b"));
+        // The submit notifications arrive first.
+        rx.try_recv().expect("submit notifies");
+
+        let a = queue.try_dispatch().expect("first job dispatches");
+        let a_id = a.id;
+        // Parallelism is saturated: nothing else may dispatch.
+        assert!(queue.try_dispatch().is_none());
+        assert_eq!(queue.snapshot().in_flight, 1);
+
+        queue.mark_done(a);
+        // mark_done must wake the (otherwise sleeping) dispatcher loop and
+        // the freed slot must let the pending job start.
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("mark_done must notify the dispatcher")
+            .expect("channel open");
+        let b = queue.try_dispatch().expect("freed slot allows dispatch");
+        assert_ne!(b.id, a_id);
+    }
+
+    #[test]
+    fn try_dispatch_never_exceeds_parallelism() {
+        let (queue, _rx) = JobQueue::new(2);
+        for i in 0..32 {
+            queue.submit(test_job(&format!("j{i}")));
+        }
+        let queue = queue.clone();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let q = Arc::clone(&queue);
+                std::thread::spawn(move || {
+                    let mut got = 0;
+                    while q.try_dispatch().is_some() { got += 1; }
+                    got
+                })
+            })
+            .collect();
+        let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 2, "exactly `parallelism` jobs may be in flight");
+        assert_eq!(queue.snapshot().in_flight, 2);
+        assert_eq!(queue.snapshot().pending, 30);
+    }
+
+    #[tokio::test]
+    async fn jobs_snapshot_never_duplicates_or_drops_a_job() {
+        let (queue, _rx) = JobQueue::new(2);
+        for i in 0..64 {
+            queue.submit(test_job(&format!("j{i}")));
+        }
+
+        let q = Arc::clone(&queue);
+        let churn = std::thread::spawn(move || {
+            for _ in 0..500 {
+                while let Some(job) = q.try_dispatch() {
+                    q.mark_done(job);
+                }
+            }
+        });
+
+        let mut seen_dupe = false;
+        for _ in 0..2000 {
+            let snap = queue.jobs_snapshot();
+            let mut ids: Vec<_> = snap.iter().map(|j| j.id).collect();
+            let n = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.len() != n { seen_dupe = true; break; }
+        }
+        churn.join().unwrap();
+        assert!(!seen_dupe, "a job appeared more than once in a snapshot");
+        // After the churn completes, every job is accounted for exactly once.
+        assert_eq!(queue.jobs_snapshot().len(), 64);
+    }
 }

@@ -10,10 +10,15 @@
 //! - `JobQueue` holds pending/in-flight jobs and dispatches up to
 //!   `parallelism` of them concurrently to a `Worker`.
 //! - `Worker` uses `adb_proxy::ProxyFile` for random-access I/O.
-//! - Resumption: we record `.adbshare-partial` markers in the destination
-//!   directory containing JSON with bytes-completed. On retry, the engine
-//!   continues from the last chunk boundary instead of restarting.
-//! - Checksums: optional SHA-256 verification at the end of each transfer.
+//! - Overwrite modes: with `OverwriteMode::SkipExisting` (the default) a
+//!   transfer to an existing destination completes as `JobState::Skipped`
+//!   without touching the file. `Resume` continues in place from the
+//!   destination's current size (detected via stat — there are no
+//!   `.adbshare-partial` marker files). `Rename` writes to a free
+//!   `name (N).ext` alternate. Partial files are only cleaned up when the
+//!   job itself created the destination.
+//! - Checksums: `VerifyMode::On` re-reads and hashes both sides (SHA-256)
+//!   after the transfer and fails the job on mismatch.
 
 #![warn(missing_debug_implementations)]
 
