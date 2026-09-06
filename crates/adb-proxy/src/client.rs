@@ -68,18 +68,12 @@ impl std::fmt::Debug for ProxyConn {
 struct ProxyConnInner {
     write_tx: mpsc::Sender<Bytes>,
     read_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
-    inflight: Arc<Mutex<Option<oneshot::Sender<Bytes>>>>,
     closed: Arc<PlMutex<bool>>,
     /// Serializes requests on this connection: each request must wait for
     /// the previous response before sending the next, because the protocol
     /// is strictly request/response with no IDs.
     req_lock: tokio::sync::Mutex<()>,
 }
-
-mod oneshot {
-    pub use tokio::sync::oneshot::*;
-}
-use std::sync::Mutex;
 
 impl ProxyConn {
     /// Open a new connection to the proxy. Caller is responsible for not
@@ -138,7 +132,6 @@ impl ProxyConn {
             inner: Arc::new(ProxyConnInner {
                 write_tx,
                 read_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
-                inflight: Arc::new(Mutex::new(None)),
                 closed,
                 req_lock: tokio::sync::Mutex::new(()),
             }),
@@ -410,27 +403,6 @@ impl ProxyClient {
         }.await;
         self.release(conn);
         res
-    }
-}
-
-impl ProxyConn {
-    fn new_unpooled(addr: String) -> Self {
-        // Synchronous-ish: the caller holds a permit and we cannot await here.
-        // Use a best-effort lazy connect: spawn and wait once. For the pool
-        // path this is rarely hit because max_conns == pool size.
-        // We use a blocking stub: return a closed connection. The caller will
-        // get an Io error and surface a useful message.
-        let (write_tx, _write_rx) = mpsc::channel::<Bytes>(1);
-        let (_tx, rx) = mpsc::channel::<Bytes>(1);
-        Self {
-            inner: Arc::new(ProxyConnInner {
-                write_tx,
-                read_rx: Arc::new(tokio::sync::Mutex::new(rx)),
-                inflight: Arc::new(Mutex::new(None)),
-                closed: Arc::new(PlMutex::new(true)),
-                req_lock: tokio::sync::Mutex::new(()),
-            }),
-        }
     }
 }
 
