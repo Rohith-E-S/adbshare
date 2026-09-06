@@ -1014,7 +1014,12 @@ fn handle_browser_event(
                             if src.parent() == Some(target_dir.as_path()) {
                                 continue;
                             }
-                            if let Err(e) = rename(&device, &rel.to_string_lossy(), &dst.to_string_lossy()).await {
+                            // The device proxy resolves paths from the device
+                            // root, so the stripped relative path needs a
+                            // leading '/' (e.g. "sdcard/Download/a" ->
+                            // "/sdcard/Download/a").
+                            let device_src = format!("/{}", rel.to_string_lossy());
+                            if let Err(e) = rename(&device, &device_src, &dst.to_string_lossy()).await {
                                 let _ = op_tx.try_send((None, Err(format!("move: {e}"))));
                             }
                         }
