@@ -92,7 +92,7 @@ impl Message {
         buf.put_u32_le(self.arg1);
         let len = self.payload.len() as u32;
         buf.put_u32_le(len);
-        let crc = crc32(&self.payload);
+        let crc = data_checksum(&self.payload);
         buf.put_u32_le(crc);
         buf.put_u32_le(self.command.as_u32() ^ 0xFFFF_FFFF);
         buf.extend_from_slice(&self.payload);
@@ -122,7 +122,7 @@ impl Message {
                 data_length
             )));
         }
-        let actual_crc = crc32(&payload);
+        let actual_crc = data_checksum(&payload);
         if actual_crc != data_crc {
             return Err(crate::AdbError::InvalidResponse(format!(
                 "crc mismatch: got {:08x}, want {:08x}",
@@ -134,23 +134,13 @@ impl Message {
     }
 }
 
-pub fn crc32(data: &[u8]) -> u32 {
-    // ADB uses a custom CRC32 with polynomial 0x04C11DB7 and an initial value of 0xFFFFFFFF.
-    // We use the `crc32fast` crate's algorithm with the right polynomial via manual table
-    // generation. To keep zero-deps, here is a hand-rolled table-less implementation.
-    const POLY: u32 = 0x04C1_1DB7;
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= (b as u32) << 24;
-        for _ in 0..8 {
-            if crc & 0x8000_0000 != 0 {
-                crc = (crc << 1) ^ POLY;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc ^ 0xFFFF_FFFF
+/// ADB's `data_crc32` header field.
+///
+/// Despite the name, this is *not* a CRC: adbd computes it as a plain additive
+/// byte sum (`sum += byte` over the payload, wrapping at 32 bits). See
+/// `PROTOCOL.txt` in the AOSP adb tree ("the crc is the sum of all bytes").
+pub fn data_checksum(data: &[u8]) -> u32 {
+    data.iter().fold(0u32, |a, &b| a.wrapping_add(b as u32))
 }
 
 #[cfg(test)]
@@ -158,12 +148,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crc32_known() {
-        // From AOSP adb protocol doc, "host:version" payload.
-        let v = crc32(b"host:version");
-        // We don't pin to a specific value here — just that it doesn't panic and is stable.
-        let v2 = crc32(b"host:version");
-        assert_eq!(v, v2);
+    fn data_checksum_known_answers() {
+        // Additive byte sum, so empty input is 0 and "hello" sums to
+        // 104+101+108+108+111 = 532 = 0x214.
+        assert_eq!(data_checksum(b""), 0);
+        assert_eq!(data_checksum(b"hello"), 0x214);
+        // "host:version" from the AOSP adb protocol doc.
+        assert_eq!(data_checksum(b"host:version"), 1278);
     }
 
     #[test]
