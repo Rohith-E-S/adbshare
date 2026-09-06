@@ -1912,7 +1912,9 @@ impl FileBrowser {
             let grid = self.grid_box.clone();
             let list = self.list_box.clone();
             let stack = self.file_view_stack.clone();
+            let root_sel = self.root.clone();
             add_shortcut("<Control>a", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&root_sel) { return glib::Propagation::Proceed; }
                 if view_is_grid(&stack) { grid.select_all(); } else { list.select_all(); }
                 glib::Propagation::Proceed
             }));
@@ -1930,6 +1932,7 @@ impl FileBrowser {
         {
             let browser = self.clone();
             add_shortcut("Delete", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
                 let sel = browser.selected_entries();
                 if !sel.is_empty() {
                     let label = if sel.len() == 1 { sel[0].name.clone() } else { format!("{} items", sel.len()) };
@@ -1972,14 +1975,21 @@ impl FileBrowser {
             let browser = self.clone();
             let on_ev = self.on_event.clone();
             add_shortcut("<Control><Shift>c", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
                 let files: Vec<DirEntry> = browser.selected_entries().into_iter().filter(|e| !e.is_dir).collect();
                 if !files.is_empty() { emit_ev(&on_ev, BrowserEvent::Download(files)); }
                 glib::Propagation::Proceed
             }));
         }
         {
+            let root_push = self.root.clone();
             let on_ev = self.on_event.clone();
-            add_shortcut("<Control>u", gtk4::CallbackAction::new(move |_, _| { emit_ev(&on_ev, BrowserEvent::Upload); glib::Propagation::Proceed }));
+            add_shortcut("<Control>u", gtk4::CallbackAction::new(move |_, _| {
+                // Ctrl+U is "delete to line start" inside text entries.
+                if focus_in_editable(&root_push) { return glib::Propagation::Proceed; }
+                emit_ev(&on_ev, BrowserEvent::Upload);
+                glib::Propagation::Proceed
+            }));
         }
         // Ctrl+= / Ctrl+- — grid zoom
         {
@@ -2015,6 +2025,7 @@ impl FileBrowser {
         {
             let browser = self.clone();
             add_shortcut("<Alt>Return", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
                 let sel = browser.selected_entries();
                 if sel.len() == 1 {
                     let e = sel.into_iter().next().unwrap();
@@ -2029,6 +2040,25 @@ impl FileBrowser {
             }));
         }
     }
+}
+
+/// True when the keyboard focus sits inside a text-editing widget (Entry,
+/// SearchEntry, the internal GtkText, or a TextView). The browser's global
+/// shortcuts (Delete, Ctrl+A, ...) must not fire while the user is typing,
+/// or e.g. pressing Delete mid-text pops the delete-confirmation dialog.
+fn focus_in_editable<W: IsA<gtk4::Widget>>(browser_root: &W) -> bool {
+    let Some(toplevel) = browser_root.root() else { return false };
+    let focus = toplevel
+        .downcast_ref::<gtk4::Window>()
+        .and_then(|w| gtk4::prelude::GtkWindowExt::focus(w));
+    let mut w = focus;
+    while let Some(widget) = w {
+        if widget.is::<gtk4::Editable>() || widget.is::<gtk4::Text>() || widget.is::<gtk4::TextView>() {
+            return true;
+        }
+        w = widget.parent();
+    }
+    false
 }
 
 /// Helper function to create stylish context menu items
