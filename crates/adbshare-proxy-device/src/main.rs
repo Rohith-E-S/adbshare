@@ -1,5 +1,6 @@
 use std::env;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -8,6 +9,9 @@ const MAX_REQUEST: usize = 8 * 1024 * 1024;
 const MAX_PATH: usize = 4096;
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 const LOG_PATH: &str = "/data/local/tmp/adbshare-proxy.log";
+/// Close a client connection after this much time without a completed
+/// request, so a stalled client cannot pin a task + socket forever.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn wlog(msg: String) {
     use std::fs::OpenOptions;
@@ -53,7 +57,33 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Arms a watchdog that force-closes the client socket if no request is
+/// completed within `IDLE_TIMEOUT`. Sending on the returned sender resets
+/// the timer; dropping it disarms the watchdog. Implemented with a plain
+/// thread + `libc::shutdown` because this binary is built without tokio's
+/// `time` feature.
+fn spawn_idle_watchdog(fd: i32) -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let _ = std::thread::Builder::new().name("idle-watchdog".into()).spawn(move || {
+        loop {
+            match rx.recv_timeout(IDLE_TIMEOUT) {
+                Ok(()) => continue, // activity: reset the timer
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    wlog(format!("[fd {}] idle timeout, closing connection", fd));
+                    // Interrupts any pending async read on this socket.
+                    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+                    return;
+                }
+            }
+        }
+    });
+    tx
+}
+
 async fn handle_connection(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) {
+    use std::os::fd::AsRawFd;
+    let watchdog = spawn_idle_watchdog(stream.as_raw_fd());
     let (mut reader, mut writer) = stream.into_split();
     let mut buf = Vec::with_capacity(64 * 1024);
     wlog(format!("[{:?}] open", addr));
@@ -80,14 +110,26 @@ async fn handle_connection(stream: tokio::net::TcpStream, addr: std::net::Socket
         buf.drain(..5+len);
         wlog(format!("[{:?}] op={:#x} len={}", addr, op, len));
 
-        let response = dispatch(op, &args).await;
+        // The dispatch handlers use blocking libc calls (pread/pwrite/
+        // readdir/stat/...); run them on the blocking pool so they cannot
+        // stall the async runtime.
+        let response = match tokio::task::spawn_blocking(move || dispatch(op, &args)).await {
+            Ok(response) => response,
+            Err(e) => {
+                wlog(format!("[{:?}] dispatch task failed: {}", addr, e));
+                return;
+            }
+        };
         wlog(format!("[{:?}] -> {} bytes", addr, response.len()));
         if writer.write_all(&response).await.is_err() { wlog(format!("[{:?}] write err", addr)); return; }
         if writer.flush().await.is_err() { return; }
+
+        // Completed request: reset the idle timer.
+        let _ = watchdog.send(());
     }
 }
 
-async fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
+fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     match op {
         0x01 => match handle_open(args) {
