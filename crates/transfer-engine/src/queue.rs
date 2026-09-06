@@ -68,6 +68,10 @@ impl JobQueue {
         inflight.retain(|j| j.id != job.id);
         drop(inflight);
         self.completed.lock().push(job);
+        // A parallelism slot just freed up; wake the dispatcher so a waiting
+        // `try_dispatch` loop re-checks capacity and starts pending jobs.
+        // Best-effort: a closed receiver simply means nobody is dispatching.
+        let _ = self.notify.send(());
     }
 
     pub fn has_capacity(&self) -> bool {
@@ -151,4 +155,45 @@ pub struct QueueSnapshot {
     pub pending: usize,
     pub in_flight: usize,
     pub completed: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::{Direction, JobOptions};
+
+    fn test_job(name: &str) -> Job {
+        Job::new(
+            0,
+            Direction::Push,
+            std::path::PathBuf::from(format!("/src/{name}")),
+            std::path::PathBuf::from(format!("/dst/{name}")),
+            JobOptions::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn mark_done_wakes_dispatcher() {
+        let (queue, mut rx) = JobQueue::new(1);
+        queue.submit(test_job("a"));
+        queue.submit(test_job("b"));
+        // The submit notifications arrive first.
+        rx.try_recv().expect("submit notifies");
+
+        let a = queue.try_dispatch().expect("first job dispatches");
+        let a_id = a.id;
+        // Parallelism is saturated: nothing else may dispatch.
+        assert!(queue.try_dispatch().is_none());
+        assert_eq!(queue.snapshot().in_flight, 1);
+
+        queue.mark_done(a);
+        // mark_done must wake the (otherwise sleeping) dispatcher loop and
+        // the freed slot must let the pending job start.
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("mark_done must notify the dispatcher")
+            .expect("channel open");
+        let b = queue.try_dispatch().expect("freed slot allows dispatch");
+        assert_ne!(b.id, a_id);
+    }
 }
