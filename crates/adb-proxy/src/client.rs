@@ -448,6 +448,22 @@ impl ProxyClient {
         res
     }
 
+    /// Set the access/modification times of `path` (unix epoch seconds).
+    /// Wire format: [path len u32][path][atime i64 LE][mtime i64 LE].
+    pub async fn utime(&self, path: &str, atime: i64, mtime: i64) -> Result<()> {
+        let (conn, _permit) = self.acquire().await?;
+        let res = async {
+            let mut args = Vec::new();
+            args.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            args.extend_from_slice(path.as_bytes());
+            args.extend_from_slice(&atime.to_le_bytes());
+            args.extend_from_slice(&mtime.to_le_bytes());
+            conn.request(Op::Utime, &args).await.map(|_| ())
+        }.await;
+        self.release(conn);
+        res
+    }
+
     pub async fn read_link(&self, path: &str) -> Result<String> {
         let (conn, _permit) = self.acquire().await?;
         let res = async {

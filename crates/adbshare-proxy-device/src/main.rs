@@ -280,9 +280,21 @@ fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         0x10 => match read_path(args) {
-            Some((path, _)) => {
-                let r = unsafe { libc::utimes(path.as_ptr() as *const _, std::ptr::null()) };
-                if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"utimes"); }
+            Some((path, rest)) => {
+                // Payload: [path][atime i64 LE][mtime i64 LE] — the client's
+                // requested times (see adb_proxy::ProxyClient::utime). Use
+                // them instead of unconditionally setting "now".
+                if rest.len() < 16 { out.push(0x08); out.extend_from_slice(b"short"); }
+                else {
+                    let atime = i64::from_le_bytes(rest[0..8].try_into().unwrap());
+                    let mtime = i64::from_le_bytes(rest[8..16].try_into().unwrap());
+                    let times = [
+                        libc::timeval { tv_sec: atime as libc::time_t, tv_usec: 0 },
+                        libc::timeval { tv_sec: mtime as libc::time_t, tv_usec: 0 },
+                    ];
+                    let r = unsafe { libc::utimes(path.as_ptr() as *const _, times.as_ptr()) };
+                    if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"utimes"); }
+                }
             }
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
