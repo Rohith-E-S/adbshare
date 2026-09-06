@@ -47,6 +47,9 @@ pub enum JobState {
     Running,
     Paused,
     Completed,
+    /// The destination already existed and `OverwriteMode::SkipExisting` left
+    /// it untouched.
+    Skipped,
     Failed,
     Cancelled,
 }
@@ -132,7 +135,7 @@ impl Job {
         let total = self.bytes_total();
         let frac = if total == 0 {
             match self.state() {
-                JobState::Completed => 1.0,
+                JobState::Completed | JobState::Skipped => 1.0,
                 _ => 0.0,
             }
         } else {
