@@ -20,7 +20,7 @@ use tokio::{
 };
 
 use crate::error::{AdbError, Result};
-use crate::packet::{Message, Command};
+use crate::packet::{Message, Command, MAX_PAYLOAD};
 
 pub type LocalId = u32;
 pub type RemoteId = u32;
@@ -174,6 +174,13 @@ impl AdbConnection {
                     break;
                 }
                 let len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+                if len > MAX_PAYLOAD {
+                    // The claimed length is attacker-controlled; honouring it
+                    // blindly would let a hostile peer wedge us with a ~4 GiB
+                    // allocation. This is unrecoverable framing corruption.
+                    tracing::error!(len, "frame exceeds MAX_PAYLOAD; dropping connection");
+                    break;
+                }
                 let mut payload = BytesMut::with_capacity(len);
                 if len > 0 {
                     payload.resize(len, 0);

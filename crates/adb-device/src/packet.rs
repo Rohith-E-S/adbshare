@@ -20,6 +20,17 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub const ADB_VERSION: u32 = 0x01000000;
 
+/// Maximum payload size we will ever allocate for or accept in a single frame.
+///
+/// 256 KiB is the classic ADB `MAX_PAYLOAD`. The precise limit is negotiated
+/// per-connection in the CNXN handshake (`max_payload`), but that value lives
+/// in the transport layer and is not plumbed through yet; until it is, this
+/// constant bounds how large a frame the reader will trust. Frames claiming a
+/// larger `data_length` are treated as a protocol error: trusting the wire
+/// value would let a hostile or glitching peer demand a ~4 GiB allocation and
+/// wedge the connection.
+pub const MAX_PAYLOAD: usize = 256 * 1024;
+
 pub const A_SYNC: u32 = 0x434e5953;
 pub const A_CNXN: u32 = 0x4e584e43;
 pub const A_OPEN: u32 = 0x4e45504f;
