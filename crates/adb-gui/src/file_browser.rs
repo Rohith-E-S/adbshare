@@ -1657,9 +1657,13 @@ impl FileBrowser {
         let local_act = self.local_mode.clone();
         let curr_act = self.current_path.clone();
         self.list_box.connect_row_activated(move |_lb, row| {
-            let idx = row.index() as usize;
+            // Resolve the entry by the row's widget name (set in set_entries)
+            // instead of the row index: the entries vec also holds dotfiles
+            // that have no row, so any index past a hidden dotfile would
+            // activate the wrong entry.
+            let name = row.widget_name().to_string();
             let entries = entries_act.borrow();
-            if let Some(e) = entries.get(idx) {
+            if let Some(e) = entries.iter().find(|e| e.name == name) {
                 if e.is_dir || e.is_symlink {
                     if let Some(cb) = on_event_act.borrow().as_ref() {
                         cb(BrowserEvent::OpenDir(e.clone()));
@@ -1695,8 +1699,19 @@ impl FileBrowser {
         let local_grid = self.local_mode.clone();
         let curr_grid = self.current_path.clone();
         self.grid_box.connect_child_activated(move |_fb, child| {
-            let idx = child.index() as usize;
-            if let Some(entry) = entries_sel_grid.borrow().get(idx).cloned() {
+            // Name-based lookup (same reason as the list view): the card's
+            // widget name is the entry name, while the child index drifts
+            // whenever dotfile entries are kept in the vec without a card.
+            let name = child
+                .child()
+                .map(|c| c.widget_name().to_string())
+                .unwrap_or_default();
+            let entry = entries_sel_grid
+                .borrow()
+                .iter()
+                .find(|e| e.name == name)
+                .cloned();
+            if let Some(entry) = entry {
                 if entry.is_dir || entry.is_symlink {
                     if let Some(cb) = on_ev_sel_grid.borrow().as_ref() {
                         cb(BrowserEvent::OpenDir(entry));
