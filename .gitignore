@@ -1,0 +1,28 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+rust_out
+
+.stitch/
+.zcode/
+stitch_adb_nautilus_file_manager/
+stitch_signal_deck/
+
+# Local tool state
+.zcode/
+.stitch/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# Packaging artifacts
+flatpak-builder/
+build/
+*.flatpak
+*.deb
+*.rpm
+
+# OS
+.DS_Store

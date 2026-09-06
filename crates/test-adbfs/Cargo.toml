@@ -1,0 +1,18 @@
+[package]
+name = "test-adbfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local test harness: mount Adbfs against a local proxy"
+publish = false
+
+[dependencies]
+adb-device = { path = "../adb-device" }
+adb-proxy = { path = "../adb-proxy" }
+adbfs = { path = "../adbfs" }
+tokio.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "test-adbfs"
+path = "src/main.rs"

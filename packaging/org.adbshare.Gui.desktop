@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=adbshare
+GenericName=Android File Manager
+Comment=Fast file manager for Android devices over ADB
+Exec=adb-gui %F
+Icon=org.adbshare.Gui
+Terminal=false
+Categories=FileManager;Utility;Network;
+Keywords=android;adb;mtp;file;transfer;phone;
+StartupNotify=true
+StartupWMClass=adbshare

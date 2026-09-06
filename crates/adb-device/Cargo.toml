@@ -1,0 +1,38 @@
+[package]
+name = "adb-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ADB device discovery, key management, and transport for adbshare"
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+clap.workspace = true
+dirs.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rsa = { version = "0.9", features = ["sha1"] }
+pkcs1 = { version = "0.7", features = ["pem"] }
+sha1 = "0.10"
+rand = "0.8"
+zeroize = "1.8"
+rusb = { version = "0.9", features = ["vendored"] }
+nix = { version = "0.29", features = ["fs", "net", "poll"] }
+
+# For OpenSSH PEM read/write (adb key compat)
+ssh-key = { version = "0.6", features = ["rsa"] }
+
+[dev-dependencies]
+tokio = { version = "1.41", features = ["full", "test-util", "macros"] }

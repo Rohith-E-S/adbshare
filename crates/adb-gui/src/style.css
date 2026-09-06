@@ -1,0 +1,660 @@
+/* ADBShare — "Signal Deck" design system
+ * Source: Stitch project "adbshare — Reimagined UI", variant
+ * "adbshare Dashboard — Signal Deck (Centered Dock)".
+ * Palette: green-tinted graphite (canvas #0c0f0d) + Android signal
+ * green #3ddc84 + cyan data accents. Type: Space Grotesk display /
+ * Inter body / JetBrains Mono data. Signature: the floating centered
+ * transfer dock, the 2px signal rail under the header, glowing
+ * progress fills, and LED dots on device rows. */
+
+window.background {
+    background-color: #0c0f0d;
+    color: #e8ece8;
+    font-family: Inter, system-ui, -apple-system, "Cantarell", sans-serif;
+}
+
+/* ---------- Header: the command bar ---------- */
+.app-headerbar {
+    background-color: #191e1a;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 0 8px;
+}
+
+.app-headerbar .header-left-segment {
+    padding: 0;
+    padding-right: 10px;
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.app-headerbar button {
+    min-height: 28px;
+    min-width: 28px;
+    padding: 2px 6px;
+    border-radius: 8px;
+    color: #9aa59c;
+    background: transparent;
+    border: none;
+    transition: background-color 120ms ease, color 120ms ease;
+}
+
+.app-headerbar button:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #e8ece8;
+}
+
+.app-headerbar button:disabled {
+    opacity: 0.35;
+}
+
+headerbar .title {
+    font-family: "Space Grotesk", Inter, sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    letter-spacing: 0.01em;
+}
+
+.files-title {
+    font-family: "Space Grotesk", Inter, sans-serif;
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #e8ece8;
+}
+
+/* Signal rail: 2px link-status strip pinned under the header.
+ * Idle = mint glow, working = amber. The app toggles the
+ * .transferring class from update_transfer_banner. */
+.signal-rail {
+    min-height: 2px;
+    background: linear-gradient(90deg, rgba(61,220,132,0.0), rgba(61,220,132,0.85), rgba(61,220,132,0.0));
+    opacity: 0.55;
+}
+.signal-rail.transferring {
+    background: linear-gradient(90deg, rgba(255,180,84,0.0), #ffb454 30%, #3ddc84 70%, rgba(61,220,132,0.0));
+    opacity: 1;
+}
+
+/* Location pill: segmented control, current crumb in mint-tinted chip */
+.app-headerbar .nav-pill-bar {
+    background-color: #0c0f0d;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 2px 4px;
+    margin: 4px 0;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+
+.nav-pill-btn {
+    border-radius: 7px;
+    padding: 3px 10px;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: #9aa59c;
+    background: transparent;
+    border: none;
+    transition: all 120ms ease;
+}
+
+.nav-pill-btn:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #e8ece8;
+}
+
+.nav-pill-btn.current {
+    background-color: rgba(61, 220, 132, 0.14);
+    color: #3ddc84;
+    font-weight: 700;
+    box-shadow: inset 0 0 0 1px rgba(61, 220, 132, 0.25), 0 0 12px rgba(61, 220, 132, 0.2);
+}
+
+.nav-pill-sep {
+    color: #3c4a3f;
+    font-size: 12px;
+    margin: 0 1px;
+}
+
+/* Circular close */
+.window-close-circle {
+    border-radius: 9999px;
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+    background-color: rgba(255,255,255,0.06);
+    color: #9aa59c;
+    border: 1px solid rgba(255,255,255,0.1);
+}
+.window-close-circle:hover {
+    background-color: #ff6b5e;
+    color: #fff;
+    border-color: #ff6b5e;
+}
+
+/* ---------- Sidebar: the device rail ---------- */
+.navigation-sidebar {
+    background-color: #141815;
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+paned.sidebar-paned > separator {
+    min-width: 5px;
+    background-color: transparent;
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+paned.sidebar-paned > separator:hover {
+    border-right-color: rgba(61, 220, 132, 0.55);
+}
+
+.sidebar-heading {
+    font-family: "JetBrains Mono", monospace;
+    color: #6b756c;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 12px 14px 5px 14px;
+}
+
+.sidebar-list { background: transparent; }
+.sidebar-list > row { background: transparent; border-radius: 9px; }
+.sidebar-list > row:hover { background-color: rgba(255,255,255,0.05); }
+.sidebar-list > row:selected { background: transparent; outline: none; }
+
+.sidebar-row {
+    border-radius: 9px;
+    margin: 1px 6px;
+    padding: 7px 10px;
+    border: 1px solid transparent;
+    background: transparent;
+    transition: background-color 110ms ease, border-color 110ms ease;
+}
+.sidebar-row:hover { background-color: rgba(255,255,255,0.055); }
+.sidebar-row:selected, .sidebar-row.active {
+    background-color: rgba(61, 220, 132, 0.11);
+    border-color: rgba(61, 220, 132, 0.28);
+    box-shadow: inset 2px 0 0 #3ddc84;
+}
+.sidebar-row:selected label, .sidebar-row.active label { color: #e8ece8; }
+.sidebar-row:selected .device-subline, .sidebar-row.active .device-subline { color: #9aa59c; }
+.sidebar-row:selected image, .sidebar-row.active image { color: #3ddc84; }
+
+.sidebar-row:selected .usb-badge-muted {
+    background-color: rgba(61,220,132,0.16);
+    color: #3ddc84;
+}
+
+.sidebar-icon-dim { color: #6b756c; }
+.selected-icon { color: #3ddc84; }
+.sidebar-icon-places { color: #57d4ff; }
+.sidebar-icon-trash { color: #6b756c; }
+
+.device-name {
+    font-size: 13px;
+    font-weight: 700;
+    color: #e8ece8;
+}
+.device-subline {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10.5px;
+    font-weight: 500;
+    color: #9aa59c;
+}
+.storage-path {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10.5px;
+    color: #6b756c;
+}
+
+.usb-badge-muted {
+    background-color: rgba(255,255,255,0.07);
+    color: #9aa59c;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-radius: 5px;
+    padding: 2px 7px;
+    border: 1px solid rgba(255,255,255,0.08);
+}
+.usb-badge {
+    background-color: rgba(61,220,132,0.16);
+    color: #3ddc84;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-radius: 5px;
+    padding: 2px 7px;
+    border: 1px solid rgba(61,220,132,0.3);
+}
+
+/* Device cards (Stitch "Signal Deck"): elevated cards, green-tinted
+ * and glowing when active, dimmed when idle. */
+.device-card {
+    background-color: #1f2620;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin: 3px 6px;
+    transition: background-color 130ms ease, border-color 130ms ease, box-shadow 130ms ease;
+}
+.device-card:hover { border-color: rgba(255, 255, 255, 0.16); }
+.device-card.active {
+    background-color: rgba(61, 220, 132, 0.10);
+    border-color: rgba(61, 220, 132, 0.45);
+    box-shadow: 0 0 12px rgba(61, 220, 132, 0.15);
+}
+.device-card.active .device-name { color: #e8ece8; }
+.device-card.dimmed { opacity: 0.78; }
+
+/* Toolbar search field (Stitch: always-visible input). */
+.header-search entry, searchentry.header-search {
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 4px 10px;
+    color: #e8ece8;
+    font-size: 12px;
+}
+searchentry.header-search:focus-within {
+    border-color: rgba(61, 220, 132, 0.5);
+    box-shadow: 0 0 0 1px rgba(61, 220, 132, 0.3);
+}
+
+/* Battery pill on device cards */
+.battery-pill {
+    background-color: rgba(61,220,132,0.14);
+    color: #3ddc84;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 9999px;
+    padding: 2px 7px;
+    border: 1px solid rgba(61,220,132,0.28);
+}
+
+/* Thin storage capacity bar on device cards */
+.device-storage-bar.progressbar trough,
+.device-storage-bar trough {
+    background-color: rgba(255,255,255,0.08);
+    border-radius: 9999px;
+    min-height: 4px;
+    border: none;
+}
+.device-storage-bar.progressbar progress,
+.device-storage-bar progress {
+    background-color: #3ddc84;
+    border-radius: 9999px;
+    min-height: 4px;
+    border: none;
+    box-shadow: 0 0 12px rgba(61,220,132,0.35);
+}
+
+/* LED dot prepended to device rows (device_list.rs adds .led) */
+.led {
+    border-radius: 9999px;
+    min-width: 8px;
+    min-height: 8px;
+    background-color: #3c4a3f;
+}
+.led-on { background-color: #3ddc84; box-shadow: 0 0 8px rgba(61,220,132,0.8); }
+.led-wifi { background-color: #57d4ff; box-shadow: 0 0 8px rgba(87,212,255,0.8); }
+.green-dot { background-color: #3ddc84; border-radius: 9999px; min-width: 8px; min-height: 8px; box-shadow: 0 0 8px rgba(61,220,132,0.7); }
+.blue-dot { background-color: #57d4ff; border-radius: 9999px; min-width: 8px; min-height: 8px; }
+
+.sidebar-separator {
+    min-height: 1px;
+    background-color: rgba(255,255,255,0.08);
+    margin: 8px 12px;
+    border: none;
+}
+.sidebar-top { padding: 4px 8px; }
+
+/* ---------- Rail brand header (Stitch: "adbshare v1.0.0-alpha") ---------- */
+.rail-brand {
+    font-family: "Space Grotesk", Inter, sans-serif;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: #e8ece8;
+}
+.rail-brand-icon { color: #3ddc84; }
+.rail-brand-version {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9.5px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #6b756c;
+}
+
+/* Ghost "+ Connect device" action row */
+.sidebar-row.connect-ghost {
+    border: 1px dashed rgba(255, 255, 255, 0.16);
+    border-radius: 10px;
+    margin: 4px 6px 2px 6px;
+    padding: 8px 10px;
+}
+.sidebar-row.connect-ghost label { color: #9aa59c; font-weight: 600; }
+.sidebar-row.connect-ghost:hover {
+    background-color: rgba(61, 220, 132, 0.08);
+    border-color: rgba(61, 220, 132, 0.45);
+}
+.sidebar-row.connect-ghost:hover label { color: #3ddc84; }
+
+/* ---------- Link banner (device status strip) ---------- */
+.adb-connected-banner {
+    background: linear-gradient(180deg, #171c18, #121613);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    padding: 9px 16px;
+}
+.adb-connected-banner .heading {
+    font-family: "Space Grotesk", Inter, sans-serif;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+.adb-pill-tag {
+    background-color: rgba(61,220,132,0.12);
+    border: 1px solid rgba(61,220,132,0.3);
+    border-radius: 9999px;
+    padding: 3px 10px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    font-weight: 700;
+    color: #3ddc84;
+}
+.adb-speed-label {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11.5px;
+    color: #9aa59c;
+}
+
+.raised-btn {
+    background-color: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px;
+    padding: 5px 12px;
+    color: #e8ece8;
+    font-size: 12px;
+    font-weight: 600;
+}
+.raised-btn:hover { background-color: rgba(255,255,255,0.12); }
+.raised-btn:disabled { opacity: 0.4; }
+.raised-btn.destructive-hover:hover { background-color: #ff6b5e; border-color: #ff6b5e; color: #fff; }
+
+/* Striped work progress */
+progressbar.progress-slim progress {
+    background: repeating-linear-gradient(-45deg, #ffb454 0 8px, #e6994a 8px 16px);
+    border-radius: 9999px;
+    min-height: 5px;
+}
+progressbar.progress-slim trough {
+    background-color: rgba(255,255,255,0.1);
+    border-radius: 9999px;
+    min-height: 5px;
+    border: none;
+}
+
+/* ---------- Sub-header ---------- */
+.sub-header-bar {
+    background-color: #141815;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    padding: 5px 14px;
+}
+.sub-header-title {
+    font-family: "JetBrains Mono", monospace;
+    color: #6b756c;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+.sub-header-path {
+    color: #9aa59c;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+}
+.sub-header-perm { color: #6b756c; font-size: 11px; }
+
+/* ---------- File canvas ---------- */
+.file-canvas { background-color: #0c0f0d; }
+
+.file-list-view { background-color: transparent; padding: 8px 12px; }
+
+.file-row {
+    border-radius: 10px;
+    margin: 1px 0;
+    border: 1px solid transparent;
+    background-color: transparent;
+    padding: 4px 6px;
+    transition: background-color 100ms ease, border-color 100ms ease;
+}
+.file-row:hover { background-color: rgba(255,255,255,0.045); border-color: rgba(255,255,255,0.07); }
+.file-row:selected {
+    background-color: rgba(61,220,132,0.13);
+    border-color: rgba(61,220,132,0.35);
+}
+.file-row:selected .title, .file-row:selected .subtitle { color: #e8ece8; }
+
+flowboxchild { border-radius: 12px; padding: 2px; }
+flowboxchild:selected { background-color: transparent; outline: none; }
+flowboxchild:selected .grid-item-card {
+    background-color: rgba(61,220,132,0.12);
+    border-color: rgba(61,220,132,0.45);
+    box-shadow: 0 0 0 1px rgba(61,220,132,0.35), 0 0 12px rgba(61,220,132,0.2), 0 8px 22px rgba(0,0,0,0.4);
+}
+flowboxchild:selected .grid-item-title,
+flowboxchild:selected .grid-item-sub { color: #e8ece8; }
+
+.grid-item-card {
+    border-radius: 12px;
+    padding: 10px 4px 8px 4px;
+    background-color: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+    transition: background-color 130ms ease, border-color 130ms ease, box-shadow 130ms ease;
+}
+.grid-item-card:hover {
+    background-color: rgba(255,255,255,0.06);
+    border-color: rgba(255,255,255,0.14);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+}
+.grid-item-title { font-size: 12.5px; font-weight: 500; color: #e8ece8; margin-top: 4px; }
+.grid-item-sub { font-family: "JetBrains Mono", monospace; font-size: 10.5px; color: #9aa59c; margin-top: 2px; }
+
+.folder-icon { color: #57d4ff; }
+.file-icon { color: #9aa59c; }
+.apk-icon { color: #3ddc84; }
+
+.rubber-band {
+    border: 1px solid #3ddc84;
+    background-color: rgba(61,220,132,0.14);
+    border-radius: 6px;
+}
+
+/* Empty states */
+statuspage .title, .heading {
+    font-family: "Space Grotesk", Inter, sans-serif;
+}
+statuspage .description { color: #9aa59c; }
+
+/* ---------- Popovers / menus ---------- */
+popover.background { background: transparent; border: none; box-shadow: none; padding: 0; }
+popover > arrow { background: transparent; border: none; box-shadow: none; }
+popover > contents {
+    background-color: #1f2620;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 14px;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.6);
+    padding: 5px;
+}
+popover separator { background-color: rgba(255,255,255,0.08); min-height: 1px; margin: 5px 10px; border: none; }
+popover button {
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 13px;
+    color: #c7cfc7;
+    border: none;
+    background: transparent;
+    min-height: 24px;
+}
+popover button:hover { background-color: rgba(255,255,255,0.08); color: #fff; }
+popover button.destructive:hover { background-color: rgba(255,107,94,0.22); color: #ffc2bc; }
+
+.shortcut-label { font-family: "JetBrains Mono", monospace; font-size: 11px; color: #6b756c; }
+.shortcut-label-highlight, .shortcut-label-accent { font-family: "JetBrains Mono", monospace; font-size: 11px; color: #3ddc84; }
+.menu-accent { color: #3ddc84; }
+.menu-item-highlight { background-color: rgba(61,220,132,0.12); border: 1px solid rgba(61,220,132,0.2); border-radius: 8px; }
+.menu-item-highlight:hover { background-color: rgba(61,220,132,0.2); }
+
+/* Transfer list cards */
+.transfer-card {
+    background-color: #1f2620;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin: 6px 10px;
+}
+.transfer-card .title { font-size: 13px; font-weight: 700; color: #e8ece8; }
+.transfer-card .subtitle { font-family: "JetBrains Mono", monospace; font-size: 11px; color: #9aa59c; }
+.transfer-card progressbar progress {
+    background: repeating-linear-gradient(-45deg, #3ddc84 0 8px, #2bb673 8px 16px);
+    border-radius: 9999px;
+    min-height: 6px;
+    box-shadow: 0 0 12px rgba(61,220,132,0.35);
+}
+.transfer-card progressbar trough {
+    background-color: rgba(255,255,255,0.1);
+    border-radius: 9999px;
+    min-height: 6px;
+    border: none;
+}
+
+/* ---------- Floating centered transfer dock ----------
+ * The signature element of the Stitch "Centered Dock" variant:
+ * a bottom-center card with the aggregate throughput in large cyan
+ * mono type, mini per-file progress rows, and pause/cancel controls. */
+.transfer-dock {
+    background-color: rgba(31, 38, 32, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 10px 14px;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,0,0,0.4);
+}
+.transfer-dock .dock-summary {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #9aa59c;
+}
+.transfer-dock .dock-speed {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 16px;
+    font-weight: 700;
+    color: #57d4ff;
+}
+.transfer-dock .dock-separator {
+    background-color: rgba(255,255,255,0.08);
+    min-width: 1px;
+}
+.transfer-dock .dock-mini-name {
+    font-size: 11.5px;
+    font-weight: 500;
+    color: #e8ece8;
+}
+.transfer-dock .dock-mini-pct {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10.5px;
+    color: #9aa59c;
+}
+.transfer-dock progressbar trough {
+    background-color: rgba(255,255,255,0.1);
+    border-radius: 9999px;
+    min-height: 4px;
+    border: none;
+}
+.transfer-dock progressbar progress {
+    background-color: #3ddc84;
+    border-radius: 9999px;
+    min-height: 4px;
+    border: none;
+    box-shadow: 0 0 12px rgba(61,220,132,0.35);
+}
+.transfer-dock button {
+    border-radius: 8px;
+    min-height: 26px;
+    min-width: 26px;
+    padding: 2px;
+    color: #9aa59c;
+    background: transparent;
+    border: none;
+}
+.transfer-dock button:hover { background-color: rgba(255,255,255,0.08); color: #e8ece8; }
+.transfer-dock button.destructive:hover { background-color: rgba(255,107,94,0.22); color: #ffc2bc; }
+
+/* Bottom floating status pill */
+.floating-drop-card {
+    background-color: rgba(31, 38, 32, 0.92);
+    border: 1px solid rgba(61,220,132,0.3);
+    border-radius: 9999px;
+    padding: 7px 18px;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,0,0,0.4);
+}
+.drop-icon-holder { background-color: #3ddc84; border-radius: 9999px; padding: 7px; }
+.drop-icon-circle { color: #0c0f0d; }
+
+.header-op-badge {
+    background-color: rgba(255,180,84,0.12);
+    border: 1px solid rgba(255,180,84,0.3);
+    border-radius: 9999px;
+    padding: 4px 10px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    font-weight: 700;
+    color: #ffb454;
+}
+.header-device-badge {
+    background-color: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 9999px;
+    padding: 4px 10px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    color: #9aa59c;
+}
+
+.avatar-circle {
+    background: linear-gradient(135deg, #3ddc84, #57d4ff);
+    color: #0c0f0d;
+    border-radius: 9999px;
+    min-width: 32px;
+    min-height: 32px;
+    font-weight: 700;
+}
+
+.nav-arrows-box {
+    background-color: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 9px;
+    padding: 2px;
+}
+.nav-arrows-box button { border-radius: 7px; padding: 4px 6px; background: transparent; color: #9aa59c; border: none; }
+.nav-arrows-box button:hover { background-color: rgba(255,255,255,0.09); color: #fff; }
+
+.card-sub-badge { border-radius: 5px; padding: 1px 5px; font-size: 10px; font-weight: 700; }
+
+/* Traffic lights (kept for compat, dimmed to fit theme) */
+.traffic-btn { border-radius: 9999px; min-width: 12px; min-height: 12px; padding: 0; margin: 0 3px; border: none; }
+.traffic-close { background-color: #ff6b5e; }
+.traffic-min { background-color: #6b756c; }
+.traffic-max { background-color: #3ddc84; }
+
+/* Focus visibility */
+button:focus-visible, row:focus-visible, entry:focus-visible {
+    outline: 2px solid rgba(61,220,132,0.6);
+    outline-offset: 1px;
+}
+
+scrollbar slider { background-color: rgba(255,255,255,0.16); border-radius: 9999px; }
+scrollbar slider:hover { background-color: rgba(61,220,132,0.4); }

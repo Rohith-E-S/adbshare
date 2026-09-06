@@ -1,0 +1,41 @@
+{
+  "app-id": "org.adbshare.Gui",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "47",
+  "sdk": "org.gnome.Sdk",
+  "command": "adb-gui",
+  "finish-args": [
+    "--share=ipc",
+    "--socket=session-bus",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--filesystem=xdg-run/adbshare:create",
+    "--filesystem=home",
+    "--filesystem=xdg-cache:create",
+    "--device=all"
+  ],
+  "modules": [
+    {
+      "name": "fuse3",
+      "buildsystem": "simple",
+      "build-commands": []
+    },
+    {
+      "name": "adbshare",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo build --release --bin adb-gui --bin adb-daemon --bin adbshare-proxy",
+        "install -Dm755 target/release/adb-gui /app/bin/adb-gui",
+        "install -Dm755 target/release/adb-daemon /app/bin/adb-daemon",
+        "install -Dm755 target/release/adbshare-proxy /app/bin/adbshare-proxy"
+      ],
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://github.com/yourusername/adbshare.git",
+          "tag": "v0.1.0"
+        }
+      ]
+    }
+  ]
+}

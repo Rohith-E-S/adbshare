@@ -1,0 +1,20 @@
+[package]
+name = "adbfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FUSE filesystem exposing Android devices over ADB"
+
+[dependencies]
+adb-device = { path = "../adb-device" }
+adb-proxy = { path = "../adb-proxy" }
+tokio.workspace = true
+fuser.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+libc = "0.2"

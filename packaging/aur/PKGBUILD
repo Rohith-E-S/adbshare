@@ -1,0 +1,34 @@
+# Maintainer: adbshare contributors <noreply@example.com>
+pkgname=adbshare
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Fast, reliable Linux file manager for Android devices over ADB"
+arch=('x86_64' 'aarch64')
+url="https://github.com/yourusername/adbshare"
+license=('GPL3')
+depends=('gtk4' 'libadwaita' 'fuse3' 'libusb')
+makedepends=('cargo' 'rust' 'pkgconf')
+optdepends=('android-tools: fallback adb binary')
+
+build() {
+    cd "$srcdir/.."
+    cargo build --release --workspace
+}
+
+package() {
+    cd "$srcdir/.."
+    install -Dm755 target/release/adb-gui "$pkgdir/usr/bin/adb-gui"
+    install -Dm755 target/release/adb-daemon "$pkgdir/usr/bin/adb-daemon"
+    install -Dm755 target/release/adbshare-proxy "$pkgdir/usr/lib/adbshare/adbshare-proxy"
+    install -Dm644 packaging/flatpak/org.adbshare.Gui.json \
+        "$pkgdir/usr/share/adbshare/flatpak-manifest.json"
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/org.adbshare.Gui.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=adbshare
+Comment=File manager for Android devices over ADB
+Exec=adb-gui %F
+Icon=phone
+Categories=FileManager;Utility;
+EOF
+}

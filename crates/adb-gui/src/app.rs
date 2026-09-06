@@ -1,0 +1,1667 @@
+//! Application root: AdwApplication + main window + D-Bus client.
+
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use std::os::unix::fs::PermissionsExt;
+
+use gtk4::prelude::*;
+use libadwaita as adw;
+use libadwaita::{prelude::*, *};
+
+use crate::device_list::{DeviceList, SidebarEvent};
+use crate::file_browser::ViewMode;
+use crate::file_browser::{BrowserEvent, DirEntry as FsDirEntry, FileBrowser};
+use crate::transfer_dock::TransferDock;
+use crate::transfer_view::{JobInfo, TransferView};
+
+#[zbus::proxy(
+    default_service = "org.adbshare.Manager",
+    interface = "org.adbshare.Manager",
+    default_path = "/org/adbshare/Manager"
+)]
+trait Manager {
+    async fn list_devices(&self) -> zbus::Result<Vec<String>>;
+    async fn device_info(&self, serial: &str) -> zbus::Result<String>;
+    async fn adb_version(&self) -> zbus::Result<String>;
+    async fn list_dir(&self, device: &str, path: &str) -> zbus::Result<String>;
+    async fn enqueue_push(&self, device: &str, local_path: &str, device_path: &str) -> zbus::Result<u64>;
+    async fn enqueue_pull(&self, device: &str, device_path: &str, local_path: &str) -> zbus::Result<u64>;
+    async fn list_jobs(&self) -> zbus::Result<String>;
+    async fn pause_job(&self, id: u64) -> zbus::Result<bool>;
+    async fn resume_job(&self, id: u64) -> zbus::Result<bool>;
+    async fn cancel_job(&self, id: u64) -> zbus::Result<bool>;
+    async fn mkdir(&self, device: &str, path: &str) -> zbus::Result<()>;
+    async fn rename(&self, device: &str, src: &str, dst: &str) -> zbus::Result<()>;
+    async fn delete(&self, device: &str, path: &str) -> zbus::Result<()>;
+    async fn connect_wireless(&self, address: &str) -> zbus::Result<String>;
+    async fn mountpoint_for(&self, device: &str) -> zbus::Result<String>;
+}
+
+mod adbshare_dbus_proxy {
+    pub use super::ManagerProxy;
+}
+
+struct UiHandles {
+    browser: FileBrowser,
+    transfer: TransferView,
+    dock: TransferDock,
+    selected_device: parking_lot::Mutex<Option<String>>,
+    /// Cache of live device metadata from the daemon.
+    devices: parking_lot::Mutex<Vec<crate::device_list::DeviceEntry>>,
+    /// Ids of jobs currently Pending/Running (for banner Pause/Cancel).
+    active_jobs: parking_lot::Mutex<Vec<u64>>,
+    /// Whether the banner pause button currently means "resume".
+    transfers_paused: parking_lot::Mutex<bool>,
+}
+
+/// Sidebar geometry: divider defaults to this and can be dragged narrower
+/// (min 200 via the pane's size request), never wider.
+const SIDEBAR_DEFAULT_WIDTH: i32 = 248;
+
+pub struct AdbshareApp {
+    app: adw::Application,
+}
+
+impl AdbshareApp {
+    pub fn new() -> Self {
+        let app = adw::Application::builder()
+            .application_id("org.adbshare.Gui")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        Self { app }
+    }
+
+    pub fn run(self) -> anyhow::Result<()> {
+        let app = self.app;
+
+        // Tokio runtime — zbus needs a reactor.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let rt_handle = rt.handle().clone();
+        std::thread::Builder::new()
+            .name("adbshare-tokio".into())
+            .spawn(move || {
+                let _ = rt.block_on(async {
+                    std::future::pending::<()>().await;
+                });
+            })?;
+
+        app.connect_activate(move |app| {
+            // Load custom CSS stylesheet
+            let css_provider = gtk4::CssProvider::new();
+            css_provider.load_from_data(include_str!("style.css"));
+            if let Some(display) = gdk4::Display::default() {
+                gtk4::style_context_add_provider_for_display(
+                    &display,
+                    &css_provider,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+
+            let window = adw::ApplicationWindow::builder()
+                .application(app)
+                .title("ADBShare Files")
+                .default_width(1280)
+                .default_height(800)
+                .build();
+            window.add_css_class("background");
+
+            // --- Top Level Layout: Full-width Headerbar + Horizontal Body ---
+            let main_layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+            // --- Top toolbar (Stitch "Centered Dock" clone): compact bar,
+            // nav arrows left, centered breadcrumb chips, right cluster with
+            // search field + view toggle + kebab + close.
+            let unified_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            unified_header.add_css_class("app-headerbar");
+            unified_header.set_height_request(44);
+
+            let browser = FileBrowser::new();
+            browser.root.set_vexpand(true);
+            browser.root.set_hexpand(true);
+
+            // Live search field sits in the toolbar (Stitch), not in a
+            // collapsible bar below the sub-header.
+            browser.search_bar.set_visible(false);
+
+            // Left: navigation arrows in a linked group.
+            let nav_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            nav_box.add_css_class("nav-arrows-box");
+            nav_box.set_valign(gtk4::Align::Center);
+            browser.back_button.add_css_class("flat");
+            browser.forward_button.add_css_class("flat");
+            nav_box.append(&browser.back_button);
+            nav_box.append(&browser.forward_button);
+            unified_header.append(&nav_box);
+
+            // Center: breadcrumb chips at natural width, centered in the
+            // remaining space. The browser renders crumbs as chips; the
+            // current folder is the mono mount chip (.current).
+            let center_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            center_box.set_hexpand(true);
+            center_box.set_halign(gtk4::Align::Center);
+            browser.path_stack.set_hexpand(false);
+            center_box.append(&browser.path_stack);
+            unified_header.append(&center_box);
+
+            // Right cluster: search field, view toggle, kebab, close.
+            let header_end = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            header_end.set_valign(gtk4::Align::Center);
+
+            // Always-visible compact search field (Stitch toolbar).
+            browser.search_entry.set_width_chars(20);
+            browser.search_entry.add_css_class("header-search");
+            header_end.append(&browser.search_entry);
+
+            // Single toggle button: grid <-> list (icon shows the target view).
+            let view_toggle = gtk4::Button::from_icon_name("view-list-symbolic");
+            view_toggle.add_css_class("flat");
+            view_toggle.set_tooltip_text(Some("Toggle Grid / List View"));
+            {
+                let browser_vt = browser.clone();
+                let vt = view_toggle.clone();
+                view_toggle.connect_clicked(move |_| {
+                    let new_mode = if browser_vt.view_mode() == ViewMode::Grid {
+                        ViewMode::List
+                    } else {
+                        ViewMode::Grid
+                    };
+                    browser_vt.set_view_mode(new_mode);
+                    vt.set_icon_name(if new_mode == ViewMode::Grid {
+                        "view-list-symbolic"
+                    } else {
+                        "view-grid-symbolic"
+                    });
+                });
+            }
+            view_toggle.set_valign(gtk4::Align::Center);
+            header_end.append(&view_toggle);
+
+            let flat_item = |icon: &str, label: &str| {
+                let btn = gtk4::Button::new();
+                btn.set_has_frame(true);
+                let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+                hbox.set_margin_start(6);
+                hbox.set_margin_end(6);
+                let img = gtk4::Image::from_icon_name(icon);
+                hbox.append(&img);
+                let lbl = gtk4::Label::new(Some(label));
+                lbl.set_xalign(0.0);
+                lbl.set_hexpand(true);
+                hbox.append(&lbl);
+                btn.set_child(Some(&hbox));
+                btn
+            };
+
+            // Single kebab menu (Stitch): folder actions, view options,
+            // transfers, and app actions in one overflow.
+            let kebab = gtk4::MenuButton::new();
+            kebab.set_icon_name("view-more-symbolic");
+            kebab.add_css_class("flat");
+            kebab.set_tooltip_text(Some("Menu"));
+            kebab.set_valign(gtk4::Align::Center);
+
+            let kebab_menu = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            kebab_menu.set_margin_top(6);
+            kebab_menu.set_margin_bottom(6);
+            kebab_menu.set_margin_start(6);
+            kebab_menu.set_margin_end(6);
+            kebab_menu.set_size_request(240, -1);
+
+            let refresh_item = flat_item("view-refresh-symbolic", "Refresh");
+            refresh_item.add_css_class("flat");
+            {
+                let rb = browser.refresh_button.clone();
+                refresh_item.connect_clicked(move |_| rb.emit_clicked());
+            }
+            kebab_menu.append(&refresh_item);
+
+            let select_all_item = flat_item("edit-select-all-symbolic", "Select All");
+            select_all_item.add_css_class("flat");
+            {
+                let browser_sa = browser.clone();
+                select_all_item.connect_clicked(move |_| browser_sa.select_all_active());
+            }
+            kebab_menu.append(&select_all_item);
+
+            kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+            let new_folder_item = flat_item("folder-new-symbolic", "New Folder");
+            new_folder_item.add_css_class("flat");
+            {
+                let nb = browser.new_folder_button.clone();
+                new_folder_item.connect_clicked(move |_| nb.emit_clicked());
+            }
+            kebab_menu.append(&new_folder_item);
+
+            let terminal_item = flat_item("utilities-terminal-symbolic", "Open in Terminal");
+            terminal_item.add_css_class("flat");
+            {
+                let browser_t = browser.clone();
+                terminal_item.connect_clicked(move |_| {
+                    browser_t.emit(crate::file_browser::BrowserEvent::OpenTerminal(browser_t.current_path()));
+                });
+            }
+            kebab_menu.append(&terminal_item);
+
+            let hidden_check = gtk4::CheckButton::builder()
+                .label("Show Hidden Files")
+                .margin_start(6)
+                .margin_end(6)
+                .build();
+            {
+                let browser_h = browser.clone();
+                hidden_check.connect_toggled(move |btn| {
+                    if btn.is_active() != browser_h.show_hidden() {
+                        browser_h.toggle_show_hidden();
+                    }
+                });
+            }
+            kebab_menu.append(&hidden_check);
+
+            kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+            // Transfers popover (full queue/history), opened from the kebab
+            // and from the floating dock.
+            let transfer = TransferView::new();
+            let trans_pop = gtk4::Popover::new();
+            trans_pop.set_size_request(440, 320);
+            let trans_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let trans_hdr = gtk4::Label::builder()
+                .label("Operations & Transfers")
+                .xalign(0.0)
+                .margin_start(12)
+                .margin_top(8)
+                .margin_bottom(8)
+                .build();
+            trans_hdr.add_css_class("heading");
+            trans_box.append(&trans_hdr);
+            transfer.transfer_attach(&trans_box);
+            trans_pop.set_child(Some(&trans_box));
+            trans_pop.set_parent(&kebab);
+
+            let transfers_item = flat_item("emblem-synchronizing-symbolic", "Transfers");
+            transfers_item.add_css_class("flat");
+            {
+                let tp = trans_pop.clone();
+                transfers_item.connect_clicked(move |_| tp.popup());
+            }
+            kebab_menu.append(&transfers_item);
+
+            kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+            let app_about = flat_item("help-about-symbolic", "About ADBShare");
+            app_about.add_css_class("flat");
+            {
+                let win_about = window.clone();
+                app_about.connect_clicked(move |_| {
+                    let dialog = adw::MessageDialog::builder()
+                        .heading("ADBShare Files")
+                        .body(format!(
+                            "ADB file manager for Linux\nVersion {} (pre-alpha)\nGTK4 + libadwaita",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .modal(true)
+                        .transient_for(&win_about)
+                        .build();
+                    dialog.add_response("ok", "Close");
+                    dialog.present();
+                });
+            }
+            kebab_menu.append(&app_about);
+
+            let app_quit = flat_item("application-exit-symbolic", "Quit");
+            app_quit.add_css_class("flat");
+            {
+                let app_handle = app.clone();
+                app_quit.connect_clicked(move |_| app_handle.quit());
+            }
+            kebab_menu.append(&app_quit);
+
+            let kebab_pop = gtk4::Popover::new();
+            kebab_pop.set_child(Some(&kebab_menu));
+            kebab.set_popover(Some(&kebab_pop));
+            header_end.append(&kebab);
+
+            // Circular close button.
+            let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+            close_btn.add_css_class("window-close-circle");
+            close_btn.set_tooltip_text(Some("Close"));
+            {
+                let win_close = window.clone();
+                close_btn.connect_clicked(move |_| win_close.close());
+            }
+            header_end.append(&close_btn);
+
+            unified_header.append(&header_end);
+
+            let header_handle = gtk4::WindowHandle::new();
+            header_handle.set_child(Some(&unified_header));
+            main_layout.append(&header_handle);
+
+            // Signature element: 2px signal rail under the header.
+            // Mint at rest, amber while transfers are running.
+            let signal_rail = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            signal_rail.add_css_class("signal-rail");
+            main_layout.append(&signal_rail);
+
+            // --- Body: resizable sidebar (Nautilus-style) + content ---
+            let body_paned = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+            body_paned.set_vexpand(true);
+            body_paned.add_css_class("sidebar-paned");
+
+            let sidebar_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            sidebar_box.add_css_class("navigation-sidebar");
+            sidebar_box.set_size_request(200, -1);
+            body_paned.set_start_child(Some(&sidebar_box));
+            // Allow the pane to shrink to the set position: if the sidebar's
+            // minimum width exceeds the position, GTK paints the start child
+            // shifted left by the overflow instead of clipping it, which is
+            // what made the sidebar's left edge look cut off. Overflow is now
+            // handled inside the ScrolledWindow (clips right, never scrolls
+            // left thanks to the hadjustment guard).
+            body_paned.set_shrink_start_child(true);
+
+
+            let device_list = std::rc::Rc::new(DeviceList::new());
+            // Rail brand header (Stitch: "adbshare v1.0.0-alpha" at the
+            // top-left of the device rail).
+            let brand_box = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
+            let brand_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            let brand_icon = gtk4::Image::from_icon_name("phone-symbolic");
+            brand_icon.add_css_class("rail-brand-icon");
+            brand_icon.set_pixel_size(18);
+            brand_row.append(&brand_icon);
+            let brand_label = gtk4::Label::new(Some("adbshare"));
+            brand_label.add_css_class("rail-brand");
+            brand_row.append(&brand_label);
+            brand_box.append(&brand_row);
+            let brand_version = gtk4::Label::new(Some(&format!(
+                "v{} · signal deck",
+                env!("CARGO_PKG_VERSION")
+            )));
+            brand_version.add_css_class("rail-brand-version");
+            brand_box.append(&brand_version);
+            brand_box.set_margin_start(14);
+            brand_box.set_margin_top(10);
+            brand_box.set_margin_bottom(2);
+            sidebar_box.append(&brand_box);
+            device_list.populate_defaults();
+            device_list.attach(&sidebar_box);
+
+            let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            content_box.set_vexpand(true);
+            content_box.set_hexpand(true);
+            content_box.append(&browser.root);
+            body_paned.set_end_child(Some(&content_box));
+            // Sidebar: 248px default (Stitch rail); user can drag narrower.
+            body_paned.set_position(SIDEBAR_DEFAULT_WIDTH);
+            main_layout.append(&body_paned);
+
+            // Floating centered transfer dock (Stitch "Centered Dock"
+            // variant): overlaid at the bottom-center of the window,
+            // above everything the main layout contains.
+            let window_overlay = gtk4::Overlay::new();
+            window_overlay.set_child(Some(&main_layout));
+
+            let dock = TransferDock::new();
+            window_overlay.add_overlay(&dock.root);
+            window.set_content(Some(&window_overlay));
+
+            // Drop files from other apps onto the canvas -> push/copy into
+            // the directory being browsed.
+            let (drop_tx, drop_rx) = async_channel::unbounded::<(PathBuf, Vec<PathBuf>)>();
+            let drop_target = gtk4::DropTarget::new(gtk4::gio::File::static_type(), gdk4::DragAction::COPY);
+            let browser_drop = browser.clone();
+            drop_target.connect_drop(move |_target, value, _x, _y| {
+                if let Ok(file) = value.get::<gtk4::gio::File>() {
+                    if let Some(src) = file.path() {
+                        let curr = browser_drop.current_path();
+                        let _ = drop_tx.try_send((curr.clone(), vec![src]));
+                        return true;
+                    }
+                }
+                false
+            });
+            browser.root.add_controller(drop_target);
+
+            // Stash handles
+            let handles = std::rc::Rc::new(UiHandles {
+                browser,
+                transfer,
+                dock,
+                selected_device: parking_lot::Mutex::new(None),
+                devices: parking_lot::Mutex::new(Vec::new()),
+                active_jobs: parking_lot::Mutex::new(Vec::new()),
+                transfers_paused: parking_lot::Mutex::new(false),
+            });
+
+            // Dock controls reuse the banner's Pause/Cancel event flow;
+            // clicking anywhere else on the dock opens the full
+            // Operations & Transfers popover.
+            {
+                let browser_dock = handles.browser.clone();
+                handles.dock.pause_button.connect_clicked(move |_| {
+                    browser_dock.emit(BrowserEvent::PauseTransfer);
+                });
+            }
+            {
+                let browser_dock = handles.browser.clone();
+                handles.dock.cancel_button.connect_clicked(move |_| {
+                    browser_dock.emit(BrowserEvent::CancelTransfer);
+                });
+            }
+            {
+                let tp = trans_pop.clone();
+                let click = gtk4::GestureClick::new();
+                click.connect_released(move |_, _, _, _| tp.popup());
+                handles.dock.root.add_controller(click);
+            }
+
+            // --- D-Bus channels ---
+            let (devices_tx, devices_rx) = async_channel::unbounded::<Result<Vec<crate::device_list::DeviceEntry>, String>>();
+            let (dir_tx, dir_rx) = async_channel::unbounded::<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>();
+            let (jobs_tx, jobs_rx) = async_channel::unbounded::<Result<Vec<JobInfo>, String>>();
+            let (info_tx, info_rx) = async_channel::unbounded::<(String, Result<String, String>)>();
+            let (mp_tx, mp_rx) = async_channel::unbounded::<Result<String, String>>();
+            // File-operation results: Err -> error dialog; Ok -> optional info dialog.
+            let (op_tx, op_rx) = async_channel::unbounded::<(Option<String>, Result<String, String>)>();
+
+            // --- Periodic device poll (replaces the one-shot initial fetch) ---
+            {
+                let rt_poll = rt_handle.clone();
+                let devices_tx_poll = devices_tx.clone();
+                glib::spawn_future_local(async move {
+                    loop {
+                        let tx = devices_tx_poll.clone();
+                        rt_poll.spawn(async move {
+                            let res = fetch_devices().await;
+                            let _ = tx.send(res).await;
+                        });
+                        glib::timeout_future(Duration::from_secs(3)).await;
+                    }
+                });
+            }
+
+            // --- Drain device-info refreshes -> cache + banner ---
+            let handles_info = handles.clone();
+            glib::spawn_future_local(async move {
+                while let Ok((serial, res)) = info_rx.recv().await {
+                    if let Ok(json) = res {
+                        if let Ok(dto) = serde_json::from_str::<DeviceInfoDto>(&json) {
+                            let entry = dto.into_entry();
+                            {
+                                let mut list = handles_info.devices.lock();
+                                if let Some(slot) = list.iter_mut().find(|d| d.serial == serial) {
+                                    *slot = entry.clone();
+                                }
+                            }
+                            handles_info.browser.set_device_info(&entry);
+                        }
+                    }
+                }
+            });
+
+            // --- Sidebar Events (Device / Place selected) ---
+            let handles_sidebar = handles.clone();
+            let dir_tx_sidebar = dir_tx.clone();
+            let info_tx_sidebar = info_tx.clone();
+            let mp_tx_sidebar = mp_tx.clone();
+            let op_tx_sidebar = op_tx.clone();
+            let rt_sidebar = rt_handle.clone();
+            let window_for_sidebar = window.clone();
+            device_list.on_event(move |ev| match ev {
+                SidebarEvent::SelectDevice(serial) => {
+                    select_device(&serial, &handles_sidebar, &dir_tx_sidebar, &info_tx_sidebar, &mp_tx_sidebar, rt_sidebar.clone());
+                }
+                SidebarEvent::SelectLocal(path) => {
+                    if !path.is_dir() {
+                        let _ = op_tx_sidebar.try_send((None, Err(format!("{} does not exist (is the folder or Trash empty?)", path.display()))));
+                        return;
+                    }
+                    handles_sidebar.browser.set_local_mode();
+                    handles_sidebar.browser.set_loading(true);
+                    let dir_tx = dir_tx_sidebar.clone();
+                    let p = path.clone();
+                    rt_sidebar.spawn_blocking(move || {
+                        let res = list_local_dir(&p);
+                        let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), p, res));
+                    });
+                }
+                SidebarEvent::ConnectIp => {
+                    show_connect_dialog(&window_for_sidebar, op_tx_sidebar.clone(), rt_sidebar.clone());
+                }
+                SidebarEvent::SelectPlace(path) => {
+                    let device = match handles_sidebar.selected_device.lock().clone() {
+                        Some(d) => d,
+                        None => {
+                            let _ = op_tx_sidebar.try_send((
+                                None,
+                                Err("No device selected — connect an Android device first.".to_string()),
+                            ));
+                            return;
+                        }
+                    };
+                    handles_sidebar.browser.set_loading(true);
+                    let dir_tx = dir_tx_sidebar.clone();
+                    let path_str = path.to_string_lossy().to_string();
+                    let dev_clone = device.clone();
+                    let target_path = path.clone();
+                    rt_sidebar.spawn(async move {
+                        let res = list_dir(&dev_clone, &path_str).await.map_err(|e| e.to_string());
+                        let _ = dir_tx.send((dev_clone, target_path, res)).await;
+                    });
+                }
+            });
+
+            // --- Drain device list -> sidebar ---
+            let dev_list_drain = device_list.clone();
+            let handles_dev_drain = handles.clone();
+            let dir_tx_dev_drain = dir_tx.clone();
+            let info_tx_dev_drain = info_tx.clone();
+            let mp_tx_dev_drain = mp_tx.clone();
+            let rt_dev_drain = rt_handle.clone();
+            glib::spawn_future_local(async move {
+                while let Ok(result) = devices_rx.recv().await {
+                    match result {
+                        Ok(devices) => {
+                            *handles_dev_drain.devices.lock() = devices.clone();
+                            let selected = handles_dev_drain.selected_device.lock().clone();
+                            dev_list_drain.set_devices(&devices, selected.as_deref());
+                            // Auto-select the first real device if none selected.
+                            if selected.is_none() {
+                                if let Some(first) = devices.first() {
+                                    select_device(&first.serial, &handles_dev_drain, &dir_tx_dev_drain, &info_tx_dev_drain, &mp_tx_dev_drain, rt_dev_drain.clone());
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            // Daemon unreachable — keep the empty state.
+                        }
+                    }
+                }
+            });
+
+            // --- Browser events ---
+            let handles_browser = handles.clone();
+            let dir_tx_browser = dir_tx.clone();
+            let op_tx_browser = op_tx.clone();
+            let rt_browser = rt_handle.clone();
+            let window_for_dialogs = window.clone();
+            handles.browser.on_event(move |ev| {
+                handle_browser_event(
+                    ev,
+                    &handles_browser,
+                    &dir_tx_browser,
+                    &op_tx_browser,
+                    rt_browser.clone(),
+                    window_for_dialogs.clone(),
+                );
+            });
+
+            // --- Drain dir results ---
+            let handles_dir = handles.clone();
+            glib::spawn_future_local(async move {
+                while let Ok((_serial, path, result)) = dir_rx.recv().await {
+                    match result {
+                        Ok(entries) => {
+                            handles_dir.browser.show_path(path);
+                            handles_dir.browser.set_entries(entries);
+                            handles_dir.browser.show_list();
+                            handles_dir.browser.set_loading(false);
+                        }
+                        Err(e) => {
+                            handles_dir.browser.set_loading(false);
+                            tracing::warn!(error=%e, "list_dir failed");
+                        }
+                    }
+                }
+            });
+
+            // --- Periodic job refresh ---
+            {
+                let rt_poll = rt_handle.clone();
+                let jobs_tx_poll = jobs_tx.clone();
+                glib::spawn_future_local(async move {
+                    loop {
+                        let tx = jobs_tx_poll.clone();
+                        rt_poll.spawn(async move {
+                            let res = list_jobs().await.map_err(|e| e.to_string());
+                            let _ = tx.send(res).await;
+                        });
+                        glib::timeout_future(Duration::from_millis(600)).await;
+                    }
+                });
+            }
+
+            // --- Drain drop events -> DropFiles handling (move/copy/push) ---
+            {
+                let handles_drop = handles.clone();
+                let dir_tx_drop = dir_tx.clone();
+                let op_tx_drop = op_tx.clone();
+                let rt_drop = rt_handle.clone();
+                let window_drop = window.clone();
+                glib::spawn_future_local(async move {
+                    while let Ok((target_dir, files)) = drop_rx.recv().await {
+                        handle_browser_event(
+                            BrowserEvent::DropFiles { from_dir: target_dir.clone(), target_dir, files },
+                            &handles_drop,
+                            &dir_tx_drop,
+                            &op_tx_drop,
+                            rt_drop.clone(),
+                            window_drop.clone(),
+                        );
+                    }
+                });
+            }
+
+            // --- Drain jobs -> TransferView & Header Operations Badge & ADB Banner ---
+            let handles_jobs = handles.clone();
+            let browser_drain = handles.browser.clone();
+            let rail_drain = signal_rail.clone();
+            glib::spawn_future_local(async move {
+                while let Ok(result) = jobs_rx.recv().await {
+                    match result {
+                        Ok(jobs) => {
+                            let active: Vec<_> = jobs.iter().filter(|j| j.state == "Running" || j.state == "Pending").collect();
+                            *handles_jobs.active_jobs.lock() = active.iter().map(|j| j.id).collect();
+                            if !active.is_empty() {
+                                rail_drain.add_css_class("transferring");
+                                let total_speed: u64 = active.iter().map(|j| j.speed_bps).sum();
+                                let transferred_bytes: u64 = active.iter().map(|j| j.bytes_done).sum();
+                                let total_bytes: u64 = active.iter().map(|j| j.bytes_total).sum();
+
+                                let speed_mb = (total_speed as f64) / 1_048_576.0;
+                                let trans_mb = (transferred_bytes as f64) / 1_048_576.0;
+                                let tot_mb = (total_bytes as f64) / 1_048_576.0;
+
+                                let fraction = if total_bytes > 0 {
+                                    ((transferred_bytes as f64) / (total_bytes as f64)).clamp(0.0, 1.0)
+                                } else {
+                                    0.5
+                                };
+
+                                let banner_str = format!(
+                                    "Transferring {} item{} ({:.1} MB of {:.1} MB — {:.1} MB/s)",
+                                    active.len(),
+                                    if active.len() > 1 { "s" } else { "" },
+                                    trans_mb,
+                                    tot_mb,
+                                    speed_mb
+                                );
+                                browser_drain.update_transfer_banner(true, &banner_str, fraction);
+                            } else {
+                                rail_drain.remove_css_class("transferring");
+                                browser_drain.update_transfer_banner(false, "", 0.0);
+                            }
+                            handles_jobs.dock.update(&jobs);
+                            handles_jobs.transfer.update_jobs(jobs);
+                        }
+                        Err(e) => tracing::warn!(error=%e, "list_jobs failed"),
+                    }
+                }
+            });
+
+            window.present();
+        });
+
+        app.run_with_args::<&str>(&[]);
+        Ok(())
+    }
+}
+
+/// Live device metadata as reported by the daemon over D-Bus.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DeviceInfoDto {
+    serial: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    android_version: Option<String>,
+    transport: String,
+    #[serde(default)]
+    battery_pct: Option<u8>,
+    #[serde(default)]
+    storage_used: Option<u64>,
+    #[serde(default)]
+    storage_total: Option<u64>,
+}
+
+impl DeviceInfoDto {
+    fn into_entry(self) -> crate::device_list::DeviceEntry {
+        crate::device_list::DeviceEntry {
+            serial: self.serial,
+            model: self.model,
+            transport: if self.transport == "wifi" { "wifi" } else { "usb" },
+            storage: match (self.storage_used, self.storage_total) {
+                (Some(u), Some(t)) if t > 0 => Some((u, t)),
+                _ => None,
+            },
+            battery_pct: self.battery_pct,
+        }
+    }
+}
+
+/// Query the daemon for devices + their live ADB metadata.
+async fn fetch_devices() -> Result<Vec<crate::device_list::DeviceEntry>, String> {
+    let serials = list_devices().await.map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(serials.len());
+    for s in serials {
+        let entry = match device_info(&s).await {
+            Ok(json) => serde_json::from_str::<DeviceInfoDto>(&json)
+                .map(DeviceInfoDto::into_entry)
+                .unwrap_or_else(|_| fallback_entry(&s)),
+            Err(_) => fallback_entry(&s),
+        };
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+fn fallback_entry(serial: &str) -> crate::device_list::DeviceEntry {
+    crate::device_list::DeviceEntry {
+        serial: serial.to_string(),
+        model: None,
+        transport: "usb",
+        storage: None,
+        battery_pct: None,
+    }
+}
+
+/// Shared "user picked (or auto-picked) this device" flow: updates header,
+/// banner, browser state, and kicks off a directory listing plus a fresh
+/// `device_info` fetch (battery/storage change over time).
+fn select_device(
+    serial: &str,
+    handles: &std::rc::Rc<UiHandles>,
+    dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+    info_tx: &async_channel::Sender<(String, Result<String, String>)>,
+    mp_tx: &async_channel::Sender<Result<String, String>>,
+    rt: tokio::runtime::Handle,
+) {
+    {
+        let mut sel = handles.selected_device.lock();
+        *sel = Some(serial.to_string());
+    }
+    let cached = handles.devices.lock().iter().find(|d| d.serial == serial).cloned();
+    if let Some(ref entry) = cached {
+        handles.browser.set_device_info(entry);
+    }
+    handles.browser.set_device(Some(serial));
+    handles.browser.show_path(PathBuf::from("/sdcard/Download"));
+
+    // Fetch the FUSE mountpoint for drag & drop out of the app; the result
+    // is drained on the GTK side (browser isn't Send).
+    {
+        let mp_tx = mp_tx.clone();
+        let serial_m = serial.to_string();
+        rt.spawn(async move {
+            let _ = mp_tx.send(mountpoint_for(&serial_m).await.map_err(|e| e.to_string())).await;
+        });
+    }
+
+    // Refresh live info (battery/storage change over time); the result is
+    // drained on the GTK side.
+    {
+        let info_tx = info_tx.clone();
+        let serial_c = serial.to_string();
+        rt.spawn(async move {
+            let res = device_info(&serial_c).await.map_err(|e| e.to_string());
+            let _ = info_tx.send((serial_c, res)).await;
+        });
+    }
+
+    let dir_tx = dir_tx.clone();
+    let serial_c = serial.to_string();
+    rt.spawn(async move {
+        let res = list_dir(&serial_c, "/sdcard/Download").await.map_err(|e| e.to_string());
+        let _ = dir_tx.send((serial_c, PathBuf::from("/sdcard/Download"), res)).await;
+    });
+}
+
+/// List a directory on the local Linux filesystem (sidebar "Linux Root").
+fn list_local_dir(path: &std::path::Path) -> Result<Vec<FsDirEntry>, String> {
+    let mut out = Vec::new();
+    let read_dir = std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Hide dotfiles like Nautilus does by default.
+        if name.starts_with('.') { continue; }
+        // DirEntry::metadata() does not follow symlinks; stat the target so
+        // symlinked directories (e.g. /bin -> usr/bin) render as folders.
+        let meta = std::fs::metadata(entry.path()).or_else(|_| entry.metadata());
+        let Ok(meta) = meta else { continue };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        out.push(FsDirEntry {
+            name,
+            is_dir: meta.is_dir(),
+            is_symlink: entry.file_type().map(|t| t.is_symlink()).unwrap_or(false),
+            size: meta.len(),
+            mode: meta.permissions().mode() & 0o7777,
+            mtime,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(out)
+}
+
+/// Sentinel "serial" for local-filesystem listings on the dir channel.
+const LOCAL_DEVICE: &str = "__local__";
+
+fn handle_browser_event(
+    ev: BrowserEvent,
+    handles: &std::rc::Rc<UiHandles>,
+    dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+    op_tx: &async_channel::Sender<(Option<String>, Result<String, String>)>,
+    rt: tokio::runtime::Handle,
+    window: adw::ApplicationWindow,
+) {
+    // Refresh the listing of `dir` on `device` after an operation.
+    fn refresh(
+        dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+        rt: &tokio::runtime::Handle,
+        device: String,
+        dir: PathBuf,
+    ) {
+        let dir_tx = dir_tx.clone();
+        rt.spawn(async move {
+            let res = list_dir(&device, &dir.to_string_lossy()).await.map_err(|e| e.to_string());
+            let _ = dir_tx.send((device, dir, res)).await;
+        });
+    }
+
+    // Refresh the local filesystem listing after an operation.
+    fn refresh_local(
+        dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+        rt: &tokio::runtime::Handle,
+        path: PathBuf,
+    ) {
+        let dir_tx = dir_tx.clone();
+        rt.spawn_blocking(move || {
+            let res = list_local_dir(&path);
+            let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), path, res));
+        });
+    }
+
+    match ev {
+        BrowserEvent::DropFiles { from_dir, target_dir, files } => {
+            let op_tx = op_tx.clone();
+            if handles.browser.is_local_mode() {
+                // Internal drags move; drops from other apps copy.
+                let from_dir_for_task = from_dir.clone();
+                let op_tx = op_tx.clone();
+                rt.spawn_blocking(move || {
+                    for src in files {
+                        let Some(name) = src.file_name().and_then(|n| n.to_str()) else { continue };
+                        let dst = target_dir.join(name);
+                        if src == dst { continue; }
+                        let internal = src.parent() == Some(from_dir_for_task.as_path());
+                        let r = if internal {
+                            std::fs::rename(&src, &dst)
+                        } else {
+                            std::fs::copy(&src, &dst).map(|_| ())
+                        };
+                        if let Err(e) = r {
+                            let _ = op_tx.try_send((None, Err(format!("drop: {e}"))));
+                        }
+                    }
+                });
+                refresh_local(dir_tx, &rt, from_dir);
+                return;
+            }
+            let Some(device) = handles.selected_device.lock().clone() else {
+                let _ = op_tx.try_send((None, Err("No device connected — connect a device to drop files onto it.".into())));
+                return;
+            };
+            let mount = handles.browser.fuse_mount();
+            let dir_tx = dir_tx.clone();
+            rt.spawn(async move {
+                for src in files {
+                    let Some(name) = src.file_name().and_then(|n| n.to_str()) else { continue };
+                    let dst = target_dir.join(name);
+                    match src.strip_prefix(mount.as_deref().unwrap_or("/nonexistent")) {
+                        // Source lives on the device (dragged via the FUSE mount): move it.
+                        Ok(rel) => {
+                            // Dropped back into its own folder: nothing to do.
+                            if src.parent() == Some(target_dir.as_path()) {
+                                continue;
+                            }
+                            if let Err(e) = rename(&device, &rel.to_string_lossy(), &dst.to_string_lossy()).await {
+                                let _ = op_tx.try_send((None, Err(format!("move: {e}"))));
+                            }
+                        }
+                        // External local file: push (copy) to the device.
+                        Err(_) => {
+                            if let Err(e) = enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await {
+                                let _ = op_tx.try_send((None, Err(format!("push: {e}"))));
+                            }
+                        }
+                    }
+                }
+                let res = list_dir(&device, &from_dir.to_string_lossy()).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device, from_dir, res)).await;
+            });
+        }
+        BrowserEvent::PauseTransfer => {
+            // Toggle: first click pauses every active job, next click resumes.
+            let resume = {
+                let mut paused = handles.transfers_paused.lock();
+                let resume = *paused;
+                *paused = !resume;
+                resume
+            };
+            let ids = handles.active_jobs.lock().clone();
+            if ids.is_empty() { return; }
+            rt.spawn(async move {
+                for id in ids {
+                    let r = if resume { resume_job(id).await } else { pause_job(id).await };
+                    if let Err(e) = r {
+                        tracing::warn!(id, error = %e, "pause/resume failed");
+                    }
+                }
+            });
+        }
+        BrowserEvent::CancelTransfer => {
+            let ids = handles.active_jobs.lock().split_off(0);
+            if ids.is_empty() { return; }
+            *handles.transfers_paused.lock() = false;
+            rt.spawn(async move {
+                for id in ids {
+                    if let Err(e) = cancel_job(id).await {
+                        tracing::warn!(id, error = %e, "cancel failed");
+                    }
+                }
+            });
+        }
+        BrowserEvent::Up => {
+            let current = handles.browser.current_path();
+            if handles.browser.is_local_mode() {
+                let parent = if current == PathBuf::from("/") {
+                    PathBuf::from("/")
+                } else {
+                    current.parent().unwrap_or(Path::new("/")).to_path_buf()
+                };
+                refresh_local(dir_tx, &rt, parent);
+                return;
+            }
+            let parent = if current == PathBuf::from("/") {
+                PathBuf::from("/")
+            } else {
+                current.parent().unwrap_or(&PathBuf::from("/")).to_path_buf()
+            };
+            let device = match handles.selected_device.lock().clone() {
+                Some(d) => d,
+                None => return,
+            };
+            handles.browser.set_loading(true);
+            let dir_tx = dir_tx.clone();
+            let path_str = parent.to_string_lossy().to_string();
+            rt.spawn(async move {
+                let res = list_dir(&device, &path_str).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device, parent, res)).await;
+            });
+        }
+        BrowserEvent::Back | BrowserEvent::Forward => {}
+        BrowserEvent::Navigate(path) => {
+            if handles.browser.is_local_mode() {
+                refresh_local(dir_tx, &rt, path);
+                return;
+            }
+            let device = match handles.selected_device.lock().clone() {
+                Some(d) => d,
+                None => return,
+            };
+            handles.browser.set_loading(true);
+            let dir_tx = dir_tx.clone();
+            let path_str = path.to_string_lossy().to_string();
+            rt.spawn(async move {
+                let res = list_dir(&device, &path_str).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device, path, res)).await;
+            });
+        }
+        BrowserEvent::Refresh => {
+            if handles.browser.is_local_mode() {
+                refresh_local(dir_tx, &rt, handles.browser.current_path());
+                return;
+            }
+            let device = match handles.selected_device.lock().clone() {
+                Some(d) => d,
+                None => return,
+            };
+            let path = handles.browser.current_path();
+            handles.browser.set_loading(true);
+            let dir_tx = dir_tx.clone();
+            let path_str = path.to_string_lossy().to_string();
+            rt.spawn(async move {
+                let res = list_dir(&device, &path_str).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device, path, res)).await;
+            });
+        }
+        BrowserEvent::OpenDir(entry) => {
+            if handles.browser.is_loading() { return; }
+            if !entry.is_dir && !entry.is_symlink { return; }
+            if handles.browser.is_local_mode() {
+                let mut new_path = handles.browser.current_path();
+                new_path.push(&entry.name);
+                refresh_local(dir_tx, &rt, new_path);
+                return;
+            }
+            let device = match handles.selected_device.lock().clone() {
+                Some(d) => d,
+                None => return,
+            };
+            let mut new_path = handles.browser.current_path();
+            new_path.push(&entry.name);
+            handles.browser.set_loading(true);
+            let dir_tx = dir_tx.clone();
+            let path_str = new_path.to_string_lossy().to_string();
+            rt.spawn(async move {
+                let res = list_dir(&device, &path_str).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device, new_path, res)).await;
+            });
+        }
+        BrowserEvent::Selected(_) => {}
+        BrowserEvent::Upload => {
+            if handles.browser.is_local_mode() {
+                // Browsing local files: push a chosen file to the connected device.
+                let Some(device) = handles.selected_device.lock().clone() else {
+                    let _ = op_tx.try_send((None, Err("No device connected — connect a device in the sidebar to push files to it.".into())));
+                    return;
+                };
+                let chooser = gtk4::FileChooserNative::builder()
+                    .title("Pick a file to push to the device")
+                    .modal(true)
+                    .action(gtk4::FileChooserAction::Open)
+                    .build();
+                chooser.set_transient_for(Some(&window));
+                let op_tx = op_tx.clone();
+                chooser.connect_response(move |chooser, resp| {
+                    if resp == gtk4::ResponseType::Accept {
+                        if let Some(file) = chooser.file() {
+                            if let Some(path) = file.path() {
+                                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+                                let local = path.to_string_lossy().to_string();
+                                let device_path = format!("/sdcard/Download/{name}");
+                                let device = device.clone();
+                                let op_tx = op_tx.clone();
+                                rt.spawn(async move {
+                                    let r = enqueue_push(&device, &local, &device_path).await
+                                        .map(|_| format!("Queued push of {name} to {device_path}"));
+                                    let _ = op_tx.try_send((Some("ADB Push".into()), r.map_err(|e| e.to_string())));
+                                });
+                            }
+                        }
+                    }
+                    chooser.destroy();
+                });
+                chooser.show();
+                return;
+            }
+            let device = match handles.selected_device.lock().clone() {
+                Some(d) => d,
+                None => return,
+            };
+            let current_dir = handles.browser.current_path();
+            let chooser = gtk4::FileChooserNative::builder()
+                .title("Pick file to upload")
+                .modal(true)
+                .action(gtk4::FileChooserAction::Open)
+                .build();
+            chooser.set_transient_for(Some(&window));
+
+            let device_dir = current_dir.clone();
+            let device_for_cb = device.clone();
+            let dir_tx_for_cb = dir_tx.clone();
+            let rt_for_cb = rt.clone();
+            chooser.connect_response(move |chooser, resp| {
+                if resp == gtk4::ResponseType::Accept {
+                    if let Some(file) = chooser.file() {
+                        if let Some(path) = file.path() {
+                            let name = path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("upload")
+                                .to_string();
+                            let device_path = device_dir.join(&name).to_string_lossy().to_string();
+                            let local = path.to_string_lossy().to_string();
+                            let dir_tx = dir_tx_for_cb.clone();
+                            let device_for_fetch = device_for_cb.clone();
+                            let device_dir_for_fetch = device_dir.clone();
+                            let device_dir_for_async = device_dir.clone();
+                            rt_for_cb.spawn(async move {
+                                let _ = enqueue_push(&device_for_fetch, &local, &device_path).await;
+                                let refresh = list_dir(&device_for_fetch, &device_dir_for_async.to_string_lossy())
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                let _ = dir_tx.send((device_for_fetch.clone(), device_dir_for_fetch, refresh)).await;
+                            });
+                        }
+                    }
+                }
+                chooser.destroy();
+            });
+            chooser.show();
+        }
+        BrowserEvent::Download(entries) => {
+            if entries.is_empty() { return; }
+            let files: Vec<FsDirEntry> = entries.into_iter().filter(|e| !e.is_dir).collect();
+            if files.is_empty() { return; }
+
+            if handles.browser.is_local_mode() {
+                // Local browsing: copy the files to ~/Downloads.
+                let Some(home) = dirs::home_dir() else { return };
+                let curr = handles.browser.current_path();
+                let dst_dir = home.join("Downloads");
+                let op_tx = op_tx.clone();
+                rt.spawn_blocking(move || {
+                    let mut copied = 0;
+                    let mut first_err = None;
+                    for e in &files {
+                        let src = curr.join(&e.name);
+                        let dst = dst_dir.join(&e.name);
+                        match std::fs::create_dir_all(&dst_dir)
+                            .and_then(|_| std::fs::copy(&src, &dst).map(|_| ()))
+                        {
+                            Ok(_) => copied += 1,
+                            Err(err) => { first_err = Some(format!("copy {}: {err}", e.name)); break; }
+                        }
+                    }
+                    match first_err {
+                        Some(err) => { let _ = op_tx.try_send((None, Err(err))); }
+                        None => { let _ = op_tx.try_send((Some("Copy".into()), Ok(format!("Copied {copied} file(s) to {}", dst_dir.display())))); }
+                    }
+                });
+                return;
+            }
+
+            let device = match handles.selected_device.lock().clone() {
+                Some(d) => d,
+                None => return,
+            };
+            let curr = handles.browser.current_path();
+
+            if files.len() == 1 {
+                // Single file: Save dialog with the name preset.
+                let entry = files.into_iter().next().unwrap();
+                let src = curr.join(&entry.name);
+                let src_str = src.to_string_lossy().to_string();
+                let chooser = gtk4::FileChooserNative::builder()
+                    .title("Save file as")
+                    .modal(true)
+                    .action(gtk4::FileChooserAction::Save)
+                    .build();
+                chooser.set_current_name(&entry.name);
+                if let Some(downloads) = dirs::download_dir() {
+                    let _ = chooser.set_current_folder(Some(&gtk4::gio::File::for_path(downloads)));
+                }
+                chooser.set_transient_for(Some(&window));
+                chooser.connect_response(move |chooser, resp| {
+                    if resp == gtk4::ResponseType::Accept {
+                        if let Some(file) = chooser.file() {
+                            if let Some(path) = file.path() {
+                                let local = path.to_string_lossy().to_string();
+                                let device = device.clone();
+                                let src_str = src_str.clone();
+                                rt.spawn(async move {
+                                    let _ = enqueue_pull(&device, &src_str, &local).await
+                                        .map_err(|e| tracing::warn!(error=%e, "enqueue_pull failed"));
+                                });
+                            }
+                        }
+                    }
+                    chooser.destroy();
+                });
+                chooser.show();
+            } else {
+                // Multiple files: pick a destination folder, pull them all.
+                let chooser = gtk4::FileChooserNative::builder()
+                    .title("Choose destination folder")
+                    .modal(true)
+                    .action(gtk4::FileChooserAction::SelectFolder)
+                    .build();
+                if let Some(downloads) = dirs::download_dir() {
+                    let _ = chooser.set_current_folder(Some(&gtk4::gio::File::for_path(downloads)));
+                }
+                chooser.set_transient_for(Some(&window));
+                chooser.connect_response(move |chooser, resp| {
+                    if resp == gtk4::ResponseType::Accept {
+                        if let Some(file) = chooser.file() {
+                            if let Some(dest_dir) = file.path() {
+                                for e in &files {
+                                    let src = curr.join(&e.name).to_string_lossy().to_string();
+                                    let local = dest_dir.join(&e.name).to_string_lossy().to_string();
+                                    let device = device.clone();
+                                    rt.spawn(async move {
+                                        let _ = enqueue_pull(&device, &src, &local).await
+                                            .map_err(|e| tracing::warn!(error=%e, "enqueue_pull failed"));
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    chooser.destroy();
+                });
+                chooser.show();
+            }
+        }
+        BrowserEvent::NewFolder(name) => {
+            let curr = handles.browser.current_path();
+            if handles.browser.is_local_mode() {
+                let mut target = curr.clone();
+                target.push(&name);
+                let op_tx = op_tx.clone();
+                rt.spawn_blocking(move || {
+                    if let Err(e) = std::fs::create_dir_all(&target) {
+                        let _ = op_tx.try_send((None, Err(format!("mkdir: {e}"))));
+                    }
+                });
+                refresh_local(dir_tx, &rt, curr);
+                return;
+            }
+            let Some(device) = handles.selected_device.lock().clone() else { return };
+            let mut target = handles.browser.current_path();
+            target.push(&name);
+            let target_str = target.to_string_lossy().to_string();
+            let op_tx = op_tx.clone();
+            let device_for_op = device.clone();
+            rt.spawn(async move {
+                if let Err(e) = mkdir(&device_for_op, &target_str).await {
+                    let _ = op_tx.send((None, Err(format!("mkdir {target_str}: {e}")))).await;
+                }
+            });
+            refresh(dir_tx, &rt, device, handles.browser.current_path());
+        }
+        BrowserEvent::Rename(entry, new_name) => {
+            let curr = handles.browser.current_path();
+            if handles.browser.is_local_mode() {
+                let mut src = curr.clone(); src.push(&entry.name);
+                let mut dst = curr.clone(); dst.push(&new_name);
+                let op_tx = op_tx.clone();
+                rt.spawn_blocking(move || {
+                    if let Err(e) = std::fs::rename(&src, &dst) {
+                        let _ = op_tx.try_send((None, Err(format!("rename: {e}"))));
+                    }
+                });
+                refresh_local(dir_tx, &rt, curr);
+                return;
+            }
+            let Some(device) = handles.selected_device.lock().clone() else { return };
+            let curr = handles.browser.current_path();
+            let mut src = curr.clone(); src.push(&entry.name);
+            let mut dst = curr.clone(); dst.push(&new_name);
+            let src_str = src.to_string_lossy().to_string();
+            let dst_str = dst.to_string_lossy().to_string();
+            let op_tx = op_tx.clone();
+            let device_for_op = device.clone();
+            rt.spawn(async move {
+                if let Err(e) = rename(&device_for_op, &src_str, &dst_str).await {
+                    let _ = op_tx.send((None, Err(format!("rename {src_str}: {e}")))).await;
+                }
+            });
+            refresh(dir_tx, &rt, device, curr);
+        }
+        BrowserEvent::Delete(entries) => {
+            if entries.is_empty() { return; }
+            let curr = handles.browser.current_path();
+            if handles.browser.is_local_mode() {
+                let op_tx = op_tx.clone();
+                let curr_for_task = curr.clone();
+                rt.spawn_blocking(move || {
+                    for e in entries {
+                        let target = curr_for_task.join(&e.name);
+                        let r = if e.is_dir {
+                            std::fs::remove_dir_all(&target)
+                        } else {
+                            std::fs::remove_file(&target)
+                        };
+                        if let Err(err) = r {
+                            let _ = op_tx.try_send((None, Err(format!("delete {}: {err}", e.name))));
+                        }
+                    }
+                });
+                refresh_local(dir_tx, &rt, curr);
+                return;
+            }
+            let Some(device) = handles.selected_device.lock().clone() else { return };
+            let op_tx = op_tx.clone();
+            let device_for_op = device.clone();
+            let curr_for_task = curr.clone();
+            rt.spawn(async move {
+                for e in entries {
+                    let target = curr_for_task.join(&e.name).to_string_lossy().to_string();
+                    if let Err(err) = delete(&device_for_op, &target).await {
+                        let _ = op_tx.try_send((None, Err(format!("delete {target}: {err}"))));
+                    }
+                }
+            });
+            refresh(dir_tx, &rt, device, curr);
+        }
+        BrowserEvent::OpenExternal(path) => {
+            if handles.browser.is_local_mode() {
+                if let Err(e) = std::process::Command::new("xdg-open").arg(&path).spawn() {
+                    let _ = op_tx.try_send((None, Err(format!("xdg-open {}: {e}", path.display()))));
+                }
+                return;
+            }
+            let Some(device) = handles.selected_device.lock().clone() else { return };
+            let op_tx = op_tx.clone();
+            rt.spawn(async move {
+                match mountpoint_for(&device).await {
+                    Ok(mp) => {
+                        let local = format!("{}{}", mp.trim_end_matches('/'), path.display());
+                        if let Err(e) = std::process::Command::new("xdg-open").arg(&local).spawn() {
+                            let _ = op_tx.send((None, Err(format!("xdg-open {local}: {e}")))).await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = op_tx.send((None, Err(format!(
+                            "The device is not mounted (file operations still work, but opening in the system file manager needs the FUSE mount): {e}"
+                        )))).await;
+                    }
+                }
+            });
+        }
+        BrowserEvent::InstallApk(entry) => {
+            let curr = handles.browser.current_path();
+            if handles.browser.is_local_mode() {
+                // The APK is already local — install straight to a connected device.
+                let Some(device) = handles.selected_device.lock().clone() else {
+                    let _ = op_tx.try_send((None, Err("No device connected — connect a device to install the APK.".into())));
+                    return;
+                };
+                let mut apk = curr.clone();
+                apk.push(&entry.name);
+                let apk_str = apk.to_string_lossy().to_string();
+                let op_tx = op_tx.clone();
+                rt.spawn(async move {
+                    let out = tokio::process::Command::new("adb")
+                        .args(["-s", &device, "install", "-r", &apk_str])
+                        .output()
+                        .await;
+                    let r = match out {
+                        Ok(o) if o.status.success() => Ok("APK installed".to_string()),
+                        Ok(o) => Err(format!("adb install failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
+                        Err(e) => Err(format!("adb install: {e}")),
+                    };
+                    let _ = op_tx.try_send((Some("Install APK".into()), r));
+                });
+                return;
+            }
+            let Some(device) = handles.selected_device.lock().clone() else { return };
+            let mut target = handles.browser.current_path();
+            target.push(&entry.name);
+            let target_str = target.to_string_lossy().to_string();
+            let op_tx = op_tx.clone();
+            rt.spawn(async move {
+                match mountpoint_for(&device).await {
+                    Ok(mp) => {
+                        let apk_local = format!("{}{}", mp.trim_end_matches('/'), target.display());
+                        let out = tokio::process::Command::new("adb")
+                            .args(["-s", &device, "install", "-r", &apk_local])
+                            .output()
+                            .await;
+                        match out {
+                            Ok(o) if o.status.success() => {
+                                let _ = op_tx.send((Some("APK installed".into()), Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()))).await;
+                            }
+                            Ok(o) => {
+                                let msg = String::from_utf8_lossy(&o.stderr);
+                                let _ = op_tx.send((None, Err(format!("adb install failed: {}", msg.trim())))).await;
+                            }
+                            Err(e) => {
+                                let _ = op_tx.send((None, Err(format!("adb install: {e}")))).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = op_tx.send((None, Err(format!(
+                            "Installing an APK needs the FUSE mount to read the file locally: {e}"
+                        )))).await;
+                    }
+                }
+            });
+        }
+        BrowserEvent::OpenTerminal(path) => {
+            let cmd = if handles.browser.is_local_mode() {
+                format!("cd '{}' && exec $SHELL -l", path.display())
+            } else {
+                let device = match handles.selected_device.lock().clone() {
+                    Some(d) => d,
+                    None => return,
+                };
+                let path_str = path.to_string_lossy().to_string();
+                format!("adb -s {} shell 'cd {} && exec $SHELL -l'", device, path_str)
+            };
+            let _ = std::process::Command::new("gnome-terminal")
+                .args(["--", "bash", "-c", &format!("{}; exec bash", cmd)])
+                .spawn()
+                .or_else(|_| {
+                    std::process::Command::new("x-terminal-emulator")
+                        .args(["-e", &format!("bash -c \"{}; exec bash\"", cmd)])
+                        .spawn()
+                });
+        }
+    }
+}
+
+static MANAGER_PROXY: tokio::sync::OnceCell<adbshare_dbus_proxy::ManagerProxy<'static>> = tokio::sync::OnceCell::const_new();
+
+async fn get_manager() -> anyhow::Result<&'static adbshare_dbus_proxy::ManagerProxy<'static>> {
+    use zbus::{names::WellKnownName, Connection};
+    MANAGER_PROXY.get_or_try_init(|| async {
+        let conn = Connection::session().await?;
+        let proxy = adbshare_dbus_proxy::ManagerProxy::builder(&conn)
+            .destination(WellKnownName::try_from("org.adbshare.Manager")?)?
+            .build()
+            .await?;
+        Ok(proxy)
+    }).await
+}
+
+async fn list_devices() -> anyhow::Result<Vec<String>> {
+    let proxy = get_manager().await?;
+    Ok(proxy.list_devices().await?)
+}
+
+async fn device_info(serial: &str) -> anyhow::Result<String> {
+    let proxy = get_manager().await?;
+    Ok(proxy.device_info(serial).await?)
+}
+
+async fn pause_job(id: u64) -> anyhow::Result<bool> {
+    let proxy = get_manager().await?;
+    Ok(proxy.pause_job(id).await?)
+}
+
+async fn resume_job(id: u64) -> anyhow::Result<bool> {
+    let proxy = get_manager().await?;
+    Ok(proxy.resume_job(id).await?)
+}
+
+async fn cancel_job(id: u64) -> anyhow::Result<bool> {
+    let proxy = get_manager().await?;
+    Ok(proxy.cancel_job(id).await?)
+}
+
+async fn mkdir(device: &str, path: &str) -> anyhow::Result<()> {
+    let proxy = get_manager().await?;
+    Ok(proxy.mkdir(device, path).await?)
+}
+
+async fn rename(device: &str, src: &str, dst: &str) -> anyhow::Result<()> {
+    let proxy = get_manager().await?;
+    Ok(proxy.rename(device, src, dst).await?)
+}
+
+async fn delete(device: &str, path: &str) -> anyhow::Result<()> {
+    let proxy = get_manager().await?;
+    Ok(proxy.delete(device, path).await?)
+}
+
+async fn connect_wireless(address: &str) -> anyhow::Result<String> {
+    let proxy = get_manager().await?;
+    Ok(proxy.connect_wireless(address).await?)
+}
+
+async fn mountpoint_for(device: &str) -> anyhow::Result<String> {
+    let proxy = get_manager().await?;
+    Ok(proxy.mountpoint_for(device).await?)
+}
+
+fn show_error_dialog(window: &adw::ApplicationWindow, title: &str, msg: &str) {
+    let dialog = adw::MessageDialog::builder()
+        .heading(title)
+        .body(msg)
+        .modal(true)
+        .build();
+    dialog.add_response("ok", "OK");
+    dialog.set_transient_for(Some(window));
+    dialog.present();
+}
+
+/// "Connect ADB via IP" dialog: pair first (adb pair), then connect to the
+/// device's adbd over TCP. The result is surfaced via `op_tx`.
+fn show_connect_dialog(
+    window: &adw::ApplicationWindow,
+    op_tx: async_channel::Sender<(Option<String>, Result<String, String>)>,
+    rt: tokio::runtime::Handle,
+) {
+    let dialog = gtk4::Dialog::builder()
+        .title("Connect ADB via IP")
+        .transient_for(window)
+        .modal(true)
+        .build();
+
+    let content = dialog.content_area();
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_spacing(8);
+
+    let hint = gtk4::Label::builder()
+        .label("Pair first (adb pair <phone-ip>:<pair-port>), then connect:")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    hint.add_css_class("dim-label");
+    content.append(&hint);
+
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("192.168.1.20:5555"));
+    content.append(&entry);
+
+    dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
+    let connect_btn = dialog.add_button("Connect", gtk4::ResponseType::Ok);
+    connect_btn.add_css_class("suggested-action");
+
+    let op_tx = op_tx.clone();
+    dialog.connect_response(move |d, resp| {
+        if resp == gtk4::ResponseType::Ok {
+            let addr = entry.text().trim().to_string();
+            if addr.is_empty() { return; }
+            let op_tx = op_tx.clone();
+            rt.spawn(async move {
+                let res = connect_wireless(&addr)
+                    .await
+                    .map(|out| out.trim().to_string())
+                    .map_err(|e| format!("adb connect {addr}: {e}"));
+                let _ = op_tx.send((Some("ADB wireless connect".into()), res)).await;
+            });
+        }
+        d.close();
+    });
+
+    dialog.present();
+}
+
+async fn list_dir(device: &str, path: &str) -> anyhow::Result<Vec<FsDirEntry>> {
+    let proxy = get_manager().await?;
+    let json = proxy.list_dir(device, path).await?;
+    let entries: Vec<DirEntryDto> = serde_json::from_str(&json)?;
+    Ok(entries.into_iter().map(FsDirEntry::from).collect())
+}
+
+async fn enqueue_push(device: &str, local: &str, device_path: &str) -> anyhow::Result<u64> {
+    let proxy = get_manager().await?;
+    Ok(proxy.enqueue_push(device, local, device_path).await?)
+}
+
+async fn enqueue_pull(device: &str, device_path: &str, local: &str) -> anyhow::Result<u64> {
+    let proxy = get_manager().await?;
+    Ok(proxy.enqueue_pull(device, device_path, local).await?)
+}
+
+async fn list_jobs() -> anyhow::Result<Vec<JobInfo>> {
+    let proxy = get_manager().await?;
+    let json = proxy.list_jobs().await?;
+    let jobs: Vec<JobDto> = serde_json::from_str(&json)?;
+    Ok(jobs.into_iter().map(JobInfo::from).collect())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DirEntryDto {
+    name: String,
+    is_dir: bool,
+    is_symlink: bool,
+    size: u64,
+    mode: u32,
+    mtime: i64,
+}
+
+impl From<DirEntryDto> for FsDirEntry {
+    fn from(d: DirEntryDto) -> Self {
+        FsDirEntry {
+            name: d.name,
+            is_dir: d.is_dir,
+            is_symlink: d.is_symlink,
+            size: d.size,
+            mode: d.mode,
+            mtime: d.mtime,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JobDto {
+    id: u64,
+    direction: String,
+    source: String,
+    destination: String,
+    state: String,
+    bytes_done: u64,
+    bytes_total: u64,
+    #[serde(default)]
+    speed_bps: u64,
+    #[serde(default)]
+    eta_secs: u64,
+}
+
+impl From<JobDto> for JobInfo {
+    fn from(j: JobDto) -> Self {
+        let name = std::path::Path::new(&j.source)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&j.source)
+            .to_string();
+        JobInfo {
+            id: j.id,
+            direction: j.direction,
+            name,
+            state: j.state,
+            bytes_done: j.bytes_done,
+            bytes_total: j.bytes_total,
+            speed_bps: j.speed_bps,
+            eta_secs: j.eta_secs,
+        }
+    }
+}

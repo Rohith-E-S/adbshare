@@ -1,0 +1,29 @@
+[package]
+name = "adb-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Background service: manages mounts, exposes D-Bus IPC to the GUI"
+
+[[bin]]
+name = "adb-daemon"
+path = "src/main.rs"
+
+[dependencies]
+adb-device = { path = "../adb-device" }
+adb-proxy = { path = "../adb-proxy" }
+adbfs = { path = "../adbfs" }
+transfer-engine = { path = "../transfer-engine" }
+tokio.workspace = true
+zbus.workspace = true
+zbus_macros.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+dirs.workspace = true
