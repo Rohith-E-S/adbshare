@@ -37,6 +37,7 @@ trait Manager {
     async fn delete(&self, device: &str, path: &str) -> zbus::Result<()>;
     async fn connect_wireless(&self, address: &str) -> zbus::Result<String>;
     async fn mountpoint_for(&self, device: &str) -> zbus::Result<String>;
+    async fn install_apk(&self, device: &str, path: &str) -> zbus::Result<String>;
 }
 
 mod adbshare_dbus_proxy {
@@ -54,6 +55,23 @@ struct UiHandles {
     active_jobs: parking_lot::Mutex<Vec<u64>>,
     /// Whether the banner pause button currently means "resume".
     transfers_paused: parking_lot::Mutex<bool>,
+    /// Ctrl+C snapshot: (from-local?, source dir, entry names). Paste (Ctrl+V)
+    /// resolves it into push/pull/local-copy via the existing transfer paths.
+    clipboard: parking_lot::Mutex<Option<ClipboardFiles>>,
+}
+
+/// In-app copy snapshot for Ctrl+C / Ctrl+V between the local and phone views.
+#[derive(Debug, Clone)]
+struct ClipboardFiles {
+    /// True when the snapshot came from the local view; false = from a device.
+    from_local: bool,
+    /// Device serial when `from_local` is false.
+    device: Option<String>,
+    /// Directory that was browsed when copied (local FS path or /sdcard/...).
+    from_dir: PathBuf,
+    /// Copied entries (files only; dirs are skipped — daemon push/pull is
+    /// file-based).
+    entries: Vec<FsDirEntry>,
 }
 
 /// Sidebar geometry: the divider defaults to this and can be dragged down to
@@ -424,6 +442,7 @@ impl AdbshareApp {
                 devices: parking_lot::Mutex::new(Vec::new()),
                 active_jobs: parking_lot::Mutex::new(Vec::new()),
                 transfers_paused: parking_lot::Mutex::new(false),
+                clipboard: parking_lot::Mutex::new(None),
             });
 
             // Dock controls reuse the banner's Pause/Cancel event flow;
@@ -547,17 +566,43 @@ impl AdbshareApp {
                 }
             });
 
-            // --- Drain device list -> sidebar ---
+            // --- Drain device list -> sidebar + notifications ---
             let dev_list_drain = device_list.clone();
             let handles_dev_drain = handles.clone();
             let dir_tx_dev_drain = dir_tx.clone();
             let info_tx_dev_drain = info_tx.clone();
             let mp_tx_dev_drain = mp_tx.clone();
             let rt_dev_drain = rt_handle.clone();
+            let app_notify = app.clone();
+            // ponytail: previous serials live in this drain; global store
+            // only if second consumer needs them.
             glib::spawn_future_local(async move {
+                let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut first_poll = true;
                 while let Ok(result) = devices_rx.recv().await {
                     match result {
                         Ok(devices) => {
+                            // Diff before overwrite: added/removed drive notifications.
+                            let current: std::collections::HashSet<String> =
+                                devices.iter().map(|d| d.serial.clone()).collect();
+                            if !first_poll {
+                                for serial in current.difference(&known) {
+                                    let name = devices.iter().find(|d| &d.serial == serial)
+                                        .map(|d| d.display_name().to_string())
+                                        .unwrap_or_else(|| serial.clone());
+                                    let note = gtk4::gio::Notification::new(&format!("{} connected", name));
+                                    note.set_body(Some("Tap to browse files"));
+                                    app_notify.send_notification(Some(&format!("device-{}", serial)), &note);
+                                }
+                                for serial in known.difference(&current) {
+                                    app_notify.withdraw_notification(&format!("device-{}", serial));
+                                    let note = gtk4::gio::Notification::new("Device disconnected");
+                                    note.set_body(Some(serial.as_str()));
+                                    app_notify.send_notification(Some(&format!("device-gone-{}", serial)), &note);
+                                }
+                            }
+                            known = current;
+                            first_poll = false;
                             *handles_dev_drain.devices.lock() = devices.clone();
                             let selected = handles_dev_drain.selected_device.lock().clone();
                             dev_list_drain.set_devices(&devices, selected.as_deref());
@@ -952,6 +997,261 @@ fn list_local_dir(path: &std::path::Path) -> Result<Vec<FsDirEntry>, String> {
 /// Sentinel "serial" for local-filesystem listings on the dir channel.
 const LOCAL_DEVICE: &str = "__local__";
 
+/// Ctrl+V: resolve the in-app copy snapshot into the existing transfer paths
+/// (local copy / device rename / push / pull). When the snapshot is empty,
+/// fall back to the GDK clipboard text (paths copied from another app).
+fn paste_clipboard(
+    handles: &std::rc::Rc<UiHandles>,
+    rt: &tokio::runtime::Handle,
+    dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+    op_tx: &async_channel::Sender<(Option<String>, Result<String, String>)>,
+) {
+    fn refresh_after(
+        dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+        rt: &tokio::runtime::Handle,
+        path: PathBuf,
+    ) {
+        let dir_tx = dir_tx.clone();
+        rt.spawn_blocking(move || {
+            let res = list_local_dir(&path);
+            let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), path, res));
+        });
+    }
+    let Some(snap) = handles.clipboard.lock().clone() else {
+        paste_gdk_text(handles, rt, dir_tx, op_tx);
+        return;
+    };
+    let target_dir = handles.browser.current_path();
+    let to_local = handles.browser.is_local_mode();
+    match (snap.from_local, to_local) {
+        (true, true) => {
+            let from = snap.from_dir.clone();
+            let files = snap.entries.clone();
+            let op_tx = op_tx.clone();
+            let dir_tx = dir_tx.clone();
+            let rt2 = rt.clone();
+            rt.spawn_blocking(move || {
+                for e in &files {
+                    let src = from.join(&e.name);
+                    let dst = target_dir.join(&e.name);
+                    if src == dst {
+                        continue;
+                    }
+                    if let Err(err) = std::fs::copy(&src, &dst) {
+                        let _ = op_tx.try_send((None, Err(format!("paste: {err}"))));
+                    }
+                }
+                refresh_after(&dir_tx, &rt2, snap.from_dir.clone());
+            });
+        }
+        (false, false) => {
+            let Some(device) = handles.selected_device.lock().clone() else {
+                let _ = op_tx.try_send((
+                    None,
+                    Err("No device connected — connect a device to paste.".into()),
+                ));
+                return;
+            };
+            if snap.device.as_deref() != Some(device.as_str()) {
+                let _ = op_tx.try_send((
+                    None,
+                    Err("Pasting between two phones is not supported yet.".into()),
+                ));
+                return;
+            }
+            let from = snap.from_dir.clone();
+            let files = snap.entries.clone();
+            let dir_tx = dir_tx.clone();
+            let op_tx = op_tx.clone();
+            rt.clone().spawn(async move {
+                for e in &files {
+                    let src = from.join(&e.name);
+                    let dst = target_dir.join(&e.name);
+                    if src == dst {
+                        continue;
+                    }
+                    if let Err(err) =
+                        rename(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
+                    {
+                        let _ = op_tx.try_send((None, Err(format!("paste: {err}"))));
+                    }
+                }
+                let res =
+                    list_dir(&device, &from.to_string_lossy()).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device, from, res)).await;
+            });
+        }
+        (true, false) => {
+            let Some(device) = handles.selected_device.lock().clone() else {
+                let _ = op_tx.try_send((
+                    None,
+                    Err("No device connected — connect a device to paste.".into()),
+                ));
+                return;
+            };
+            let from = snap.from_dir.clone();
+            let files: Vec<PathBuf> =
+                snap.entries.iter().map(|e| snap.from_dir.join(&e.name)).collect();
+            let dir_tx = dir_tx.clone();
+            let op_tx = op_tx.clone();
+            rt.clone().spawn(async move {
+                for src in &files {
+                    let Some(name) = src.file_name().and_then(|n| n.to_str()) else { continue };
+                    let dst = target_dir.join(name);
+                    if let Err(e) =
+                        enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
+                    {
+                        let _ = op_tx.try_send((None, Err(format!("push: {e}"))));
+                    }
+                }
+                let res =
+                    list_dir(&device, &from.to_string_lossy()).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device, from, res)).await;
+            });
+        }
+        (false, true) => {
+            let Some(device) = snap.device.clone() else { return };
+            let target_dir = handles.browser.current_path();
+            let dir_tx = dir_tx.clone();
+            let op_tx = op_tx.clone();
+            rt.clone().spawn(async move {
+                for e in &snap.entries {
+                    let src = snap.from_dir.join(&e.name).to_string_lossy().to_string();
+                    let local = target_dir.join(&e.name).to_string_lossy().to_string();
+                    if let Err(err) = enqueue_pull(&device, &src, &local).await {
+                        let _ = op_tx.try_send((None, Err(format!("pull: {err}"))));
+                    }
+                }
+                let res =
+                    list_dir(&device, &snap.from_dir.to_string_lossy()).await.map_err(|e| e.to_string());
+                let _ = dir_tx.send((device, snap.from_dir.clone(), res)).await;
+            });
+        }
+    }
+}
+
+/// Paste paths copied from another app (GDK clipboard text / file URIs).
+/// Local paths pasted onto the phone push via `enqueue_push`; pasted while
+/// browsing local files they copy with `std::fs::copy`.
+fn paste_gdk_text(
+    handles: &std::rc::Rc<UiHandles>,
+    rt: &tokio::runtime::Handle,
+    dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+    op_tx: &async_channel::Sender<(Option<String>, Result<String, String>)>,
+) {
+    let Some(display) = gdk4::Display::default() else { return };
+    let clipboard = display.clipboard();
+    let handles = std::rc::Rc::clone(handles);
+    let dir_tx = dir_tx.clone();
+    let op_tx = op_tx.clone();
+    let rt = rt.clone();
+    glib::spawn_future_local(async move {
+        let text = match clipboard.read_text_future().await {
+            Ok(Some(t)) => t.to_string(),
+            Ok(None) | Err(_) => return,
+        };
+        let paths: Vec<PathBuf> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .filter_map(|l| {
+                let l = l.strip_prefix("file://").unwrap_or(l);
+                let decoded = url_decode(l);
+                let p = PathBuf::from(decoded);
+                if p.is_absolute() { Some(p) } else { None }
+            })
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        paste_external_paths(&handles, &rt, &dir_tx, &op_tx, paths);
+    });
+}
+
+/// Paste local paths from an external app into the browsed directory.
+fn paste_external_paths(
+    handles: &std::rc::Rc<UiHandles>,
+    rt: &tokio::runtime::Handle,
+    dir_tx: &async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+    op_tx: &async_channel::Sender<(Option<String>, Result<String, String>)>,
+    paths: Vec<PathBuf>,
+) {
+    let target_dir = handles.browser.current_path();
+    if handles.browser.is_local_mode() {
+        let op_tx = op_tx.clone();
+        let dir_tx = dir_tx.clone();
+        let rt2 = rt.clone();
+        rt.spawn_blocking(move || {
+            for src in &paths {
+                let Some(name) = src.file_name() else { continue };
+                let dst = target_dir.join(name);
+                if src == &dst {
+                    continue;
+                }
+                if let Err(e) = std::fs::copy(src, &dst) {
+                    let _ = op_tx.try_send((None, Err(format!("paste: {e}"))));
+                }
+            }
+            let dir_tx = dir_tx.clone();
+            rt2.spawn_blocking(move || {
+                let res = list_local_dir(&target_dir);
+                let _ = dir_tx.try_send((LOCAL_DEVICE.to_string(), target_dir, res));
+            });
+        });
+        return;
+    }
+    let Some(device) = handles.selected_device.lock().clone() else {
+        let _ = op_tx.try_send((
+            None,
+            Err("No device connected — connect a device to paste.".into()),
+        ));
+        return;
+    };
+    let dir_tx = dir_tx.clone();
+    let op_tx = op_tx.clone();
+    rt.clone().spawn(async move {
+        for src in &paths {
+            let Some(name) = src.file_name().and_then(|n| n.to_str()) else { continue };
+            let dst = target_dir.join(name);
+            if let Err(e) =
+                enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
+            {
+                let _ = op_tx.try_send((None, Err(format!("push: {e}"))));
+            }
+        }
+        let res = list_dir(&device, &target_dir.to_string_lossy()).await.map_err(|e| e.to_string());
+        let _ = dir_tx.send((device, target_dir, res)).await;
+    });
+}
+
+/// Percent-decode a `file://` URI path (UTF-8, lossy; `+` stays literal).
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn handle_browser_event(
     ev: BrowserEvent,
     handles: &std::rc::Rc<UiHandles>,
@@ -1038,6 +1338,35 @@ fn handle_browser_event(
                 let res = list_dir(&device, &from_dir.to_string_lossy()).await.map_err(|e| e.to_string());
                 let _ = dir_tx.send((device, from_dir, res)).await;
             });
+        }
+        BrowserEvent::CopyFiles(entries) => {
+            let from_local = handles.browser.is_local_mode();
+            let from_dir = handles.browser.current_path();
+            let files: Vec<FsDirEntry> =
+                entries.into_iter().filter(|e| !e.is_dir).collect();
+            if files.is_empty() {
+                return;
+            }
+            let device = handles.selected_device.lock().clone();
+            // GDK mirror: plain paths as text so other apps see the copy too;
+            // the in-app snapshot below is what Ctrl+V resolves into transfers.
+            if let Some(display) = gdk4::Display::default() {
+                let text = files
+                    .iter()
+                    .map(|e| from_dir.join(&e.name).to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                display.clipboard().set_text(&text);
+            }
+            *handles.clipboard.lock() = Some(ClipboardFiles {
+                from_local,
+                device,
+                from_dir,
+                entries: files,
+            });
+        }
+        BrowserEvent::Paste => {
+            paste_clipboard(handles, &rt, dir_tx, op_tx);
         }
         BrowserEvent::PauseTransfer => {
             // Toggle: first click pauses every active job, next click resumes.
@@ -1482,62 +1811,41 @@ fn handle_browser_event(
         }
         BrowserEvent::InstallApk(entry) => {
             let curr = handles.browser.current_path();
-            if handles.browser.is_local_mode() {
-                // The APK is already local — install straight to a connected device.
-                let Some(device) = handles.selected_device.lock().clone() else {
-                    let _ = op_tx.try_send((None, Err("No device connected — connect a device to install the APK.".into())));
-                    return;
-                };
-                let mut apk = curr.clone();
-                apk.push(&entry.name);
-                let apk_str = apk.to_string_lossy().to_string();
-                let op_tx = op_tx.clone();
-                rt.spawn(async move {
-                    let out = tokio::process::Command::new("adb")
-                        .args(["-s", &device, "install", "-r", &apk_str])
-                        .output()
-                        .await;
-                    let r = match out {
-                        Ok(o) if o.status.success() => Ok("APK installed".to_string()),
-                        Ok(o) => Err(format!("adb install failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
-                        Err(e) => Err(format!("adb install: {e}")),
-                    };
-                    let _ = op_tx.try_send((Some("Install APK".into()), r));
-                });
+            let fuse = handles.browser.fuse_mount();
+            let local = handles.browser.is_local_mode();
+            let Some(device) = handles.selected_device.lock().clone() else {
+                let _ = op_tx.try_send((
+                    None,
+                    Err("No device connected — connect a device to install the APK.".into()),
+                ));
                 return;
-            }
-            let Some(device) = handles.selected_device.lock().clone() else { return };
-            let mut target = handles.browser.current_path();
+            };
+            let mut target = curr.clone();
             target.push(&entry.name);
-            let target_str = target.to_string_lossy().to_string();
-            let op_tx = op_tx.clone();
-            rt.spawn(async move {
-                match mountpoint_for(&device).await {
-                    Ok(mp) => {
-                        let apk_local = format!("{}{}", mp.trim_end_matches('/'), target.display());
-                        let out = tokio::process::Command::new("adb")
-                            .args(["-s", &device, "install", "-r", &apk_local])
-                            .output()
-                            .await;
-                        match out {
-                            Ok(o) if o.status.success() => {
-                                let _ = op_tx.send((Some("APK installed".into()), Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()))).await;
-                            }
-                            Ok(o) => {
-                                let msg = String::from_utf8_lossy(&o.stderr);
-                                let _ = op_tx.send((None, Err(format!("adb install failed: {}", msg.trim())))).await;
-                            }
-                            Err(e) => {
-                                let _ = op_tx.send((None, Err(format!("adb install: {e}")))).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = op_tx.send((None, Err(format!(
-                            "Installing an APK needs the FUSE mount to read the file locally: {e}"
-                        )))).await;
+            // Daemon runs `adb -s SERIAL install -r <host-local path>`; when
+            // browsing the device the host-local path is the FUSE mount.
+            let apk_local = if local {
+                target.to_string_lossy().to_string()
+            } else {
+                match fuse {
+                    Some(mp) => format!("{}{}", mp.trim_end_matches('/'), target.display()),
+                    None => {
+                        let _ = op_tx.try_send((
+                            None,
+                            Err("Installing an APK needs the FUSE mount to read the file locally.".into()),
+                        ));
+                        return;
                     }
                 }
+            };
+            let op_tx = op_tx.clone();
+            rt.spawn(async move {
+                let r = install_apk(&device, &apk_local)
+                    .await
+                    .map(|_| "APK installed".to_string())
+                    .map_err(|e| e.to_string());
+                let title = if r.is_ok() { Some("APK installed".into()) } else { Some("Install APK".into()) };
+                let _ = op_tx.send((title, r)).await;
             });
         }
         BrowserEvent::OpenTerminal(path) => {
@@ -1680,6 +1988,11 @@ async fn mountpoint_for(device: &str) -> anyhow::Result<String> {
     Ok(proxy.mountpoint_for(device).await?)
 }
 
+async fn install_apk(device: &str, path: &str) -> anyhow::Result<String> {
+    let proxy = get_manager().await?;
+    Ok(proxy.install_apk(device, path).await?)
+}
+
 fn show_error_dialog(window: &adw::ApplicationWindow, title: &str, msg: &str) {
     let dialog = adw::MessageDialog::builder()
         .heading(title)
@@ -1722,6 +2035,59 @@ fn show_connect_dialog(
     let entry = gtk4::Entry::new();
     entry.set_placeholder_text(Some("192.168.1.20:5555"));
     content.append(&entry);
+
+    // QR-pairing stub (no new deps): echo the typed host:port back as a
+    // large selectable label with a Copy button, so the user can copy it
+    // to the phone. Updates live as the entry changes.
+    let pairing_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let pairing_label = gtk4::Label::builder()
+        .label("192.168.1.20:5555")
+        .halign(gtk4::Align::Center)
+        .hexpand(true)
+        .selectable(true)
+        .wrap(true)
+        .build();
+    pairing_label.add_css_class("title-2");
+    pairing_label.add_css_class("monospace");
+    pairing_label.add_css_class("dim-label");
+    let copy_btn = gtk4::Button::with_label("Copy");
+    copy_btn.set_tooltip_text(Some("Copy address to clipboard"));
+    pairing_row.append(&pairing_label);
+    pairing_row.append(&copy_btn);
+    content.append(&pairing_row);
+
+    let pairing_for_entry = pairing_label.clone();
+    entry.connect_changed(move |e| {
+        let addr = e.text().trim().to_string();
+        if addr.is_empty() {
+            pairing_for_entry.set_label("192.168.1.20:5555");
+            pairing_for_entry.add_css_class("dim-label");
+        } else {
+            pairing_for_entry.set_label(&addr);
+            pairing_for_entry.remove_css_class("dim-label");
+        }
+    });
+
+    let entry_for_copy = entry.clone();
+    copy_btn.connect_clicked(move |_| {
+        let addr = entry_for_copy.text().trim().to_string();
+        let text = if addr.is_empty() {
+            "192.168.1.20:5555".to_string()
+        } else {
+            addr
+        };
+        if let Some(display) = gtk4::gdk::Display::default() {
+            display.clipboard().set_text(&text);
+        }
+    });
+
+    let camera_hint = gtk4::Label::builder()
+        .label("Open your phone camera / Wi-Fi pairing screen and type this address, or tap Copy.")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    camera_hint.add_css_class("dim-label");
+    content.append(&camera_hint);
 
     dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
     let connect_btn = dialog.add_button("Connect", gtk4::ResponseType::Ok);
