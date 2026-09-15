@@ -191,13 +191,14 @@ async fn main() -> anyhow::Result<()> {
     let mount_base_clone = mount_base.clone();
     let proxy_conns = cli.proxy_conns;
     let no_fuse = cli.no_fuse;
+    let queue_for_setup = queue.clone();
 
     tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
             match ev {
                 adb_device::watcher::WatchEvent::Added(id) => {
                     info!(?id, "device added");
-                    ensure_device_ready(&state_clone, &id, &mount_base_clone, no_fuse, proxy_conns)
+                    ensure_device_ready(&state_clone, &queue_for_setup, &id, &mount_base_clone, no_fuse, proxy_conns)
                         .await;
                 }
                 adb_device::watcher::WatchEvent::Removed(id) => {
@@ -221,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
                     // re-runs setup when the existing setup is actually broken
                     // (a healthy setup is just health-checked, so active
                     // transfers aren't killed by a re-add/Changed event).
-                    ensure_device_ready(&state_clone, &id, &mount_base_clone, no_fuse, proxy_conns)
+                    ensure_device_ready(&state_clone, &queue_for_setup, &id, &mount_base_clone, no_fuse, proxy_conns)
                         .await;
                 }
             }
@@ -330,6 +331,7 @@ async fn device_healthy(client: &ProxyClient) -> bool {
 /// thread; a complete device lifecycle rework is tracked separately.
 async fn ensure_device_ready(
     state: &Arc<Mutex<State>>,
+    queue: &Arc<JobQueue>,
     id: &DeviceId,
     mount_base: &std::path::Path,
     no_fuse: bool,
@@ -375,6 +377,12 @@ async fn ensure_device_ready(
                 },
             );
             info!(?id, "device ready");
+            // Replug: retry jobs that failed for this device while it was
+            // away (auto-requeue on reconnect).
+            let requeued = queue.retry_failed_for(id.as_str());
+            if requeued > 0 {
+                info!(?id, requeued, "requeued failed jobs after replug");
+            }
         }
         Err(e) => {
             error!(?id, ?e, "setup/mount");
@@ -905,6 +913,38 @@ impl ManagerInterface {
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
+    /// Storage insight: sizes of the immediate children of `path` on the
+    /// device plus filesystem totals (via the `DISKUSAGE`/`statvfs` proxy
+    /// op). Returns JSON `DuResult`; `entries` is the `(name, size)` array
+    /// (stat size per entry; directories report their entry size, not
+    /// recursive totals).
+    async fn du(&self, device: &str, path: &str) -> zbus::fdo::Result<String> {
+        let client = client_for(&self.state, device)?;
+        let usage = client.disk_usage(path).await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("du: {e}")))?;
+        let entries = match client.listdir(path).await {
+            Ok(list) => list
+                .into_iter()
+                .map(|e| DuEntry { name: e.name, size: e.stat.size })
+                .collect(),
+            Err(_) => {
+                // `path` may be a file: report it as a single entry.
+                let st = client.stat(path).await
+                    .map_err(|e| zbus::fdo::Error::Failed(format!("du: {e}")))?;
+                let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                vec![DuEntry { name, size: st.size }]
+            }
+        };
+        let out = DuResult {
+            path: path.to_string(),
+            avail_bytes: usage.avail_bytes,
+            total_bytes: usage.total_bytes,
+            entries,
+        };
+        serde_json::to_string(&out)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
     /// Enqueue a push (local file -> device). `local_path` is on the host;
     /// `device_path` is the absolute path on the phone. Returns the new
     /// job id.
@@ -944,6 +984,54 @@ impl ManagerInterface {
         Ok(self.queue.submit(job))
     }
 
+    /// Photo import (backend only; no GUI button yet). Lists `src_dirs`
+    /// (defaults to `/sdcard/DCIM/Camera` when empty), skips files already
+    /// present under `dest_base/YYYY-MM-DD/<name>` with the same size, and
+    /// enqueues `Pull` jobs for the rest. Returns a JSON
+    /// `transfer_engine::PhotoImportResult`.
+    async fn import_photos(
+        &self,
+        device: &str,
+        src_dirs: Vec<String>,
+        dest_base: &str,
+    ) -> zbus::fdo::Result<String> {
+        let dest = PathBuf::from(dest_base);
+        if !dest.is_absolute() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "dest_base must be an absolute path".into(),
+            ));
+        }
+        let client = client_for(&self.state, device)?;
+        let result = transfer_engine::import_photos(
+            &client,
+            &self.queue,
+            device,
+            &src_dirs,
+            &dest,
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(format!("import_photos: {e}")))?;
+        serde_json::to_string(&result)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
+    /// Mirror diff (no auto-sync): list `remote_path` on the device and
+    /// return a JSON array of `transfer_engine::MirrorEntry` (regular files
+    /// only) so the GUI can call `plan_mirror(local_dir, remote)` itself and
+    /// enqueue push/pull jobs via `enqueue_push`/`enqueue_pull`.
+    async fn mirror_diff(&self, device: &str, remote_path: &str) -> zbus::fdo::Result<String> {
+        let client = client_for(&self.state, device)?;
+        let entries = client.listdir(remote_path).await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("mirror_diff: {e}")))?;
+        let out: Vec<transfer_engine::MirrorEntry> = entries
+            .into_iter()
+            .filter(|e| !e.stat.mode.is_dir())
+            .map(|e| transfer_engine::MirrorEntry { name: e.name, size: e.stat.size })
+            .collect();
+        serde_json::to_string(&out)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
     /// Snapshot of every job currently tracked by the queue (JSON).
     async fn list_jobs(&self) -> zbus::fdo::Result<String> {
         let dtos: Vec<JobDto> = self.queue.jobs_snapshot().into_iter().map(JobDto::from).collect();
@@ -963,6 +1051,12 @@ impl ManagerInterface {
 
     async fn cancel_job(&self, id: u64) -> zbus::fdo::Result<bool> {
         Ok(self.queue.cancel_job(id))
+    }
+
+    /// Requeue every failed job as pending so the worker loop retries it.
+    /// Returns the number of jobs requeued.
+    async fn retry_failed(&self) -> zbus::fdo::Result<u64> {
+        Ok(self.queue.retry_failed())
     }
 
     // --- File operations on a device (via the on-device proxy) ---
@@ -1026,6 +1120,34 @@ impl ManagerInterface {
         }
         Ok(text)
     }
+
+    /// `adb -s SERIAL install -r path` with a 120s timeout. `path` is a
+    /// host-local APK file (local view path, or the FUSE-mounted path when
+    /// browsing the device). Returns combined adb output on success.
+    async fn install_apk(&self, device: &str, path: &str) -> zbus::fdo::Result<String> {
+        if device.is_empty() || path.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device and path are required".into()));
+        }
+        let out = tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new("adb")
+                .args(["-s", device, "install", "-r", path])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed(format!("adb install timed out after 120s")))?
+        .map_err(|e| zbus::fdo::Error::Failed(format!("adb install: {e}")))?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        if !out.status.success() {
+            return Err(zbus::fdo::Error::Failed(text));
+        }
+        Ok(text)
+    }
 }
 
 #[allow(dead_code)]
@@ -1059,6 +1181,20 @@ impl From<DirEntry> for DirEntryDto {
             mtime: e.stat.mtime,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DuEntry {
+    name: String,
+    size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DuResult {
+    path: String,
+    avail_bytes: u64,
+    total_bytes: u64,
+    entries: Vec<DuEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
