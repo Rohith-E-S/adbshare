@@ -23,12 +23,16 @@
 #![warn(missing_debug_implementations)]
 
 pub mod job;
+pub mod mirror;
+pub mod photo_import;
 pub mod progress;
 pub mod queue;
 pub mod verify;
 pub mod worker;
 
 pub use job::{Direction, Job, JobId, JobOptions, JobState};
+pub use mirror::{plan_mirror, MirrorEntry};
+pub use photo_import::{import_photos, PhotoImportResult, DEFAULT_PHOTO_SRC_DIRS};
 pub use progress::{ProgressSnapshot, SpeedSample};
 pub use queue::JobQueue;
 pub use verify::verify_checksum;
