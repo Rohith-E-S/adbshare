@@ -1,0 +1,249 @@
+name: Release
+
+# Autobuild: every push to main (each merged PR / code change) builds
+# release binaries and publishes a GitHub Release with a new version.
+# Doc-only changes are skipped. Manual runs via workflow_dispatch.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+
+# `contents: write` is required to create tags + GitHub Releases.
+permissions:
+  contents: write
+
+# Never cancel a release once it starts: every merged commit must produce
+# exactly one Release, in order. Concurrent pushes queue up.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1. Build Linux host binaries (adb-gui, adb-daemon, host proxy)
+  # ---------------------------------------------------------------
+  build-linux:
+    runs-on: ubuntu-latest
+    # Same reasoning as CI: the workspace needs GTK >= 4.17 /
+    # libadwaita >= 1.7, which ubuntu-latest's apt cannot provide.
+    # Pinned Fedora major version so distro upgrades are deliberate.
+    container: fedora:44
+    timeout-minutes: 30
+    outputs:
+      base-version: ${{ steps.version.outputs.base-version }}
+      tag: ${{ steps.version.outputs.tag }}
+      deb-version: ${{ steps.version.outputs.deb-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc pkgconf-pkg-config \
+            gtk4-devel libadwaita-devel \
+            fuse3-devel libusbx-devel
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-build
+          cache-on-failure: true
+
+      # Version scheme: base comes from Cargo.toml [workspace.package]
+      # version; suffix makes every main-commit unique and monotonic:
+      #   tag:         v<base>-r<RUN>-g<SHORT_SHA> (e.g. v0.1.0-r42-gf4d6876)
+      #   deb-version: <base>-r<RUN>.g<SHORT_SHA> (Debian-compliant, no 'v')
+      - name: Resolve version
+        id: version
+        run: |
+          BASE_VER=$(sed -n 's/^version *= *\"\([^\"]*\)\"/\1/p' Cargo.toml | head -n1)
+          if [ -z "$BASE_VER" ]; then echo "ERROR: no version in Cargo.toml" >&2; exit 1; fi
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          TAG="v${BASE_VER}-r${GITHUB_RUN_NUMBER}-g${SHORT_SHA}"
+          DEB_VER="${BASE_VER}-r${GITHUB_RUN_NUMBER}.g${SHORT_SHA}"
+          echo "base-version=${BASE_VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "deb-version=${DEB_VER}" >> "$GITHUB_OUTPUT"
+          echo "Resolved BASE=${BASE_VER} TAG=${TAG} DEB=${DEB_VER}"
+
+      - name: Build (release)
+        run: cargo build --release --locked --bin adb-gui --bin adb-daemon --bin adbshare-proxy
+
+      - name: Smoke test binaries
+        # NOTE: adbshare-proxy takes a port number as $1 (no clap), so never
+        # run it with --help here — it would bind 127.0.0.1:31337 and hang
+        # the job. Just verify it exists and is an ELF binary.
+        run: |
+          ./target/release/adb-daemon --version
+          ./target/release/adb-gui --version
+          test -x ./target/release/adbshare-proxy
+          file ./target/release/adb-gui ./target/release/adb-daemon ./target/release/adbshare-proxy
+
+      - name: Stage release tree
+        run: |
+          rm -rf dist
+          mkdir -p dist/root/usr/bin dist/root/usr/libexec/adbshare \
+                   dist/root/usr/share/applications \
+                   dist/root/usr/share/icons/hicolor/scalable/apps \
+                   dist/root/usr/share/dbus-1/services \
+                   dist/root/usr/lib/systemd/user
+          install -Dm755 target/release/adb-gui dist/root/usr/bin/adb-gui
+          install -Dm755 target/release/adb-daemon dist/root/usr/bin/adb-daemon
+          install -Dm755 target/release/adbshare-proxy dist/root/usr/libexec/adbshare/adbshare-proxy
+          install -Dm644 packaging/org.adbshare.Gui.desktop dist/root/usr/share/applications/org.adbshare.Gui.desktop
+          install -Dm644 assets/org.adbshare.Gui.svg dist/root/usr/share/icons/hicolor/scalable/apps/org.adbshare.Gui.svg
+          install -Dm644 packaging/dbus/org.adbshare.Manager.service dist/root/usr/share/dbus-1/services/org.adbshare.Manager.service
+          install -Dm644 packaging/systemd/adbshare-daemon.service dist/root/usr/lib/systemd/user/adbshare-daemon.service
+          tar -czf "dist/adbshare-${{ steps.version.outputs.tag }}-x86_64-linux.tar.gz" -C dist/root .
+          (cd dist && sha256sum "adbshare-${{ steps.version.outputs.tag }}-x86_64-linux.tar.gz" > SHA256SUMS-linux.txt)
+          echo "${{ steps.version.outputs.tag }}" > dist/TAG
+          echo "${{ steps.version.outputs.deb-version }}" > dist/DEBVERSION
+          ls -la dist dist/root/usr/bin
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # 2. Cross-compile device-side proxy for Android (aarch64)
+  # ---------------------------------------------------------------
+  build-android-proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-android
+          cache-on-failure: true
+
+      - name: Install Android NDK
+        run: |
+          NDK_VERSION="r26d"
+          curl -sSLo /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q /tmp/ndk.zip -d /tmp
+          echo "ANDROID_NDK=/tmp/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+          ls /tmp/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/ | head -n 5
+
+      - name: Build adbshare-proxy (aarch64-linux-android)
+        run: |
+          export CC_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          export CXX_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          export AR_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          cargo build --release --locked --target aarch64-linux-android --bin adbshare-proxy
+          file target/aarch64-linux-android/release/adbshare-proxy
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/adbshare-proxy dist/adbshare-proxy-aarch64-android
+          (cd dist && sha256sum adbshare-proxy-aarch64-android > SHA256SUMS-android.txt)
+          ls -la dist
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-dist
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # 3. Assemble .deb + publish the GitHub Release
+  # ---------------------------------------------------------------
+  publish:
+    needs: [build-linux, build-android-proxy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-dist
+          path: linux-dist
+
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-dist
+          path: android-dist
+
+      - name: Build .deb package
+        run: |
+          set -euo pipefail
+          TAG=$(cat linux-dist/TAG)
+          DEB_VER=$(cat linux-dist/DEBVERSION)
+          PKGDIR="deb-pkg/adbshare_${DEB_VER}_amd64"
+          rm -rf deb-pkg release-assets
+          mkdir -p "$PKGDIR"
+          cp -a linux-dist/root/usr "$PKGDIR"/
+          mkdir -p "$PKGDIR/DEBIAN"
+          cat > "$PKGDIR/DEBIAN/control" <<EOF
+          Package: adbshare
+          Version: ${DEB_VER}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: adbshare contributors <noreply@example.com>
+          Depends: libgtk-4-1, libadwaita-1-0, libfuse3-3, libusb-1.0-0
+          Description: Fast, reliable Linux file manager for Android over ADB
+           Uses ADB over USB (or wireless) and exposes the device as a real
+           filesystem via FUSE, with a GTK4 frontend on top.
+          EOF
+          find "$PKGDIR" -type d -exec chmod 755 {} +
+          find "$PKGDIR" -type f -exec chmod 644 {} +
+          chmod 755 "$PKGDIR/usr/bin/adb-gui" "$PKGDIR/usr/bin/adb-daemon"
+          chmod 755 "$PKGDIR/usr/libexec/adbshare/adbshare-proxy"
+          dpkg-deb --build "$PKGDIR" "adbshare_${DEB_VER}_amd64.deb"
+          mkdir -p release-assets
+          mv "adbshare_${DEB_VER}_amd64.deb" release-assets/
+          cp linux-dist/*.tar.gz release-assets/
+          cp android-dist/adbshare-proxy-aarch64-android release-assets/
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "DEB_VER=${DEB_VER}" >> "$GITHUB_ENV"
+          ls -la release-assets && cat release-assets/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build-linux.outputs.tag }}
+          name: adbshare ${{ needs.build-linux.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release-assets/*
+          fail_on_unmatched_files: true
+          body: |
+            ## Install
+
+            - **Debian/Ubuntu (x86_64):** download the `.deb` below, then `sudo apt install ./adbshare_*.deb`
+            - **Any distro (x86_64):** extract the `-x86_64-linux.tar.gz` tarball — binaries live under `usr/bin/`
+            - **Android proxy:** `adbshare-proxy-aarch64-android` is pushed to the device automatically by `adb-daemon`
+
+            ## Verify
+
+            ```
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            Built from commit ${{ github.sha }} (run #${{ github.run_number }}).
+

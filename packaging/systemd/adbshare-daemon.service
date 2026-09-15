@@ -1,0 +1,13 @@
+[Unit]
+Description=adbshare daemon (Android file manager backend)
+Documentation=https://github.com/Rohith-E-S/adbshare
+After=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/adb-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
