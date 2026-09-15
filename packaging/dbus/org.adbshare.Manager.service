@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.adbshare.Manager
+Exec=/usr/bin/adb-daemon
+SystemdService=adbshare-daemon.service

@@ -20,15 +20,12 @@ package() {
     install -Dm755 target/release/adb-gui "$pkgdir/usr/bin/adb-gui"
     install -Dm755 target/release/adb-daemon "$pkgdir/usr/bin/adb-daemon"
     install -Dm755 target/release/adbshare-proxy "$pkgdir/usr/lib/adbshare/adbshare-proxy"
-    install -Dm644 packaging/flatpak/org.adbshare.Gui.json \
-        "$pkgdir/usr/share/adbshare/flatpak-manifest.json"
-    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/org.adbshare.Gui.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Name=adbshare
-Comment=File manager for Android devices over ADB
-Exec=adb-gui %F
-Icon=phone
-Categories=FileManager;Utility;
-EOF
+    install -Dm644 packaging/org.adbshare.Gui.desktop \
+        "$pkgdir/usr/share/applications/org.adbshare.Gui.desktop"
+    install -Dm644 assets/org.adbshare.Gui.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.adbshare.Gui.svg"
+    install -Dm644 packaging/dbus/org.adbshare.Manager.service \
+        "$pkgdir/usr/share/dbus-1/services/org.adbshare.Manager.service"
+    install -Dm644 packaging/systemd/adbshare-daemon.service \
+        "$pkgdir/usr/lib/systemd/user/adbshare-daemon.service"
 }

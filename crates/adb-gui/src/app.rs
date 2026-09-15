@@ -1568,6 +1568,11 @@ static MANAGER_PROXY: tokio::sync::OnceCell<adbshare_dbus_proxy::ManagerProxy<'s
 async fn get_manager() -> anyhow::Result<&'static adbshare_dbus_proxy::ManagerProxy<'static>> {
     use zbus::{names::WellKnownName, Connection};
     MANAGER_PROXY.get_or_try_init(|| async {
+        // ponytail: spawn fallback if D-Bus activation unavailable (no .service
+        // installed, e.g. running from cargo). D-Bus activation is the primary
+        // path via org.adbshare.Manager.service + systemd --user; upgrade to
+        // removing this when packaged installs are the only supported path.
+        ensure_daemon_running().await;
         let conn = Connection::session().await?;
         let proxy = adbshare_dbus_proxy::ManagerProxy::builder(&conn)
             .destination(WellKnownName::try_from("org.adbshare.Manager")?)?
@@ -1575,6 +1580,54 @@ async fn get_manager() -> anyhow::Result<&'static adbshare_dbus_proxy::ManagerPr
             .await?;
         Ok(proxy)
     }).await
+}
+
+/// Best-effort daemon startup for environments without D-Bus activation
+/// (dev runs from `cargo`, missing package files). No-op if the name is
+/// already owned — the common case once the .service + systemd unit ship.
+async fn ensure_daemon_running() {
+    use std::process::Stdio;
+    use zbus::{names::WellKnownName, Connection};
+
+    // Fast path: daemon already owns the bus name.
+    if let Ok(conn) = Connection::session().await {
+        if let Ok(dbus) = zbus::fdo::DBusProxy::new(&conn).await {
+            let name = WellKnownName::try_from("org.adbshare.Manager").unwrap();
+            if dbus.name_has_owner(name.into()).await.unwrap_or(false) {
+                return;
+            }
+        }
+    }
+
+    let exe = match daemon_binary_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let _ = std::process::Command::new(exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    // Give the daemon a moment to claim the bus name before first call.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+}
+
+/// Locate `adb-daemon`: same dir as `adb-gui` first (dev + tarball),
+/// then PATH. None if neither resolves — caller silently skips spawn.
+fn daemon_binary_path() -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let next_to = dir.join("adb-daemon");
+            if next_to.is_file() {
+                return Some(next_to);
+            }
+        }
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join("adb-daemon"))
+            .find(|p| p.is_file())
+    })
 }
 
 async fn list_devices() -> anyhow::Result<Vec<String>> {
