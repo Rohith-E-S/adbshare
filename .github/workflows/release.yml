@@ -45,7 +45,7 @@ jobs:
       - name: Install system deps
         run: |
           dnf install -y --setopt=install_weak_deps=False \
-            gcc pkgconf-pkg-config \
+            gcc pkgconf-pkg-config file \
             gtk4-devel libadwaita-devel \
             fuse3-devel libusbx-devel
 
@@ -146,10 +146,18 @@ jobs:
           ls /tmp/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/ | head -n 5
 
       - name: Build adbshare-proxy (aarch64-linux-android)
+        env:
+          # ponytail: env block not exports — rustc reads LINKER var at
+          # startup; inline `export` in run body is too late for sccache
+          # wrappers and leaks nothing. Add rustflags only if NDK bump breaks.
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: aarch64-linux-android24-clang
+          CC_aarch64_linux_android: aarch64-linux-android24-clang
+          CXX_aarch64_linux_android: aarch64-linux-android24-clang++
+          AR_aarch64_linux_android: llvm-ar
         run: |
-          export CC_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-          export CXX_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
-          export AR_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          NDK_BIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$NDK_BIN/aarch64-linux-android24-clang" || { echo "NDK clang missing in $NDK_BIN" >&2; ls "$NDK_BIN"; exit 1; }
+          export PATH="$NDK_BIN:$PATH"
           cargo build --release --locked --target aarch64-linux-android --bin adbshare-proxy
           file target/aarch64-linux-android/release/adbshare-proxy
           mkdir -p dist
