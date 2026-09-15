@@ -166,6 +166,61 @@ impl JobQueue {
         }
         self.find(id).map(|j| j.cancel()).is_some()
     }
+
+    /// Requeue every `Failed` job as `Pending` so the dispatcher retries it.
+    /// Returns the number of jobs requeued.
+    pub fn retry_failed(&self) -> u64 {
+        let mut pending = self.pending.lock();
+        let mut completed = self.completed.lock();
+        let mut count: u64 = 0;
+        completed.retain(|job| {
+            if job.state() == JobState::Failed {
+                job.set_state(JobState::Pending);
+                pending.push_back(job.clone());
+                count += 1;
+                false
+            } else {
+                true
+            }
+        });
+        drop(pending);
+        drop(completed);
+        if count > 0 {
+            let _ = self.notify.send(());
+        }
+        count
+    }
+
+    /// Requeue every `Failed` job whose source/destination paths (or device tag)
+    /// contain `serial` as `Pending` so the dispatcher retries it after a
+    /// replug. Returns the number of jobs requeued.
+    pub fn retry_failed_for(&self, serial: &str) -> u64 {
+        if serial.is_empty() {
+            return 0;
+        }
+        let mut pending = self.pending.lock();
+        let mut completed = self.completed.lock();
+        let mut count: u64 = 0;
+        completed.retain(|job| {
+            let mine = job.device.as_deref().is_some_and(|d| d.contains(serial))
+                || job.source.to_string_lossy().contains(serial)
+                || job.destination.to_string_lossy().contains(serial);
+            if mine && job.state() == JobState::Failed {
+                job.set_state(JobState::Pending);
+                pending.push_back(job.clone());
+                count += 1;
+                false
+            } else {
+                true
+            }
+        });
+        drop(pending);
+        drop(completed);
+        if count > 0 {
+            let _ = self.notify.send(());
+        }
+        count
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

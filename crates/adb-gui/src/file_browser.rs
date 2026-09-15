@@ -304,6 +304,12 @@ pub enum BrowserEvent {
         target_dir: PathBuf,
         files: Vec<PathBuf>,
     },
+    /// Ctrl+C snapshot of the selection (app stores it + mirrors to the
+    /// GDK clipboard as text for interop).
+    CopyFiles(Vec<DirEntry>),
+    /// Ctrl+V into the directory being browsed (app resolves the snapshot
+    /// via the existing push/pull/copy paths).
+    Paste,
 }
 
 #[derive(Clone)]
@@ -973,6 +979,10 @@ impl FileBrowser {
     pub fn set_fuse_mount(&self, mountpoint: Option<&str>) {
         *self.fuse_mount.borrow_mut() = mountpoint.map(|s| s.trim_end_matches('/').to_string());
     }
+
+    /// FUSE-backed local path for image preview (same mapping as drag-out;
+    /// None when unmounted). No persistent cache yet.
+    fn fuse_preview_path(&self, name: &str) -> Option<PathBuf> { self.dnd_fs_path(name) }
 
     pub fn fuse_mount(&self) -> Option<String> { self.fuse_mount.borrow().clone() }
 
@@ -1695,6 +1705,8 @@ impl FileBrowser {
         let on_event_act = self.on_event.clone();
         let local_act = self.local_mode.clone();
         let curr_act = self.current_path.clone();
+        let browser_act = self.clone();
+        let list_for_preview = self.list_box.clone();
         self.list_box.connect_row_activated(move |_lb, row| {
             // Resolve the entry by the row's widget name (set in set_entries)
             // instead of the row index: the entries vec also holds dotfiles
@@ -1707,6 +1719,10 @@ impl FileBrowser {
                     if let Some(cb) = on_event_act.borrow().as_ref() {
                         cb(BrowserEvent::OpenDir(e.clone()));
                     }
+                } else if let Some(src) = preview_source_path(&browser_act, e) {
+                    // Image double-click: generic preview via existing
+                    // local/FUSE read path (temp copy, no cache yet).
+                    show_image_preview(&list_for_preview, e, &src);
                 } else if *local_act.borrow() {
                     // Local mode: open the file with its default application.
                     let mut p = curr_act.borrow().clone();
@@ -1737,6 +1753,8 @@ impl FileBrowser {
         let dl_btn_grid = self.download_button.clone();
         let local_grid = self.local_mode.clone();
         let curr_grid = self.current_path.clone();
+        let browser_grid = self.clone();
+        let grid_for_preview = self.grid_box.clone();
         self.grid_box.connect_child_activated(move |_fb, child| {
             // Name-based lookup (same reason as the list view): the card's
             // widget name is the entry name, while the child index drifts
@@ -1755,6 +1773,10 @@ impl FileBrowser {
                     if let Some(cb) = on_ev_sel_grid.borrow().as_ref() {
                         cb(BrowserEvent::OpenDir(entry));
                     }
+                } else if let Some(src) = preview_source_path(&browser_grid, &entry) {
+                    // Image double-click: generic preview via existing
+                    // local/FUSE read path (temp copy, no cache yet).
+                    show_image_preview(&grid_for_preview, &entry, &src);
                 } else {
                     dl_btn_grid.set_sensitive(true);
                     if *local_grid.borrow() {
@@ -2011,6 +2033,28 @@ impl FileBrowser {
                 glib::Propagation::Proceed
             }));
         }
+        // Ctrl+C — copy selection to the in-app clipboard (+ GDK text mirror);
+        // Ctrl+V — paste it here via the existing push/pull/local-copy paths.
+        {
+            let browser = self.clone();
+            let on_ev = self.on_event.clone();
+            add_shortcut("<Control>c", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
+                let files: Vec<DirEntry> =
+                    browser.selected_entries().into_iter().filter(|e| !e.is_dir).collect();
+                if !files.is_empty() { emit_ev(&on_ev, BrowserEvent::CopyFiles(files)); }
+                glib::Propagation::Proceed
+            }));
+        }
+        {
+            let browser = self.clone();
+            let on_ev = self.on_event.clone();
+            add_shortcut("<Control>v", gtk4::CallbackAction::new(move |_, _| {
+                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
+                emit_ev(&on_ev, BrowserEvent::Paste);
+                glib::Propagation::Proceed
+            }));
+        }
         {
             let root_push = self.root.clone();
             let on_ev = self.on_event.clone();
@@ -2139,6 +2183,64 @@ fn create_menu_button(
 
     btn.set_child(Some(&hbox));
     (btn, hbox)
+}
+
+/// Image extensions that get a generic preview dialog on double-click.
+fn is_previewable_image(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".svg")
+}
+
+/// Resolve a browsed entry to a local filesystem path without new I/O:
+/// the real path in local mode, or the FUSE-mounted path in device mode
+/// (None when unmounted — no persistent cache yet).
+fn preview_source_path(browser: &FileBrowser, entry: &DirEntry) -> Option<PathBuf> {
+    if !is_previewable_image(&entry.name) || entry.is_dir {
+        return None;
+    }
+    if browser.is_local_mode() {
+        let mut p = browser.current_path();
+        p.push(&entry.name);
+        Some(p)
+    } else {
+        browser.fuse_preview_path(&entry.name)
+    }
+}
+
+/// Generic image preview: copies the source to a temp file (so the FUSE
+/// file can vanish under us) and shows it in a `gtk4::Image` inside an
+/// `adw::MessageDialog`. No persistent cache yet (task_0003 minimal).
+fn show_image_preview(parent: &impl IsA<gtk4::Widget>, entry: &DirEntry, src: &PathBuf) {
+    let window = parent.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let tmp = std::env::temp_dir().join(format!("adbshare-preview-{}", entry.name));
+    // Best effort: fall back to reading the source directly when the copy fails.
+    let shown: PathBuf = match std::fs::copy(src, &tmp) {
+        Ok(_) => tmp,
+        Err(_) => src.clone(),
+    };
+    let dialog = adw::MessageDialog::builder()
+        .heading(&entry.name)
+        .body(&format!("{} • {}", entry.display_size(), entry.display_date()))
+        .transient_for(window.as_ref().unwrap())
+        .modal(true)
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
+    let picture = gtk4::Image::from_file(&shown);
+    picture.set_pixel_size(384);
+    picture.set_halign(gtk4::Align::Center);
+    picture.set_margin_top(8);
+    picture.set_margin_bottom(8);
+    // MessageDialog has no content area; the extra child shows below the body.
+    dialog.set_extra_child(Some(&picture));
+    dialog.present();
 }
 
 /// Shows a Nautilus-style right click context menu matching the stitch mockup.
@@ -2283,22 +2385,31 @@ fn show_context_menu(
 
     menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-    let (copy_btn, _) = create_menu_button("edit-copy-symbolic", "Copy path", Some("Ctrl+C"), false, false);
+    let (copy_btn, _) = create_menu_button("edit-copy-symbolic", "Copy", Some("Ctrl+C"), false, false);
     {
-        let paths = selected
-            .iter()
-            .map(|e| curr_path.join(&e.name).to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let sel = selected.to_vec();
+        let on_ev = on_event.clone();
         let p = popover.clone();
         copy_btn.connect_clicked(move |_| {
             p.popdown();
-            if let Some(display) = gdk4::Display::default() {
-                display.clipboard().set_text(&paths);
+            let files: Vec<DirEntry> = sel.iter().filter(|e| !e.is_dir).cloned().collect();
+            if !files.is_empty() {
+                emit(&on_ev, BrowserEvent::CopyFiles(files));
             }
         });
     }
     menu_box.append(&copy_btn);
+
+    let (paste_btn, _) = create_menu_button("edit-paste-symbolic", "Paste", Some("Ctrl+V"), false, false);
+    {
+        let on_ev = on_event.clone();
+        let p = popover.clone();
+        paste_btn.connect_clicked(move |_| {
+            p.popdown();
+            emit(&on_ev, BrowserEvent::Paste);
+        });
+    }
+    menu_box.append(&paste_btn);
 
     // 8. Move to Trash / 9. Delete Permanently — the whole selection.
     let (trash_btn, _) = create_menu_button("user-trash-symbolic", "Move to Trash", Some("Delete"), false, false);

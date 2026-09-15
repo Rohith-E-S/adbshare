@@ -21,7 +21,7 @@ pub mod ops;
 #[cfg(test)]
 mod tests;
 
-pub use client::{ProxyClient, ProxyError, ProxyFile};
+pub use client::{DiskUsage, ProxyClient, ProxyError, ProxyFile};
 pub use ops::{FileMode, OpenFlags, Stat, Status};
 
 /// The user-friendly name of the proxy binary on the device.
