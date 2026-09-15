@@ -489,6 +489,54 @@ impl ProxyClient {
         self.release(conn);
         res
     }
+
+    /// Filesystem usage for the mount containing `path` (op `DiskUsage` /
+    /// `statvfs` on the device). Returns available + total bytes.
+    pub async fn disk_usage(&self, path: &str) -> Result<DiskUsage> {
+        let (conn, _permit) = self.acquire().await?;
+        let res = async {
+            let mut args = Vec::new();
+            args.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            args.extend_from_slice(path.as_bytes());
+            let resp = conn.request(Op::DiskUsage, &args).await?;
+            DiskUsage::decode(&resp)
+        }.await;
+        self.release(conn);
+        res
+    }
+}
+
+/// Filesystem usage in bytes (from the device `statvfs` handler).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskUsage {
+    pub avail_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl DiskUsage {
+    /// Decode the `DiskUsage` response body: `[avail_blocks][blocks][bsize]`
+    /// as u64 LE (64-bit device) or u32 LE (32-bit device).
+    fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() >= 24 {
+            let avail = u64::from_le_bytes(data[0..8].try_into().unwrap());
+            let total = u64::from_le_bytes(data[8..16].try_into().unwrap());
+            let bsize = u64::from_le_bytes(data[16..24].try_into().unwrap());
+            Ok(Self {
+                avail_bytes: avail.saturating_mul(bsize),
+                total_bytes: total.saturating_mul(bsize),
+            })
+        } else if data.len() >= 12 {
+            let avail = u32::from_le_bytes(data[0..4].try_into().unwrap()) as u64;
+            let total = u32::from_le_bytes(data[4..8].try_into().unwrap()) as u64;
+            let bsize = u32::from_le_bytes(data[8..12].try_into().unwrap()) as u64;
+            Ok(Self {
+                avail_bytes: avail.saturating_mul(bsize),
+                total_bytes: total.saturating_mul(bsize),
+            })
+        } else {
+            Err(ProxyError::Invalid("diskusage decode".into()))
+        }
+    }
 }
 
 /// A handle to a file opened on the device.
