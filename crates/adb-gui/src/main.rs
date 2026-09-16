@@ -6,10 +6,11 @@
 //! - Content: per-device view — transfer queue, file browser, settings.
 //! - Header bar: refresh, about, settings.
 
+#![allow(deprecated)]
+
 mod app;
 mod device_list;
 mod file_browser;
-mod transfer_dock;
 mod transfer_view;
 
 use app::AdbshareApp;

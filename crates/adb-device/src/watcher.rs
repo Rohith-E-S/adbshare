@@ -101,7 +101,6 @@ impl DeviceWatcher {
 }
 
 use std::sync::Mutex;
-use std::sync::MutexGuard;
 
 // ---------- ADB-server watcher ----------
 

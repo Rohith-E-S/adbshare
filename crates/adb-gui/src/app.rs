@@ -13,7 +13,6 @@ use libadwaita::{prelude::*, *};
 use crate::device_list::{DeviceList, SidebarEvent};
 use crate::file_browser::ViewMode;
 use crate::file_browser::{BrowserEvent, DirEntry as FsDirEntry, FileBrowser};
-use crate::transfer_dock::TransferDock;
 use crate::transfer_view::{JobInfo, TransferView};
 
 #[zbus::proxy(
@@ -57,7 +56,6 @@ mod adbshare_dbus_proxy {
 struct UiHandles {
     browser: FileBrowser,
     transfer: TransferView,
-    dock: TransferDock,
     selected_device: parking_lot::Mutex<Option<String>>,
     /// Cache of live device metadata from the daemon.
     devices: parking_lot::Mutex<Vec<crate::device_list::DeviceEntry>>,
@@ -83,11 +81,6 @@ struct ClipboardFiles {
     /// file-based).
     entries: Vec<FsDirEntry>,
 }
-
-/// Sidebar geometry: the divider defaults to this and can be dragged down to
-/// the sidebar's 240px minimum (its size request below). GTK exposes no
-/// maximum for the divider, so it can also be dragged wider.
-const SIDEBAR_DEFAULT_WIDTH: i32 = 248;
 
 pub struct AdbshareApp {
     app: adw::Application,
@@ -237,7 +230,7 @@ impl AdbshareApp {
                 .build();
             trans_sub.add_css_class("dim-label");
             trans_box.append(&trans_sub);
-            transfer.transfer_attach(&trans_box);
+            transfer.attach(&trans_box);
             trans_pop.set_child(Some(&trans_box));
 
             // 3. Right: Operations + View + Transfers + Kebab
@@ -296,7 +289,8 @@ impl AdbshareApp {
             view_capsule.set_valign(gtk4::Align::Center);
 
             let view_toggle = gtk4::Button::new();
-            view_toggle.set_child(Some(&hdr_icon("view-grid-symbolic")));
+            let view_icon = hdr_icon("view-list-symbolic");
+            view_toggle.set_child(Some(&view_icon));
             view_toggle.add_css_class("capsule-btn");
             view_toggle.add_css_class("flat");
             view_toggle.set_tooltip_text(Some("Switch to list view"));
@@ -304,6 +298,7 @@ impl AdbshareApp {
             {
                 let browser_vt = browser.clone();
                 let vt = view_toggle.clone();
+                let vi = view_icon.clone();
                 view_toggle.connect_clicked(move |_| {
                     let new_mode = if browser_vt.view_mode() == ViewMode::Grid {
                         ViewMode::List
@@ -312,10 +307,10 @@ impl AdbshareApp {
                     };
                     browser_vt.set_view_mode(new_mode);
                     if new_mode == ViewMode::Grid {
-                        vt.set_icon_name("view-grid-symbolic");
+                        vi.set_icon_name(Some("view-list-symbolic"));
                         vt.set_tooltip_text(Some("Switch to list view"));
                     } else {
-                        vt.set_icon_name("view-list-symbolic");
+                        vi.set_icon_name(Some("view-grid-symbolic"));
                         vt.set_tooltip_text(Some("Switch to grid view"));
                     }
                 });
@@ -421,6 +416,7 @@ impl AdbshareApp {
                 .label("Show hidden files")
                 .margin_start(6)
                 .margin_end(6)
+                .active(browser.show_hidden())
                 .build();
             {
                 let browser_h = browser.clone();
@@ -429,6 +425,15 @@ impl AdbshareApp {
                     kp.popdown();
                     if btn.is_active() != browser_h.show_hidden() {
                         browser_h.toggle_show_hidden();
+                    }
+                });
+            }
+            {
+                let hc = hidden_check.clone();
+                let browser_h = browser.clone();
+                kebab_pop.connect_notify_local(Some("visible"), move |pop, _| {
+                    if pop.is_visible() {
+                        hc.set_active(browser_h.show_hidden());
                     }
                 });
             }
@@ -459,6 +464,7 @@ impl AdbshareApp {
             header_end.append(&kebab);
 
             header.pack_end(&header_end);
+
             main_layout.append(&header);
 
             // Search row: hidden until search toggle is on
@@ -471,7 +477,6 @@ impl AdbshareApp {
             search_row.set_margin_bottom(4);
             search_row.append(&browser.search_entry);
             browser.search_bar.set_child(Some(&search_row));
-            main_layout.append(&browser.search_bar);
 
             // ── Body: responsive overlay split view ─────────────────
             let split_view = adw::OverlaySplitView::new();
@@ -493,6 +498,7 @@ impl AdbshareApp {
             let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             content_box.set_vexpand(true);
             content_box.set_hexpand(true);
+            content_box.append(&browser.search_bar);
             content_box.append(&browser.root);
 
             split_view.set_sidebar(Some(&sidebar_box));
@@ -530,14 +536,7 @@ impl AdbshareApp {
             });
             window.add_controller(key_ctrl);
 
-            // Bottom status bar owns transfer progress; the small dock card
-            // only appears while jobs run and opens the full list on click.
-            let window_overlay = gtk4::Overlay::new();
-            window_overlay.set_child(Some(&main_layout));
-
-            let dock = TransferDock::new();
-            window_overlay.add_overlay(&dock.root);
-            window.set_content(Some(&window_overlay));
+            window.set_content(Some(&main_layout));
 
             // Drop files from other apps onto the canvas -> push/copy into
             // the directory being browsed.
@@ -568,38 +567,12 @@ impl AdbshareApp {
             let handles = std::rc::Rc::new(UiHandles {
                 browser,
                 transfer,
-                dock,
                 selected_device: parking_lot::Mutex::new(None),
                 devices: parking_lot::Mutex::new(Vec::new()),
                 active_jobs: parking_lot::Mutex::new(Vec::new()),
                 transfers_paused: parking_lot::Mutex::new(false),
                 clipboard: parking_lot::Mutex::new(None),
             });
-
-            // Dock controls reuse the banner's Pause/Cancel event flow;
-            // clicking anywhere else on the dock opens the full
-            // Operations & Transfers popover.
-            {
-                let browser_dock = handles.browser.clone();
-                handles.dock.pause_button.connect_clicked(move |_| {
-                    browser_dock.emit(BrowserEvent::PauseTransfer);
-                });
-            }
-            {
-                let browser_dock = handles.browser.clone();
-                handles.dock.cancel_button.connect_clicked(move |_| {
-                    browser_dock.emit(BrowserEvent::CancelTransfer);
-                });
-            }
-            {
-                let tp = trans_pop.clone();
-                let click = gtk4::GestureClick::new();
-                // Primary button only: right-/middle-clicks must not open the
-                // transfers popover.
-                click.set_button(1);
-                click.connect_released(move |_, _, _, _| tp.popup());
-                handles.dock.root.add_controller(click);
-            }
 
             // --- D-Bus channels ---
             let (devices_tx, devices_rx) = async_channel::unbounded::<Result<Vec<crate::device_list::DeviceEntry>, String>>();
@@ -659,7 +632,10 @@ impl AdbshareApp {
                 }
                 SidebarEvent::SelectLocal(path) => {
                     if !path.is_dir() {
-                        let _ = op_tx_sidebar.try_send((None, Err(format!("{} does not exist (is the folder or Trash empty?)", path.display()))));
+                        let _ = std::fs::create_dir_all(&path);
+                    }
+                    if !path.is_dir() {
+                        let _ = op_tx_sidebar.try_send((None, Err(format!("{} does not exist", path.display()))));
                         return;
                     }
                     handles_sidebar.browser.set_local_mode();
@@ -685,6 +661,16 @@ impl AdbshareApp {
                             return;
                         }
                     };
+                    handles_sidebar.browser.set_device(Some(&device));
+                    let cached = handles_sidebar
+                        .devices
+                        .lock()
+                        .iter()
+                        .find(|d| d.serial == device)
+                        .cloned();
+                    if let Some(ref entry) = cached {
+                        handles_sidebar.browser.set_device_info(entry);
+                    }
                     handles_sidebar.browser.set_loading(true);
                     let dir_tx = dir_tx_sidebar.clone();
                     let path_str = path.to_string_lossy().to_string();
@@ -751,8 +737,8 @@ impl AdbshareApp {
                                     }
                                 }
                             }
-                            // Auto-select the first real device if none selected.
-                            if selected.is_none() {
+                            // Auto-select the first real device if none selected and not browsing local files.
+                            if selected.is_none() && !handles_dev_drain.browser.is_local_mode() {
                                 if let Some(first) = devices.first() {
                                     select_device(&first.serial, &handles_dev_drain, &dir_tx_dev_drain, &info_tx_dev_drain, &mp_tx_dev_drain, rt_dev_drain.clone());
                                 }
@@ -895,8 +881,8 @@ impl AdbshareApp {
                 });
             }
 
-            // --- Drain jobs -> status bar, dock card, header count, full list ---
-            // One job list, three views of it. The status bar owns progress.
+            // --- Drain jobs -> status bar, header count, full list ---
+            // The status bar owns progress.
             let handles_jobs = handles.clone();
             let browser_drain = handles.browser.clone();
             let btn_drain = transfers_btn.clone();
@@ -906,7 +892,7 @@ impl AdbshareApp {
                     match result {
                         Ok(jobs) => {
                             // Paused jobs count as active: they must stay
-                            // visible (banner + dock) and resumable.
+                            // visible and resumable.
                             let active: Vec<_> = jobs.iter().filter(|j| {
                                 j.state == "Running" || j.state == "Pending" || j.state == "Paused"
                             }).collect();
@@ -968,15 +954,23 @@ impl AdbshareApp {
                             } else {
                                 ("media-playback-pause-symbolic", "Pause all transfers")
                             };
-                            browser_drain.banner_pause_btn.set_icon_name(icon);
-                            browser_drain.banner_pause_btn.set_tooltip_text(Some(tip));
-                            handles_jobs.dock.update(&jobs, paused);
+                            browser_drain.status_pause_btn.set_icon_name(icon);
+                            browser_drain.status_pause_btn.set_tooltip_text(Some(tip));
                             handles_jobs.transfer.update_jobs(jobs);
                         }
                         Err(e) => tracing::warn!(error=%e, "list_jobs failed"),
                     }
                 }
             });
+
+            if let Ok(ms) = std::env::var("ADB_GUI_AUTOCLOSE_MS") {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    let app = app.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || {
+                        app.quit();
+                    });
+                }
+            }
 
             window.present();
         });
@@ -992,8 +986,6 @@ struct DeviceInfoDto {
     serial: String,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
-    android_version: Option<String>,
     transport: String,
     #[serde(default)]
     battery_pct: Option<u8>,
@@ -1635,7 +1627,6 @@ fn handle_browser_event(
                 let _ = dir_tx.send((device, parent, res)).await;
             });
         }
-        BrowserEvent::Back | BrowserEvent::Forward => {}
         BrowserEvent::Navigate(path) => {
             if handles.browser.is_local_mode() {
                 refresh_local(dir_tx, &rt, path);
@@ -1704,7 +1695,6 @@ fn handle_browser_event(
                 let _ = dir_tx.send((device, new_path, res)).await;
             });
         }
-        BrowserEvent::Selected(_) => {}
         BrowserEvent::Upload => {
             if handles.browser.is_local_mode() {
                 // Browsing local files: push a chosen file to the connected device.

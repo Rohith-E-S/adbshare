@@ -355,7 +355,7 @@ impl AdbConnection {
                 return Err(AdbError::Timeout);
             }
         };
-        let (close_tx, mut close_rx) = oneshot::channel::<StreamId>();
+        let (close_tx, close_rx) = oneshot::channel::<StreamId>();
         let streams_for_close = self.streams.clone();
         let write_tx_for_close = self.write_tx.clone();
         tokio::spawn(async move {

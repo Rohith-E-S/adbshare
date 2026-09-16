@@ -359,12 +359,8 @@ pub enum BrowserEvent {
     OpenDir(DirEntry),
     /// User navigated to a path (e.g. clicked a breadcrumb or typed a path).
     Navigate(PathBuf),
-    /// Selection changed.
-    Selected(Option<DirEntry>),
     /// Navigation controls.
     Up,
-    Back,
-    Forward,
     Refresh,
     /// Actions.
     Upload,
@@ -420,31 +416,14 @@ pub struct FileBrowser {
     pub search_entry: gtk4::SearchEntry,
     pub search_button: gtk4::ToggleButton,
 
-    // Single context bar: where am I + what is selected (replaces the
-    // old banner + sub-header double strip).
-    pub info_bar: gtk4::Box,
-    pub info_icon: gtk4::Image,
-    pub info_title: gtk4::Label,
-    pub info_subtitle: gtk4::Label,
-    pub info_count: gtk4::Label,
-    // Bottom status bar: selection summary normally, transfer progress
-    // while jobs run. One place for progress — no competing banners.
-    pub status_bar: gtk4::Box,
-    pub status_label: gtk4::Label,
-    pub status_progress: gtk4::ProgressBar,
+    info_icon: gtk4::Image,
+    info_title: gtk4::Label,
+    info_subtitle: gtk4::Label,
+    info_count: gtk4::Label,
+    status_label: gtk4::Label,
+    status_progress: gtk4::ProgressBar,
     pub status_pause_btn: gtk4::Button,
-    pub status_cancel_btn: gtk4::Button,
-    // Compat shims: app.rs used to touch the banner/sub-header directly.
-    // They now alias the widgets above so call sites keep compiling.
-    pub banner_box: gtk4::Box,
-    pub banner_status_label: gtk4::Label,
-    pub banner_transport_label: gtk4::Label,
-    pub banner_battery_label: gtk4::Label,
-    pub banner_progress: gtk4::ProgressBar,
-    pub banner_pause_btn: gtk4::Button,
-    pub banner_cancel_btn: gtk4::Button,
-    pub sub_header_count_label: gtk4::Label,
-    pub sub_header_path_label: gtk4::Label,
+    status_cancel_btn: gtk4::Button,
 
     current_path: Rc<RefCell<PathBuf>>,
     device: Rc<RefCell<Option<String>>>,
@@ -717,19 +696,6 @@ impl FileBrowser {
         status_bar.append(&status_cancel_btn);
         root.append(&status_bar);
 
-        // Aliases so older call sites keep working: the banner widgets are
-        // now the status-bar widgets, the sub-header labels are the context
-        // bar labels.
-        let banner_box = status_bar.clone();
-        let banner_status_label = status_label.clone();
-        let banner_transport_label = info_subtitle.clone();
-        let banner_battery_label = info_count.clone();
-        let banner_progress = status_progress.clone();
-        let banner_pause_btn = status_pause_btn.clone();
-        let banner_cancel_btn = status_cancel_btn.clone();
-        let sub_header_count_label = info_count.clone();
-        let sub_header_path_label = info_subtitle.clone();
-
         let current_path = Rc::new(RefCell::new(PathBuf::from("/")));
         let device = Rc::new(RefCell::new(None));
         let device_display = Rc::new(RefCell::new(String::new()));
@@ -768,25 +734,14 @@ impl FileBrowser {
             search_bar,
             search_entry,
             search_button,
-            info_bar,
             info_icon,
             info_title,
             info_subtitle,
             info_count,
-            status_bar,
             status_label,
             status_progress,
             status_pause_btn,
             status_cancel_btn,
-            banner_box,
-            banner_status_label,
-            banner_transport_label,
-            banner_battery_label,
-            banner_progress,
-            banner_pause_btn,
-            banner_cancel_btn,
-            sub_header_count_label,
-            sub_header_path_label,
             current_path,
             device,
             device_display,
@@ -833,9 +788,6 @@ impl FileBrowser {
             }
         }
     }
-
-    /// The context bar is always visible; "connected" just changes what it says.
-    pub fn set_connected(&self, _on: bool) {}
 
     /// Fill the context bar from live `adb` data: plain words, no jargon.
     pub fn set_device_info(&self, info: &crate::device_list::DeviceEntry) {
@@ -906,6 +858,10 @@ impl FileBrowser {
 
     /// Idle status text: what is selected / how many items are here.
     pub fn refresh_selection_status(&self) {
+        if self.device.borrow().is_none() && !*self.local_mode.borrow() {
+            self.status_label.set_label("No device connected");
+            return;
+        }
         let (folders, files, hidden) = self.visible_stats();
         let total = folders + files;
         let sel = self.selected_entries().len();
@@ -957,16 +913,8 @@ impl FileBrowser {
         }
     }
 
-    /// Override the breadcrumb phone name (e.g. with the model name).
-    pub fn set_device_display_name(&self, name: &str) {
-        *self.device_display.borrow_mut() = name.to_string();
-    }
-
     pub fn current_path(&self) -> PathBuf {
         self.current_path.borrow().clone()
-    }
-    pub fn device(&self) -> Option<String> {
-        self.device.borrow().clone()
     }
 
     /// Switch to browsing this computer's files.
@@ -1469,6 +1417,22 @@ impl FileBrowser {
     }
 
     fn render_breadcrumbs(&self, path: &PathBuf) {
+        fn nav_pill_button(icon: Option<&str>, label: &str, tooltip: &str) -> gtk4::Button {
+            let btn = gtk4::Button::new();
+            btn.add_css_class("nav-pill-btn");
+            btn.set_tooltip_text(Some(tooltip));
+            let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            if let Some(ic) = icon {
+                let img = gtk4::Image::from_icon_name(ic);
+                img.set_pixel_size(16);
+                hbox.append(&img);
+            }
+            let lbl = gtk4::Label::new(Some(label));
+            hbox.append(&lbl);
+            btn.set_child(Some(&hbox));
+            btn
+        }
+
         while let Some(child) = self.breadcrumb_container.first_child() {
             self.breadcrumb_container.remove(&child);
         }
@@ -1477,12 +1441,11 @@ impl FileBrowser {
 
         if self.is_local_mode() {
             // This computer: first crumb names the source, not a raw "/".
-            let root_btn = gtk4::Button::builder()
-                .icon_name("drive-harddisk-symbolic")
-                .label("This computer")
-                .tooltip_text("Your Linux files")
-                .build();
-            root_btn.add_css_class("nav-pill-btn");
+            let root_btn = nav_pill_button(
+                Some("drive-harddisk-symbolic"),
+                "This computer",
+                "Your Linux files",
+            );
             if path_str == "/" {
                 root_btn.add_css_class("current");
             }
@@ -1509,8 +1472,7 @@ impl FileBrowser {
 
                 let label_text = comp.to_string_lossy().to_string();
 
-                let seg_btn = gtk4::Button::with_label(&label_text);
-                seg_btn.add_css_class("nav-pill-btn");
+                let seg_btn = nav_pill_button(None, &label_text, &target_path.to_string_lossy());
                 if is_last {
                     seg_btn.add_css_class("current");
                 }
@@ -1522,6 +1484,18 @@ impl FileBrowser {
                 });
                 self.breadcrumb_container.append(&seg_btn);
             }
+            return;
+        }
+
+        // If no device is connected, show an inactive pill and stop
+        if self.device.borrow().is_none() {
+            let dev_btn = nav_pill_button(
+                Some("phone-symbolic"),
+                "No phone connected",
+                "Connect a phone via USB or Wi-Fi",
+            );
+            dev_btn.set_sensitive(false);
+            self.breadcrumb_container.append(&dev_btn);
             return;
         }
 
@@ -1537,22 +1511,23 @@ impl FileBrowser {
             friendly
         };
 
-        // 1. Device pill button
-        let dev_btn = gtk4::Button::builder()
-            .icon_name("phone-symbolic")
-            .label(&dev_name)
-            .tooltip_text("Phone storage")
-            .build();
-        dev_btn.add_css_class("nav-pill-btn");
+        // 1. Device pill button - clicking navigates to root "/"
+        let dev_btn = nav_pill_button(
+            Some("phone-symbolic"),
+            &dev_name,
+            "Phone root (/)",
+        );
         let on_event = self.on_event.clone();
         dev_btn.connect_clicked(move |_| {
             if let Some(cb) = on_event.borrow().as_ref() {
-                cb(BrowserEvent::Navigate(PathBuf::from("/sdcard")));
+                cb(BrowserEvent::Navigate(PathBuf::from("/")));
             }
         });
+        if path_str == "/" {
+            dev_btn.add_css_class("current");
+        }
         self.breadcrumb_container.append(&dev_btn);
 
-        let path_str = path.to_string_lossy();
         if path_str == "/" {
             return;
         }
@@ -1564,8 +1539,11 @@ impl FileBrowser {
 
         if path_str.starts_with("/sdcard") {
             let is_storage_root = path_str == "/sdcard" || path_str == "/sdcard/";
-            let storage_btn = gtk4::Button::with_label("Internal storage");
-            storage_btn.add_css_class("nav-pill-btn");
+            let storage_btn = nav_pill_button(
+                None,
+                "Internal storage",
+                "Internal storage (/sdcard)",
+            );
             if is_storage_root {
                 storage_btn.add_css_class("current");
             }
@@ -1591,8 +1569,7 @@ impl FileBrowser {
 
                 let label_text = comp.to_string_lossy().to_string();
 
-                let seg_btn = gtk4::Button::with_label(&label_text);
-                seg_btn.add_css_class("nav-pill-btn");
+                let seg_btn = nav_pill_button(None, &label_text, &target_path.to_string_lossy());
                 if is_last {
                     seg_btn.add_css_class("current");
                 }
@@ -1618,8 +1595,7 @@ impl FileBrowser {
 
                 let label_text = comp.to_string_lossy().to_string();
 
-                let seg_btn = gtk4::Button::with_label(&label_text);
-                seg_btn.add_css_class("nav-pill-btn");
+                let seg_btn = nav_pill_button(None, &label_text, &target_path.to_string_lossy());
                 if is_last {
                     seg_btn.add_css_class("current");
                 }
@@ -1703,16 +1679,16 @@ impl FileBrowser {
             }
         });
 
-        // Status-bar Pause & Cancel (same widgets as the old banner names)
+        // Status-bar Pause & Cancel
         let on_ev_pause = self.on_event.clone();
-        self.banner_pause_btn.connect_clicked(move |_| {
+        self.status_pause_btn.connect_clicked(move |_| {
             if let Some(cb) = on_ev_pause.borrow().as_ref() {
                 cb(BrowserEvent::PauseTransfer);
             }
         });
 
         let on_ev_cancel = self.on_event.clone();
-        self.banner_cancel_btn.connect_clicked(move |_| {
+        self.status_cancel_btn.connect_clicked(move |_| {
             if let Some(cb) = on_ev_cancel.borrow().as_ref() {
                 cb(BrowserEvent::CancelTransfer);
             }
@@ -1772,6 +1748,13 @@ impl FileBrowser {
         self.search_button.connect_toggled(move |btn| {
             search_bar.set_search_mode(btn.is_active());
         });
+        let search_btn = self.search_button.clone();
+        self.search_bar.connect_search_mode_enabled_notify(move |bar| {
+            let enabled = bar.is_search_mode();
+            if search_btn.is_active() != enabled {
+                search_btn.set_active(enabled);
+            }
+        });
 
         // Search filtering (applies to both list_box and grid_box)
         let search_query = self.search_query.clone();
@@ -1816,15 +1799,11 @@ impl FileBrowser {
             let lb_sel = self.list_box.clone();
             let entries_sel = self.entries.clone();
             let dl_btn = self.download_button.clone();
-            let on_event_sel = self.on_event.clone();
             let status_refresh = self.clone();
             self.list_box.connect_selected_rows_changed(move |_lb| {
                 let files = selected_entries_from_list(&lb_sel, &entries_sel);
                 dl_btn.set_sensitive(files.iter().any(|e| !e.is_dir));
                 status_refresh.refresh_selection_status();
-                if let Some(cb) = on_event_sel.borrow().as_ref() {
-                    cb(BrowserEvent::Selected(files.first().cloned()));
-                }
             });
         }
 
@@ -1858,6 +1837,8 @@ impl FileBrowser {
                     if let Some(cb) = on_event_act.borrow().as_ref() {
                         cb(BrowserEvent::OpenExternal(p));
                     }
+                } else if let Some(cb) = on_event_act.borrow().as_ref() {
+                    cb(BrowserEvent::Download(vec![e.clone()]));
                 }
             }
         });
@@ -1914,7 +1895,7 @@ impl FileBrowser {
                             cb(BrowserEvent::OpenExternal(p));
                         }
                     } else if let Some(cb) = on_ev_sel_grid.borrow().as_ref() {
-                        cb(BrowserEvent::Selected(Some(entry)));
+                        cb(BrowserEvent::Download(vec![entry]));
                     }
                 }
             }
@@ -1990,7 +1971,7 @@ impl FileBrowser {
             *band.borrow_mut() = Some(band_box);
         });
 
-        drag.connect_drag_update(move |d, ox, oy| {
+        drag.connect_drag_update(move |_d, ox, oy| {
             let (Some((gx, gy)), Some((sx, sy))) = (
                 start_grid_update.borrow().as_ref().copied(),
                 start_ov_update.borrow().as_ref().copied(),
@@ -2130,11 +2111,46 @@ impl FileBrowser {
                 }),
             );
         }
-        // Delete — delete the selection (with confirmation)
+        // Delete — safe trash in local mode, delete confirmation in device mode
         {
             let browser = self.clone();
             add_shortcut(
                 "Delete",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if focus_in_editable(&browser.root) {
+                        return glib::Propagation::Proceed;
+                    }
+                    let sel = browser.selected_entries();
+                    if !sel.is_empty() {
+                        if browser.is_local_mode() {
+                            let curr = browser.current_path();
+                            for e in &sel {
+                                let target = curr.join(&e.name);
+                                let _ = std::process::Command::new("gio")
+                                    .args(["trash", &target.to_string_lossy()])
+                                    .status();
+                            }
+                            browser.emit(BrowserEvent::Refresh);
+                        } else {
+                            let label = if sel.len() == 1 {
+                                sel[0].name.clone()
+                            } else {
+                                format!("{} items", sel.len())
+                            };
+                            if let Some(w) = browser.root.root() {
+                                show_delete_dialog(&w, &label, sel, &browser.on_event);
+                            }
+                        }
+                    }
+                    glib::Propagation::Proceed
+                }),
+            );
+        }
+        // Shift+Delete — permanent deletion dialog
+        {
+            let browser = self.clone();
+            add_shortcut(
+                "<Shift>Delete",
                 gtk4::CallbackAction::new(move |_, _| {
                     if focus_in_editable(&browser.root) {
                         return glib::Propagation::Proceed;
@@ -2148,6 +2164,26 @@ impl FileBrowser {
                         };
                         if let Some(w) = browser.root.root() {
                             show_delete_dialog(&w, &label, sel, &browser.on_event);
+                        }
+                    }
+                    glib::Propagation::Proceed
+                }),
+            );
+        }
+        // F2 — rename selected item
+        {
+            let browser = self.clone();
+            add_shortcut(
+                "F2",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if focus_in_editable(&browser.root) {
+                        return glib::Propagation::Proceed;
+                    }
+                    let sel = browser.selected_entries();
+                    if sel.len() == 1 {
+                        let e = sel.into_iter().next().unwrap();
+                        if let Some(w) = browser.root.root() {
+                            show_rename_dialog(&w, &e, &browser.on_event);
                         }
                     }
                     glib::Propagation::Proceed
@@ -2481,21 +2517,25 @@ fn show_image_preview(parent: &impl IsA<gtk4::Widget>, entry: &DirEntry, src: &P
         Ok(_) => tmp,
         Err(_) => src.clone(),
     };
-    let dialog = adw::MessageDialog::builder()
+    let mut builder = adw::MessageDialog::builder()
         .heading(&entry.name)
         .body(&format!(
             "{} • {}",
             entry.display_size(),
             entry.display_date()
         ))
-        .transient_for(window.as_ref().unwrap())
-        .modal(true)
-        .build();
+        .modal(true);
+    if let Some(ref w) = window {
+        builder = builder.transient_for(w);
+    }
+    let dialog = builder.build();
     dialog.add_response("close", "Close");
     dialog.set_default_response(Some("close"));
     dialog.set_close_response("close");
-    let picture = gtk4::Image::from_file(&shown);
-    picture.set_pixel_size(384);
+    let picture = gtk4::Picture::for_filename(&shown);
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk4::ContentFit::Contain);
+    picture.set_size_request(400, 300);
     picture.set_halign(gtk4::Align::Center);
     picture.set_margin_top(8);
     picture.set_margin_bottom(8);
@@ -2688,6 +2728,26 @@ fn show_context_menu(
     }
     menu_box.append(&paste_btn);
 
+    let (rename_btn, _) = create_menu_button(
+        "document-edit-symbolic",
+        "Rename…",
+        Some("F2"),
+        false,
+        false,
+    );
+    rename_btn.set_sensitive(single);
+    {
+        let e_rename = focused.clone();
+        let on_ev = on_event.clone();
+        let p = popover.clone();
+        let widget_for_rename = target_widget.clone().upcast::<gtk4::Widget>();
+        rename_btn.connect_clicked(move |_| {
+            p.popdown();
+            show_rename_dialog(&widget_for_rename, &e_rename, &on_ev);
+        });
+    }
+    menu_box.append(&rename_btn);
+
     // 8. Move to Trash / 9. Delete Permanently — the whole selection.
     let (trash_btn, _) = create_menu_button(
         "user-trash-symbolic",
@@ -2711,8 +2771,9 @@ fn show_context_menu(
                     let target = curr_for_trash.join(&e.name);
                     let _ = std::process::Command::new("gio")
                         .args(["trash", &target.to_string_lossy()])
-                        .spawn();
+                        .status();
                 }
+                emit(&on_ev, BrowserEvent::Refresh);
             } else {
                 // The daemon delete is permanent; confirm first.
                 show_delete_dialog(&widget_for_trash, &label, sel.clone(), &on_ev);
@@ -2803,11 +2864,13 @@ fn show_new_folder_dialog(
     let window = parent
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok());
-    let dialog = gtk4::Dialog::builder()
+    let mut builder = gtk4::Dialog::builder()
         .title("New Folder")
-        .transient_for(window.as_ref().unwrap())
-        .modal(true)
-        .build();
+        .modal(true);
+    if let Some(ref w) = window {
+        builder = builder.transient_for(w);
+    }
+    let dialog = builder.build();
 
     let content_area = dialog.content_area();
     content_area.set_margin_start(16);
@@ -2839,6 +2902,54 @@ fn show_new_folder_dialog(
     dialog.present();
 }
 
+fn show_rename_dialog(
+    parent: &impl IsA<gtk4::Widget>,
+    entry: &DirEntry,
+    on_event: &Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>>,
+) {
+    let window = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let mut builder = gtk4::Dialog::builder()
+        .title("Rename")
+        .modal(true);
+    if let Some(ref w) = window {
+        builder = builder.transient_for(w);
+    }
+    let dialog = builder.build();
+
+    let content_area = dialog.content_area();
+    content_area.set_margin_start(16);
+    content_area.set_margin_end(16);
+    content_area.set_margin_top(16);
+    content_area.set_margin_bottom(16);
+
+    let entry_widget = gtk4::Entry::new();
+    entry_widget.set_text(&entry.name);
+    entry_widget.set_placeholder_text(Some("New name"));
+    content_area.append(&entry_widget);
+
+    dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
+    let rename_btn = dialog.add_button("Rename", gtk4::ResponseType::Ok);
+    rename_btn.add_css_class("suggested-action");
+
+    let on_ev = on_event.clone();
+    let e_clone = entry.clone();
+    dialog.connect_response(move |d, resp| {
+        if resp == gtk4::ResponseType::Ok {
+            let new_name = entry_widget.text().trim().to_string();
+            if !new_name.is_empty() && new_name != e_clone.name {
+                if let Some(cb) = on_ev.borrow().as_ref() {
+                    cb(BrowserEvent::Rename(e_clone.clone(), new_name));
+                }
+            }
+        }
+        d.close();
+    });
+
+    dialog.present();
+}
+
 fn show_delete_dialog(
     parent: &impl IsA<gtk4::Widget>,
     label: &str,
@@ -2848,11 +2959,13 @@ fn show_delete_dialog(
     let window = parent
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok());
-    let dialog = gtk4::Dialog::builder()
+    let mut builder = gtk4::Dialog::builder()
         .title("Delete Items")
-        .transient_for(window.as_ref().unwrap())
-        .modal(true)
-        .build();
+        .modal(true);
+    if let Some(ref w) = window {
+        builder = builder.transient_for(w);
+    }
+    let dialog = builder.build();
 
     let content_area = dialog.content_area();
     content_area.set_margin_start(16);
@@ -2892,11 +3005,13 @@ fn show_properties_dialog(
     let window = parent
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok());
-    let dialog = gtk4::Dialog::builder()
+    let mut builder = gtk4::Dialog::builder()
         .title(&format!("{} Properties", entry.name))
-        .transient_for(window.as_ref().unwrap())
-        .modal(true)
-        .build();
+        .modal(true);
+    if let Some(ref w) = window {
+        builder = builder.transient_for(w);
+    }
+    let dialog = builder.build();
 
     let content_area = dialog.content_area();
     content_area.set_margin_start(16);
@@ -2934,6 +3049,14 @@ fn show_properties_dialog(
         .title("Permissions")
         .subtitle(format!("{:#o}", entry.mode & 0o7777))
         .build();
+
+    if !device.is_empty() {
+        let row_dev = adw::ActionRow::builder()
+            .title("Device")
+            .subtitle(device)
+            .build();
+        group.add(&row_dev);
+    }
 
     // The name/location rows receive raw file names and paths: switch the
     // rows to plain text so names with &, < or > render correctly.

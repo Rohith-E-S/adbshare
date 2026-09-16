@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -290,7 +290,7 @@ fn open_usb_pump(
         .iter()
         .find(|d| d.bus_number() == bus && d.address() == addr)
         .ok_or_else(|| AdbError::DeviceNotFound(format!("usb:{}:{}", bus, addr)))?;
-    let mut handle = device.open()?;
+    let handle = device.open()?;
     // Detach any kernel driver BEFORE claiming: claim_interface fails with
     // Busy if a kernel driver (e.g. usbfs-bound adbd helper or a modem
     // driver) still holds the interface.
@@ -309,7 +309,7 @@ fn open_usb_pump(
     let (tx_to_app, rx_to_app) = mpsc::channel::<bytes::Bytes>(256);
     let (tx_from_app, mut rx_from_app) = mpsc::channel::<bytes::Bytes>(256);
 
-    let mut handle_for_thread = handle;
+    let handle_for_thread = handle;
     let context_for_thread = context;
 
     std::thread::Builder::new()
@@ -378,7 +378,7 @@ struct ChannelReader {
 
 impl tokio::io::AsyncRead for ChannelReader {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
@@ -432,7 +432,7 @@ impl tokio::io::AsyncWrite for ChannelWriter {
                 let waker = cx.waker().clone();
                 let tx = this.tx.clone();
                 tokio::spawn(async move {
-                    tx.reserve().await;
+                    let _ = tx.reserve().await;
                     waker.wake();
                 });
                 Poll::Pending

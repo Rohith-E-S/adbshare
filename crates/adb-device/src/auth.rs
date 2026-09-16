@@ -15,7 +15,7 @@ use rsa::{
     pkcs1v15::{Signature, SigningKey},
     pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding},
     signature::{RandomizedSigner, SignatureEncoding},
-    RsaPrivateKey, RsaPublicKey,
+    RsaPrivateKey,
 };
 use sha1::Sha1;
 use ssh_key::private::PrivateKey as SshPrivateKey;

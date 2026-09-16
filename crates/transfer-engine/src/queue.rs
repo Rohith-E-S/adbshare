@@ -156,7 +156,7 @@ impl JobQueue {
         {
             let mut q = self.pending.lock();
             if let Some(pos) = q.iter().position(|j| j.id == id) {
-                let mut job = q.remove(pos).unwrap();
+                let job = q.remove(pos).unwrap();
                 job.cancel();
                 job.set_error("cancelled");
                 job.set_state(JobState::Cancelled);
