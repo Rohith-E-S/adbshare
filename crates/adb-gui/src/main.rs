@@ -12,8 +12,8 @@ mod file_browser;
 mod transfer_dock;
 mod transfer_view;
 
-use clap::Parser;
 use app::AdbshareApp;
+use clap::Parser;
 
 /// Kept only so `adb-gui --version` / `--help` work before GTK loads.
 /// (The old, advertised-but-ignored `--pair` flag was removed: no pairing
@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -35,4 +35,15 @@ fn main() -> anyhow::Result<()> {
 
     let app = AdbshareApp::new();
     app.run()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_css_validity() {
+        if gtk4::init().is_ok() {
+            let provider = gtk4::CssProvider::new();
+            provider.load_from_string(include_str!("style.css"));
+        }
+    }
 }

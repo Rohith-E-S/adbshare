@@ -1,321 +1,1015 @@
-/* ADBShare — adaptive Adwaita styling.
+/* ═══════════════════════════════════════════════════════════════════════
+ * ADBShare — Modern Sleek Dark UI
  *
- * Deliberately thin: the system theme (light or dark) owns backgrounds and
- * text. This file only adds structure — context bar, sidebar cards, file
- * rows, transfer bar — using theme variables and color-mix() so contrast
- * holds in both modes. The accent is the standard GNOME blue; green is
- * reserved for "connected / working" dots only. */
+ * Palette (from design spec):
+ *   black-100 #0A0E15   deep space — base canvas
+ *   black-90  #212631   elevated layer 1 — sidebar, cards
+ *   black-80  #373F4E   elevated layer 2 — hover, borders
+ *   black-70  #4E576A   subtle outlines, dividers
+ *   black-60  #667085   muted text, placeholders
+ *
+ *   white-100 #FFFFFF   headlines, active states
+ *   white-90  #F0F1F5   high emphasis text
+ *   white-80  #E0E4EB   body text, descriptions
+ *   white-70  #D1D6E0   secondary labels
+ *   white-60  #BFC6D4   dim labels, hints
+ *
+ *   Text roles:
+ *     d.header      #FFFFFF
+ *     d.description #E0E4EB
+ *     d.reverse     #0A0E15
+ * ═══════════════════════════════════════════════════════════════════════ */
 
-window.background { background-color: @theme_bg_color; color: @theme_fg_color; }
+/* ── GTK / Adwaita semantic variable overrides ───────────────────────── */
+@define-color window_bg_color       #0A0E15;
+@define-color window_fg_color       #E0E4EB;
+@define-color view_bg_color         #0A0E15;
+@define-color view_fg_color         #E0E4EB;
+@define-color headerbar_bg_color    #0F1319;
+@define-color headerbar_fg_color    #FFFFFF;
+@define-color headerbar_border_color rgba(55,63,78,0.6);
+@define-color card_bg_color         #181D27;
+@define-color card_fg_color         #E0E4EB;
+@define-color card_border_color     rgba(55,63,78,0.4);
+@define-color popover_bg_color      #181D27;
+@define-color popover_fg_color      #E0E4EB;
+@define-color dialog_bg_color       #181D27;
+@define-color dialog_fg_color       #E0E4EB;
+@define-color sidebar_bg_color      #12161E;
+@define-color sidebar_fg_color      #E0E4EB;
+@define-color sidebar_border_color  rgba(55,63,78,0.4);
+@define-color theme_bg_color        #0A0E15;
+@define-color theme_fg_color        #E0E4EB;
+@define-color theme_base_color      #0A0E15;
+@define-color theme_text_color      #FFFFFF;
+@define-color theme_selected_bg_color rgba(255,255,255,0.08);
+@define-color theme_selected_fg_color #FFFFFF;
+@define-color accent_color          #FFFFFF;
+@define-color accent_bg_color       rgba(255,255,255,0.12);
+@define-color accent_fg_color       #FFFFFF;
 
-/* ---------- Context bar: "where am I?" in one line ---------- */
-.context-bar {
-    background-color: color-mix(in srgb, @theme_fg_color 4%, transparent);
-    border: 1px solid color-mix(in srgb, @theme_fg_color 9%, transparent);
-    border-radius: 12px;
-}
-.context-icon { color: @theme_selected_bg_color; }
-.context-title { font-size: 14px; font-weight: 700; }
-.context-subtitle {
-    font-family: monospace;
-    font-size: 11px;
-    color: color-mix(in srgb, @theme_fg_color 62%, transparent);
-}
-.context-count {
-    font-family: monospace;
-    font-size: 11px;
-    color: color-mix(in srgb, @theme_fg_color 62%, transparent);
+/* ═══════════════════════════════════════════════════════════════════════
+ *  FOUNDATIONS
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+window,
+window.background {
+    background-color: #0A0E15;
+    color: #E0E4EB;
 }
 
-/* ---------- Bottom status bar: selection or the one progress row ---------- */
-.status-bar {
-    border-top: 1px solid color-mix(in srgb, @theme_fg_color 10%, transparent);
-    padding: 6px 14px;
-    background-color: color-mix(in srgb, @theme_bg_color 96%, @theme_fg_color);
+/* ── Header Bar ────────────────────────────────────────────────────── */
+
+headerbar,
+headerbar.sleek-headerbar {
+    background: linear-gradient(to bottom, #10141C, #0D1018);
+    color: #FFFFFF;
+    border-bottom: 1px solid rgba(55, 63, 78, 0.5);
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+    padding: 0 12px;
+    min-height: 46px;
 }
-.status-label {
-    font-size: 12px;
-    color: color-mix(in srgb, @theme_fg_color 75%, transparent);
+
+headerbar .title {
+    font-weight: 600;
+    font-size: 13px;
+    letter-spacing: 0.02em;
+    color: #FFFFFF;
 }
-.status-progress trough {
-    background-color: color-mix(in srgb, @theme_fg_color 12%, transparent);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  HEADER — pixel-perfect 36px uniform height for every element
+ *
+ *  GTK4 Button / ToggleButton / MenuButton all have different default
+ *  internal padding.  We strip it all and clamp with both min-height
+ *  internal padding.  We strip it all and use min-height to force
+ *  every element to exactly 36px outer.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* --- Reset: strip ALL default button sizing inside the header --- */
+headerbar button,
+headerbar button.flat,
+headerbar button.image-button,
+headerbar button.text-button,
+headerbar togglebutton > button,
+headerbar menubutton > button,
+headerbar .pill-capsule button,
+headerbar .pill-capsule togglebutton > button {
+    padding: 0;
+    margin: 0;
+    min-height: 0;
+    min-width: 0;
+}
+
+/* --- Capsule group: the rounded container holding 2–4 icon buttons --- */
+.pill-capsule {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 3px;
+    min-height: 36px;
+}
+
+/* --- Individual icon buttons inside a capsule --- */
+.capsule-btn,
+.capsule-btn.flat {
+    border-radius: 7px;
+    padding: 0;
+    min-width: 30px;
+    min-height: 30px;
+    border: none;
+    background: transparent;
+    color: #BFC6D4;
+    transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.capsule-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #FFFFFF;
+}
+
+.capsule-btn:checked,
+.capsule-btn:active {
+    background: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF;
+}
+
+/* --- Vertical dividers between capsule buttons --- */
+.capsule-sep {
+    background-color: rgba(255, 255, 255, 0.06);
+    min-width: 1px;
+    margin: 8px 0;
+}
+
+/* --- Standalone pill buttons (transfers, kebab) --- */
+.pill-capsule-btn,
+.pill-capsule-btn.flat,
+headerbar menubutton.pill-capsule-btn > button,
+headerbar menubutton.pill-capsule-btn > button.flat {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 0 10px;
+    min-height: 36px;
+    color: #BFC6D4;
+    transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.pill-capsule-btn:hover,
+headerbar menubutton.pill-capsule-btn > button:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.1);
+    color: #FFFFFF;
+}
+
+/* Hide the built-in dropdown arrow on MenuButtons */
+headerbar menubutton.pill-capsule-btn > button > arrow,
+headerbar menubutton.pill-capsule-btn > button > .arrow {
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    padding: 0;
+    -gtk-icon-size: 0;
+}
+
+/* --- Window control buttons (close/minimize/maximize from Adwaita) --- */
+headerbar windowcontrols button {
+    min-width: 30px;
+    min-height: 30px;
+    padding: 0;
+    margin: 2px 1px;
     border-radius: 9999px;
-    min-height: 5px;
-}
-.status-progress progress {
-    background-color: @theme_selected_bg_color;
-    border-radius: 9999px;
-    min-height: 5px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #BFC6D4;
 }
 
-/* ---------- Sidebar ---------- */
+headerbar windowcontrols button:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  OMNIBAR — center address pill (same 36px height)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+.omnibar-pill {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 0 10px;
+    min-height: 36px;
+    transition: all 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.omnibar-pill:hover {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+.omnibar-leading-icon {
+    color: #667085;
+    margin-left: 2px;
+    margin-right: 4px;
+    opacity: 0.7;
+}
+
+.omnibar-sub-btn,
+.omnibar-sub-btn.flat {
+    border-radius: 7px;
+    padding: 0 6px;
+    min-height: 26px;
+    min-width: 26px;
+    border: none;
+    background: transparent;
+    color: #667085;
+    transition: all 150ms ease;
+}
+
+.omnibar-sub-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #FFFFFF;
+}
+
+.omnibar-sub-btn:checked {
+    background: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF;
+}
+
+/* ── Breadcrumb chips ────────────────────────────────────────────────── */
+
+.nav-pill-btn {
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: #BFC6D4;
+    background: transparent;
+    border: none;
+    transition: all 150ms ease;
+}
+
+.nav-pill-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #FFFFFF;
+}
+
+.nav-pill-btn.current {
+    background: rgba(255, 255, 255, 0.1);
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+.nav-pill-sep {
+    color: #4E576A;
+    font-size: 13px;
+    font-weight: 400;
+    margin: 0 1px;
+    opacity: 0.6;
+}
+
+/* ── Transfer indicator dot ─────────────────────────────────────────── */
+
+.transfer-indicator-dot {
+    min-width: 6px;
+    min-height: 6px;
+    border-radius: 9999px;
+    background-color: #4E576A;
+    transition: all 300ms ease;
+}
+
+.transfer-indicator-dot.active {
+    background-color: #22C55E;
+    box-shadow: 0 0 6px rgba(34, 197, 94, 0.6), 0 0 12px rgba(34, 197, 94, 0.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  SIDEBAR
+ * ═══════════════════════════════════════════════════════════════════════ */
+
 .navigation-sidebar {
-    background-color: color-mix(in srgb, @theme_fg_color 3%, transparent);
-    border-right: 1px solid color-mix(in srgb, @theme_fg_color 9%, transparent);
+    background: linear-gradient(to bottom, #12161E, #0F1319);
+    border-right: 1px solid rgba(55, 63, 78, 0.35);
 }
-paned.sidebar-paned > separator { min-width: 5px; background-color: transparent; }
+
+paned.sidebar-paned > separator {
+    min-width: 1px;
+    background-color: rgba(55, 63, 78, 0.35);
+}
 
 .sidebar-heading {
-    font-family: monospace;
     font-size: 10px;
     font-weight: 700;
-    letter-spacing: 0.1em;
+    letter-spacing: 0.12em;
     text-transform: uppercase;
-    color: color-mix(in srgb, @theme_fg_color 55%, transparent);
-    padding: 12px 12px 4px 12px;
+    color: #667085;
+    padding: 16px 14px 6px 14px;
 }
+
 .sidebar-hint {
     font-size: 11px;
-    color: color-mix(in srgb, @theme_fg_color 55%, transparent);
-    padding: 0 12px 4px 12px;
+    color: #667085;
+    padding: 2px 14px 8px 14px;
+    opacity: 0.8;
 }
-.sidebar-list { background: transparent; }
-.sidebar-list > row { background: transparent; border-radius: 9px; }
-.sidebar-list > row:hover { background-color: color-mix(in srgb, @theme_fg_color 6%, transparent); }
-.sidebar-list > row:selected { background: transparent; outline: none; }
+
+.sidebar-list {
+    background: transparent;
+}
+
+.sidebar-list > row {
+    background: transparent;
+    border-radius: 8px;
+    outline: none;
+}
+
+.sidebar-list > row:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.sidebar-list > row:selected {
+    background: transparent;
+    outline: none;
+}
 
 .sidebar-row {
-    border-radius: 9px;
-    margin: 1px 6px;
+    border-radius: 8px;
+    margin: 1px 8px;
     padding: 7px 10px;
     border: 1px solid transparent;
-}
-.sidebar-row:hover { background-color: color-mix(in srgb, @theme_fg_color 6%, transparent); }
-.sidebar-row:selected {
-    background-color: color-mix(in srgb, @theme_selected_bg_color 14%, transparent);
-    border-color: color-mix(in srgb, @theme_selected_bg_color 35%, transparent);
-    box-shadow: inset 2px 0 0 @theme_selected_bg_color;
+    color: #D1D6E0;
+    transition: all 150ms ease;
 }
 
-/* Phone cards: elevated, accent border when selected. */
+.sidebar-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: #F0F1F5;
+}
+
+.sidebar-row:selected {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.08);
+    color: #FFFFFF;
+    box-shadow: inset 3px 0 0 #FFFFFF;
+}
+
+/* ── Device cards — elevated, refined ────────────────────────────────── */
+
 .device-card {
-    background-color: color-mix(in srgb, @theme_fg_color 4%, transparent);
-    border: 1px solid color-mix(in srgb, @theme_fg_color 10%, transparent);
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 12px;
     padding: 10px 12px;
-    margin: 3px 6px;
+    margin: 3px 8px;
+    transition: all 200ms cubic-bezier(0.4, 0, 0.2, 1);
 }
-.device-card:hover { border-color: color-mix(in srgb, @theme_fg_color 20%, transparent); }
+
+.device-card:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
 .device-card.active {
-    border-color: color-mix(in srgb, @theme_selected_bg_color 55%, transparent);
-    box-shadow: 0 0 0 1px color-mix(in srgb, @theme_selected_bg_color 25%, transparent);
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.2);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.15), 0 4px 16px rgba(0, 0, 0, 0.3);
 }
-.device-name { font-size: 13px; font-weight: 700; }
+
+.device-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: #FFFFFF;
+    letter-spacing: 0.01em;
+}
+
 .device-subline {
     font-family: monospace;
     font-size: 10.5px;
-    color: color-mix(in srgb, @theme_fg_color 60%, transparent);
+    color: #BFC6D4;
+    opacity: 0.8;
 }
 
-/* Transport badge + battery pill. */
-.usb-badge, .usb-badge-muted {
+/* ── Transport badge & battery ──────────────────────────────────────── */
+
+.usb-badge,
+.usb-badge-muted {
     font-family: monospace;
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 700;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
-    border-radius: 6px;
-    padding: 2px 7px;
-    border: 1px solid color-mix(in srgb, @theme_fg_color 14%, transparent);
-    background-color: color-mix(in srgb, @theme_fg_color 6%, transparent);
-    color: color-mix(in srgb, @theme_fg_color 70%, transparent);
+    border-radius: 5px;
+    padding: 1px 6px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.04);
+    color: #D1D6E0;
 }
+
 .usb-badge {
-    background-color: color-mix(in srgb, @theme_selected_bg_color 14%, transparent);
-    border-color: color-mix(in srgb, @theme_selected_bg_color 40%, transparent);
-    color: @theme_selected_bg_color;
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF;
 }
+
 .battery-pill {
     font-family: monospace;
     font-size: 10px;
-    font-weight: 700;
+    font-weight: 600;
     border-radius: 9999px;
-    padding: 2px 8px;
-    border: 1px solid color-mix(in srgb, @theme_fg_color 14%, transparent);
-    color: color-mix(in srgb, @theme_fg_color 70%, transparent);
+    padding: 1px 7px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.03);
+    color: #D1D6E0;
 }
-.battery-pill.low { color: #e01b24; border-color: color-mix(in srgb, #e01b24 45%, transparent); }
 
-/* Green dot = connected. The only green in the UI. */
-.led { border-radius: 9999px; min-width: 8px; min-height: 8px; background-color: color-mix(in srgb, @theme_fg_color 25%, transparent); }
-.led-on { background-color: #33d17a; }
-.led-wifi { background-color: #1c71d8; }
-.green-dot { background-color: #33d17a; border-radius: 9999px; min-width: 8px; min-height: 8px; }
-.blue-dot { background-color: #1c71d8; border-radius: 9999px; min-width: 8px; min-height: 8px; }
-.selected-icon { color: @theme_selected_bg_color; }
-.sidebar-icon-dim { color: color-mix(in srgb, @theme_fg_color 55%, transparent); }
-.sidebar-icon-places { color: @theme_selected_bg_color; }
-.sidebar-icon-trash { color: color-mix(in srgb, @theme_fg_color 55%, transparent); }
+.battery-pill.low {
+    color: #EF4444;
+    border-color: rgba(239, 68, 68, 0.4);
+    background: rgba(239, 68, 68, 0.08);
+}
+
+/* ── Status LEDs ────────────────────────────────────────────────────── */
+
+.led {
+    border-radius: 9999px;
+    min-width: 7px;
+    min-height: 7px;
+    background-color: #4E576A;
+}
+
+.led-on,
+.green-dot {
+    background-color: #22C55E;
+    border-radius: 9999px;
+    min-width: 7px;
+    min-height: 7px;
+    box-shadow: 0 0 4px rgba(34, 197, 94, 0.5);
+}
+
+.led-wifi,
+.blue-dot {
+    background-color: #FFFFFF;
+    border-radius: 9999px;
+    min-width: 7px;
+    min-height: 7px;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.4);
+}
+
+.selected-icon { color: #FFFFFF; }
+.sidebar-icon-dim { color: #667085; }
+.sidebar-icon-places { color: #D1D6E0; }
+.sidebar-icon-trash { color: #667085; }
+
+/* ── Device storage bar ─────────────────────────────────────────────── */
 
 .device-storage-bar trough {
-    background-color: color-mix(in srgb, @theme_fg_color 12%, transparent);
+    background-color: rgba(255, 255, 255, 0.06);
     border-radius: 9999px;
-    min-height: 4px;
-    border: none;
-}
-.device-storage-bar progress {
-    background-color: @theme_selected_bg_color;
-    border-radius: 9999px;
-    min-height: 4px;
+    min-height: 3px;
     border: none;
 }
 
-/* First-run onboarding card + Wi-Fi button. */
-.onboarding-card {
-    background-color: color-mix(in srgb, @theme_selected_bg_color 8%, transparent);
-    border: 1px solid color-mix(in srgb, @theme_selected_bg_color 25%, transparent);
-    border-radius: 12px;
-    padding: 10px 12px;
-    margin: 2px 6px;
+.device-storage-bar progress {
+    background: linear-gradient(to right, rgba(255,255,255,0.5), #FFFFFF);
+    border-radius: 9999px;
+    min-height: 3px;
+    border: none;
 }
-.onboarding-title { font-size: 13px; font-weight: 700; }
+
+/* ── Onboarding & connect ───────────────────────────────────────────── */
+
+.onboarding-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+    padding: 14px 14px;
+    margin: 4px 8px;
+}
+
+.onboarding-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #FFFFFF;
+}
+
 .onboarding-step {
     font-size: 12px;
-    color: color-mix(in srgb, @theme_fg_color 75%, transparent);
+    color: #D1D6E0;
+    opacity: 0.85;
 }
-.connect-button { margin: 2px 12px 4px 12px; }
 
-/* ---------- Breadcrumb chips in the header ---------- */
-.nav-pill-btn {
-    border-radius: 8px;
-    padding: 4px 10px;
+.connect-button {
+    margin: 6px 12px 8px 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #E0E4EB;
+    border-radius: 10px;
+    transition: all 150ms ease;
+}
+
+.connect-button:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  CONTEXT BAR — "where am I?" strip
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+.context-bar {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 10px;
+    padding: 8px 14px;
+}
+
+.context-icon {
+    color: #FFFFFF;
+    opacity: 0.9;
+}
+
+.context-title {
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
+    color: #FFFFFF;
+    letter-spacing: 0.01em;
 }
-.nav-pill-btn.current {
-    background-color: color-mix(in srgb, @theme_selected_bg_color 16%, transparent);
-    color: @theme_selected_bg_color;
-    font-weight: 700;
-}
-.nav-pill-sep { color: color-mix(in srgb, @theme_fg_color 35%, transparent); }
 
-/* ---------- File canvas ---------- */
-.file-canvas { background-color: transparent; }
-.file-list-view { background-color: transparent; padding: 8px 12px; }
-.file-row { border-radius: 10px; margin: 1px 0; border: 1px solid transparent; padding: 4px 6px; }
-.file-row:hover { background-color: color-mix(in srgb, @theme_fg_color 5%, transparent); }
+.context-subtitle {
+    font-family: monospace;
+    font-size: 10.5px;
+    color: #BFC6D4;
+    opacity: 0.75;
+}
+
+.context-count {
+    font-family: monospace;
+    font-size: 10.5px;
+    color: #BFC6D4;
+    opacity: 0.75;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  STATUS BAR — bottom strip
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+.status-bar {
+    border-top: 1px solid rgba(55, 63, 78, 0.35);
+    padding: 5px 14px;
+    background: linear-gradient(to bottom, #0D1018, #0A0E15);
+}
+
+.status-label {
+    font-size: 11.5px;
+    color: #BFC6D4;
+    opacity: 0.85;
+}
+
+.status-progress trough {
+    background-color: rgba(255, 255, 255, 0.06);
+    border-radius: 9999px;
+    min-height: 3px;
+}
+
+.status-progress progress {
+    background: linear-gradient(to right, rgba(255,255,255,0.6), #FFFFFF);
+    border-radius: 9999px;
+    min-height: 3px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  FILE BROWSER — canvas, grid, list
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+.file-canvas {
+    background-color: #0A0E15;
+}
+
+.file-list-view {
+    background-color: transparent;
+    padding: 4px 8px;
+}
+
+.file-row {
+    border-radius: 8px;
+    margin: 1px 0;
+    border: 1px solid transparent;
+    padding: 5px 10px;
+    color: #E0E4EB;
+    transition: all 120ms ease;
+}
+
+.file-row:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
 .file-row:selected {
-    background-color: color-mix(in srgb, @theme_selected_bg_color 13%, transparent);
-    border-color: color-mix(in srgb, @theme_selected_bg_color 35%, transparent);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.08);
+    color: #FFFFFF;
 }
 
-/* Nautilus-style icon view: no cards — glyphs float on the canvas and
- * only hover/selection paint a soft pill behind icon + label. */
-flowboxchild { border-radius: 12px; padding: 6px 2px; }
-flowboxchild:hover { background-color: color-mix(in srgb, @theme_fg_color 5%, transparent); }
-flowboxchild:selected { background-color: color-mix(in srgb, @theme_fg_color 10%, transparent); outline: none; }
-flowboxchild:selected .grid-item-title { color: @theme_fg_color; }
+/* ── Grid view (icon view) ──────────────────────────────────────────── */
+
+flowboxchild {
+    border-radius: 10px;
+    padding: 6px 4px;
+    transition: all 120ms ease;
+}
+
+flowboxchild:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+flowboxchild:selected {
+    background: rgba(255, 255, 255, 0.08);
+    outline: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+flowboxchild:selected .grid-item-title {
+    color: #FFFFFF;
+}
+
 .grid-item-card {
     border-radius: 0;
     padding: 0;
-    background-color: transparent;
+    background: transparent;
     border: none;
 }
+
 .grid-item-card:hover {
-    background-color: transparent;
+    background: transparent;
     border: none;
     box-shadow: none;
 }
-.grid-item-title { font-size: 12.5px; font-weight: 500; margin-top: 2px; }
+
+.grid-item-title {
+    font-size: 12px;
+    font-weight: 500;
+    margin-top: 4px;
+    color: #E0E4EB;
+}
+
 .grid-item-sub {
     font-family: monospace;
-    font-size: 10.5px;
+    font-size: 10px;
     margin-top: 2px;
-    color: color-mix(in srgb, @theme_fg_color 60%, transparent);
+    color: #BFC6D4;
+    opacity: 0.7;
 }
 
-.folder-icon { color: @theme_selected_bg_color; }
-.file-icon { color: color-mix(in srgb, @theme_fg_color 60%, transparent); }
-.apk-icon { color: #33d17a; }
+.folder-icon { color: #D1D6E0; }
+.file-icon { color: #667085; }
+.apk-icon { color: #FFFFFF; }
+
 .rubber-band {
-    border: 1px solid @theme_selected_bg_color;
-    background-color: color-mix(in srgb, @theme_selected_bg_color 14%, transparent);
-    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    background-color: rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
 }
 
-/* ---------- Popovers / menus ---------- */
-popover > contents {
-    border-radius: 14px;
-    padding: 5px;
-}
-popover separator { margin: 5px 10px; }
-.shortcut-label, .shortcut-label-accent, .shortcut-label-highlight {
-    font-family: monospace;
-    font-size: 11px;
-    color: color-mix(in srgb, @theme_fg_color 55%, transparent);
-}
-.menu-accent { color: @theme_selected_bg_color; }
-.menu-item-highlight {
-    background-color: color-mix(in srgb, @theme_selected_bg_color 12%, transparent);
+/* ═══════════════════════════════════════════════════════════════════════
+ *  BUTTONS & INPUTS
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+button {
     border-radius: 8px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #E0E4EB;
+    padding: 5px 12px;
+    transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* ---------- Transfers ---------- */
-.transfer-card {
-    background-color: color-mix(in srgb, @theme_fg_color 4%, transparent);
-    border: 1px solid color-mix(in srgb, @theme_fg_color 10%, transparent);
+button:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.12);
+    color: #FFFFFF;
+}
+
+button:active {
+    background: rgba(255, 255, 255, 0.14);
+    color: #FFFFFF;
+}
+
+button.flat {
+    background: transparent;
+    border-color: transparent;
+    color: #D1D6E0;
+}
+
+button.flat:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: transparent;
+    color: #FFFFFF;
+}
+
+button.suggested-action {
+    background: #FFFFFF;
+    color: #0A0E15;
+    border: none;
+    font-weight: 600;
+}
+
+button.suggested-action:hover {
+    background: #E0E4EB;
+    color: #0A0E15;
+}
+
+button.destructive-action {
+    background: rgba(239, 68, 68, 0.15);
+    color: #EF4444;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+button.destructive-action:hover {
+    background: rgba(239, 68, 68, 0.25);
+    color: #FCA5A5;
+}
+
+entry {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    color: #FFFFFF;
+    padding: 6px 10px;
+    transition: all 200ms ease;
+}
+
+entry:focus {
+    border-color: rgba(255, 255, 255, 0.3);
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.06);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  POPOVERS & MENUS
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+popover > contents {
+    background: #181D27;
+    border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 12px;
-    padding: 10px 12px;
-    margin: 6px 10px;
+    padding: 6px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.04);
+    color: #E0E4EB;
 }
-.transfer-card .title { font-size: 13px; font-weight: 700; }
-.transfer-card .subtitle {
+
+popover separator {
+    margin: 4px 8px;
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+.shortcut-label,
+.shortcut-label-accent,
+.shortcut-label-highlight {
     font-family: monospace;
-    font-size: 11px;
-    color: color-mix(in srgb, @theme_fg_color 62%, transparent);
+    font-size: 10px;
+    color: #667085;
 }
-.transfer-card progressbar progress {
-    background-color: @theme_selected_bg_color;
-    border-radius: 9999px;
-    min-height: 6px;
+
+.menu-accent { color: #FFFFFF; }
+
+.menu-item-highlight {
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    color: #FFFFFF;
 }
-.transfer-card progressbar trough {
-    background-color: color-mix(in srgb, @theme_fg_color 12%, transparent);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  TRANSFERS — card-based job rows
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Card container ─────────────────────────────────────────────────── */
+
+.transfer-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+    padding: 12px 16px;
+    margin: 4px 8px;
+    transition: all 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.transfer-card:hover {
+    background: rgba(255, 255, 255, 0.055);
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+
+/* Transparent rows so card styling takes over */
+.transfer-row {
+    background: transparent;
+    border: none;
+    outline: none;
+    padding: 0;
+}
+
+/* ── Direction arrow badge ──────────────────────────────────────────── */
+
+.transfer-dir-badge {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #D1D6E0;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    padding: 2px 8px;
+    min-width: 78px;
+}
+
+/* ── File name ──────────────────────────────────────────────────────── */
+
+.transfer-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: #FFFFFF;
+    letter-spacing: 0.01em;
+}
+
+/* ── State pills ────────────────────────────────────────────────────── */
+
+.transfer-state-pill {
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     border-radius: 9999px;
-    min-height: 6px;
+    padding: 2px 10px;
+}
+
+.pill-running {
+    color: #22C55E;
+    background: rgba(34, 197, 94, 0.1);
+    border: 1px solid rgba(34, 197, 94, 0.25);
+}
+
+.pill-pending {
+    color: #BFC6D4;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.pill-paused {
+    color: #FACC15;
+    background: rgba(250, 204, 21, 0.1);
+    border: 1px solid rgba(250, 204, 21, 0.25);
+}
+
+.pill-done {
+    color: #FFFFFF;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.pill-failed {
+    color: #EF4444;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.pill-cancelled {
+    color: #667085;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* ── Gradient progress bar ──────────────────────────────────────────── */
+
+.transfer-card .transfer-progress trough {
+    background-color: rgba(255, 255, 255, 0.06);
+    border-radius: 9999px;
+    min-height: 5px;
     border: none;
 }
 
-/* Bottom transfer bar: full-width strip, not a floating card. */
-.transfer-dock {
-    background-color: color-mix(in srgb, @theme_bg_color 92%, @theme_fg_color);
-    border: 1px solid color-mix(in srgb, @theme_fg_color 12%, transparent);
-    border-radius: 14px;
-    padding: 10px 14px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+.transfer-card .transfer-progress progress {
+    background: linear-gradient(to right, rgba(255,255,255,0.35), rgba(255,255,255,0.7), #FFFFFF);
+    border-radius: 9999px;
+    min-height: 5px;
+    border: none;
+    box-shadow: 0 0 6px rgba(255, 255, 255, 0.15);
 }
-.transfer-dock .dock-summary { font-size: 12px; font-weight: 700; }
+
+/* ── Monospace status line ──────────────────────────────────────────── */
+
+.transfer-status {
+    font-family: monospace;
+    font-size: 10.5px;
+    font-weight: 500;
+    color: #BFC6D4;
+    opacity: 0.85;
+    letter-spacing: 0.02em;
+}
+
+/* ── Floating transfer dock ─────────────────────────────────────────── */
+
+.transfer-dock {
+    background: #181D27;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 14px;
+    padding: 10px 18px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.04);
+    color: #E0E4EB;
+}
+
+.transfer-dock .dock-summary {
+    font-size: 12px;
+    font-weight: 600;
+    color: #FFFFFF;
+}
+
 .transfer-dock .dock-speed {
     font-family: monospace;
     font-size: 14px;
     font-weight: 700;
-    color: @theme_selected_bg_color;
+    color: #FFFFFF;
 }
-.transfer-dock .dock-separator { background-color: color-mix(in srgb, @theme_fg_color 12%, transparent); min-width: 1px; }
-.transfer-dock .dock-mini-name { font-size: 12px; }
+
+.transfer-dock .dock-separator {
+    background-color: rgba(255, 255, 255, 0.08);
+    min-width: 1px;
+}
+
+.transfer-dock .dock-mini-name {
+    font-size: 12px;
+    color: #E0E4EB;
+}
+
 .transfer-dock .dock-mini-pct {
     font-family: monospace;
     font-size: 11px;
-    color: color-mix(in srgb, @theme_fg_color 62%, transparent);
+    color: #BFC6D4;
 }
+
 .transfer-dock progressbar trough {
-    background-color: color-mix(in srgb, @theme_fg_color 12%, transparent);
+    background-color: rgba(255, 255, 255, 0.06);
     border-radius: 9999px;
-    min-height: 4px;
+    min-height: 3px;
     border: none;
 }
+
 .transfer-dock progressbar progress {
-    background-color: @theme_selected_bg_color;
+    background: linear-gradient(to right, rgba(255,255,255,0.5), #FFFFFF);
     border-radius: 9999px;
-    min-height: 4px;
+    min-height: 3px;
     border: none;
 }
 
-/* Generic helpers used across dialogs. */
-.heading { font-weight: 700; font-size: 14px; }
-.dim-label { color: color-mix(in srgb, @theme_fg_color 60%, transparent); }
+/* ═══════════════════════════════════════════════════════════════════════
+ *  GENERIC HELPERS
+ * ═══════════════════════════════════════════════════════════════════════ */
 
-/* Legacy classes kept so no Rust code references a missing style. */
+.heading {
+    font-weight: 600;
+    font-size: 14px;
+    color: #FFFFFF;
+}
+
+.dim-label {
+    color: #667085;
+}
+
+/* Scrollbars — minimal, translucent */
+scrollbar slider {
+    background-color: rgba(255, 255, 255, 0.12);
+    border-radius: 9999px;
+    min-width: 4px;
+    min-height: 4px;
+}
+
+scrollbar slider:hover {
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+scrollbar trough {
+    background-color: transparent;
+}
+
+/* Selection highlight on list/tree views */
+treeview:selected,
+listview:selected {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #FFFFFF;
+}
+
+/* Check buttons in menus */
+checkbutton indicator {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+}
+
+checkbutton:checked indicator {
+    background: #FFFFFF;
+    border-color: #FFFFFF;
+    color: #0A0E15;
+}
+
+/* Compat: old CSS classes that app code still references but no longer need rules */
 .app-headerbar, .signal-rail, .adb-connected-banner, .adb-pill-tag, .adb-speed-label,
 .sub-header-bar, .sub-header-title, .sub-header-path, .sub-header-perm,
 .header-search, .raised-btn, .progress-slim, .nav-arrows-box, .window-close-circle,
