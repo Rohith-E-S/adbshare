@@ -1001,7 +1001,8 @@ impl FileBrowser {
 
     /// Toggle dotfile visibility and rebuild the view.
     pub fn toggle_show_hidden(&self) {
-        *self.show_hidden.borrow_mut() = !*self.show_hidden.borrow();
+        let show = !self.show_hidden();
+        *self.show_hidden.borrow_mut() = show;
         let all = self.entries.borrow().clone();
         self.set_entries(all);
     }
@@ -3085,4 +3086,54 @@ fn show_properties_dialog(
     dialog.add_button("Close", gtk4::ResponseType::Close);
     dialog.connect_response(|d, _| d.close());
     dialog.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_show_hidden_rebuilds_both_views() {
+        if std::env::var_os("ADBSHARE_HIDDEN_FILES_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "file_browser::tests::toggle_show_hidden_rebuilds_both_views",
+                    "--nocapture",
+                ])
+                .env("ADBSHARE_HIDDEN_FILES_TEST_CHILD", "1")
+                .status()
+                .expect("Failed to start isolated GTK regression test");
+            assert!(status.success(), "GTK regression test failed: {status}");
+            return;
+        }
+        adw::init().expect("GTK and libadwaita require an available display");
+        let browser = FileBrowser::new();
+        browser.set_entries(
+            ["visible", ".hidden"]
+                .into_iter()
+                .map(|name| DirEntry {
+                    name: name.to_string(),
+                    is_dir: false,
+                    is_symlink: false,
+                    size: 0,
+                    mode: 0,
+                    mtime: 0,
+                })
+                .collect(),
+        );
+
+        assert!(!browser.show_hidden());
+        assert!(browser.list_box.row_at_index(1).is_none());
+        assert!(browser.grid_box.child_at_index(1).is_none());
+        for show_hidden in [true, false, true, false] {
+            browser.toggle_show_hidden();
+            assert_eq!(browser.show_hidden(), show_hidden);
+            assert_eq!(browser.entries.borrow().len(), 2);
+            assert!(browser.list_box.row_at_index(0).is_some());
+            assert!(browser.grid_box.child_at_index(0).is_some());
+            assert_eq!(browser.list_box.row_at_index(1).is_some(), show_hidden);
+            assert_eq!(browser.grid_box.child_at_index(1).is_some(), show_hidden);
+        }
+    }
 }
