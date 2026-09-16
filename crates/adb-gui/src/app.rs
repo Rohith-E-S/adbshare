@@ -84,11 +84,6 @@ struct ClipboardFiles {
     entries: Vec<FsDirEntry>,
 }
 
-/// Sidebar geometry: the divider defaults to this and can be dragged down to
-/// the sidebar's 240px minimum (its size request below). GTK exposes no
-/// maximum for the divider, so it can also be dragged wider.
-const SIDEBAR_DEFAULT_WIDTH: i32 = 248;
-
 pub struct AdbshareApp {
     app: adw::Application,
 }
@@ -237,7 +232,7 @@ impl AdbshareApp {
                 .build();
             trans_sub.add_css_class("dim-label");
             trans_box.append(&trans_sub);
-            transfer.transfer_attach(&trans_box);
+            transfer.attach(&trans_box);
             trans_pop.set_child(Some(&trans_box));
 
             // 3. Right: Operations + View + Transfers + Kebab
@@ -296,7 +291,8 @@ impl AdbshareApp {
             view_capsule.set_valign(gtk4::Align::Center);
 
             let view_toggle = gtk4::Button::new();
-            view_toggle.set_child(Some(&hdr_icon("view-grid-symbolic")));
+            let view_icon = hdr_icon("view-list-symbolic");
+            view_toggle.set_child(Some(&view_icon));
             view_toggle.add_css_class("capsule-btn");
             view_toggle.add_css_class("flat");
             view_toggle.set_tooltip_text(Some("Switch to list view"));
@@ -304,6 +300,7 @@ impl AdbshareApp {
             {
                 let browser_vt = browser.clone();
                 let vt = view_toggle.clone();
+                let vi = view_icon.clone();
                 view_toggle.connect_clicked(move |_| {
                     let new_mode = if browser_vt.view_mode() == ViewMode::Grid {
                         ViewMode::List
@@ -312,10 +309,10 @@ impl AdbshareApp {
                     };
                     browser_vt.set_view_mode(new_mode);
                     if new_mode == ViewMode::Grid {
-                        vt.set_icon_name("view-grid-symbolic");
+                        vi.set_icon_name(Some("view-list-symbolic"));
                         vt.set_tooltip_text(Some("Switch to list view"));
                     } else {
-                        vt.set_icon_name("view-list-symbolic");
+                        vi.set_icon_name(Some("view-grid-symbolic"));
                         vt.set_tooltip_text(Some("Switch to grid view"));
                     }
                 });
@@ -421,6 +418,7 @@ impl AdbshareApp {
                 .label("Show hidden files")
                 .margin_start(6)
                 .margin_end(6)
+                .active(browser.show_hidden())
                 .build();
             {
                 let browser_h = browser.clone();
@@ -429,6 +427,15 @@ impl AdbshareApp {
                     kp.popdown();
                     if btn.is_active() != browser_h.show_hidden() {
                         browser_h.toggle_show_hidden();
+                    }
+                });
+            }
+            {
+                let hc = hidden_check.clone();
+                let browser_h = browser.clone();
+                kebab_pop.connect_notify_local(Some("visible"), move |pop, _| {
+                    if pop.is_visible() {
+                        hc.set_active(browser_h.show_hidden());
                     }
                 });
             }
@@ -459,6 +466,7 @@ impl AdbshareApp {
             header_end.append(&kebab);
 
             header.pack_end(&header_end);
+
             main_layout.append(&header);
 
             // Search row: hidden until search toggle is on
@@ -471,7 +479,6 @@ impl AdbshareApp {
             search_row.set_margin_bottom(4);
             search_row.append(&browser.search_entry);
             browser.search_bar.set_child(Some(&search_row));
-            main_layout.append(&browser.search_bar);
 
             // ── Body: responsive overlay split view ─────────────────
             let split_view = adw::OverlaySplitView::new();
@@ -493,6 +500,7 @@ impl AdbshareApp {
             let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             content_box.set_vexpand(true);
             content_box.set_hexpand(true);
+            content_box.append(&browser.search_bar);
             content_box.append(&browser.root);
 
             split_view.set_sidebar(Some(&sidebar_box));
@@ -659,7 +667,10 @@ impl AdbshareApp {
                 }
                 SidebarEvent::SelectLocal(path) => {
                     if !path.is_dir() {
-                        let _ = op_tx_sidebar.try_send((None, Err(format!("{} does not exist (is the folder or Trash empty?)", path.display()))));
+                        let _ = std::fs::create_dir_all(&path);
+                    }
+                    if !path.is_dir() {
+                        let _ = op_tx_sidebar.try_send((None, Err(format!("{} does not exist", path.display()))));
                         return;
                     }
                     handles_sidebar.browser.set_local_mode();
@@ -685,6 +696,16 @@ impl AdbshareApp {
                             return;
                         }
                     };
+                    handles_sidebar.browser.set_device(Some(&device));
+                    let cached = handles_sidebar
+                        .devices
+                        .lock()
+                        .iter()
+                        .find(|d| d.serial == device)
+                        .cloned();
+                    if let Some(ref entry) = cached {
+                        handles_sidebar.browser.set_device_info(entry);
+                    }
                     handles_sidebar.browser.set_loading(true);
                     let dir_tx = dir_tx_sidebar.clone();
                     let path_str = path.to_string_lossy().to_string();
@@ -751,8 +772,8 @@ impl AdbshareApp {
                                     }
                                 }
                             }
-                            // Auto-select the first real device if none selected.
-                            if selected.is_none() {
+                            // Auto-select the first real device if none selected and not browsing local files.
+                            if selected.is_none() && !handles_dev_drain.browser.is_local_mode() {
                                 if let Some(first) = devices.first() {
                                     select_device(&first.serial, &handles_dev_drain, &dir_tx_dev_drain, &info_tx_dev_drain, &mp_tx_dev_drain, rt_dev_drain.clone());
                                 }
@@ -968,8 +989,8 @@ impl AdbshareApp {
                             } else {
                                 ("media-playback-pause-symbolic", "Pause all transfers")
                             };
-                            browser_drain.banner_pause_btn.set_icon_name(icon);
-                            browser_drain.banner_pause_btn.set_tooltip_text(Some(tip));
+                            browser_drain.status_pause_btn.set_icon_name(icon);
+                            browser_drain.status_pause_btn.set_tooltip_text(Some(tip));
                             handles_jobs.dock.update(&jobs, paused);
                             handles_jobs.transfer.update_jobs(jobs);
                         }
@@ -977,6 +998,15 @@ impl AdbshareApp {
                     }
                 }
             });
+
+            if let Ok(ms) = std::env::var("ADB_GUI_AUTOCLOSE_MS") {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    let app = app.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || {
+                        app.quit();
+                    });
+                }
+            }
 
             window.present();
         });
@@ -992,8 +1022,6 @@ struct DeviceInfoDto {
     serial: String,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
-    android_version: Option<String>,
     transport: String,
     #[serde(default)]
     battery_pct: Option<u8>,
@@ -1635,7 +1663,6 @@ fn handle_browser_event(
                 let _ = dir_tx.send((device, parent, res)).await;
             });
         }
-        BrowserEvent::Back | BrowserEvent::Forward => {}
         BrowserEvent::Navigate(path) => {
             if handles.browser.is_local_mode() {
                 refresh_local(dir_tx, &rt, path);
@@ -1704,7 +1731,6 @@ fn handle_browser_event(
                 let _ = dir_tx.send((device, new_path, res)).await;
             });
         }
-        BrowserEvent::Selected(_) => {}
         BrowserEvent::Upload => {
             if handles.browser.is_local_mode() {
                 // Browsing local files: push a chosen file to the connected device.

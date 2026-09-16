@@ -28,11 +28,11 @@ impl TransferDock {
         // the glass background, rounded corners, border glow, and shadow.
         let root = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         root.add_css_class("transfer-dock");
-        root.set_halign(gtk4::Align::Fill);
+        root.set_halign(gtk4::Align::Center);
         root.set_valign(gtk4::Align::End);
         root.set_margin_start(18);
         root.set_margin_end(18);
-        root.set_margin_bottom(12);
+        root.set_margin_bottom(36);
         root.set_visible(false);
 
         // ── Left section: sync icon + summary / speed column ────────────

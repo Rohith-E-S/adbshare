@@ -81,7 +81,6 @@ headerbar .title {
  *  HEADER — pixel-perfect 36px uniform height for every element
  *
  *  GTK4 Button / ToggleButton / MenuButton all have different default
- *  internal padding.  We strip it all and clamp with both min-height
  *  internal padding.  We strip it all and use min-height to force
  *  every element to exactly 36px outer.
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -142,23 +141,36 @@ headerbar .pill-capsule togglebutton > button {
 }
 
 /* --- Standalone pill buttons (transfers, kebab) --- */
-.pill-capsule-btn,
-.pill-capsule-btn.flat,
-headerbar menubutton.pill-capsule-btn > button,
-headerbar menubutton.pill-capsule-btn > button.flat {
+menubutton.pill-capsule-btn {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+}
+
+.pill-capsule-btn:not(menubutton),
+headerbar menubutton.pill-capsule-btn > button {
     background: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 10px;
     padding: 0 10px;
     min-height: 36px;
+    min-width: 36px;
     color: #BFC6D4;
     transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.pill-capsule-btn:hover,
+.pill-capsule-btn:not(menubutton):hover,
 headerbar menubutton.pill-capsule-btn > button:hover {
     background: rgba(255, 255, 255, 0.08);
     border-color: rgba(255, 255, 255, 0.1);
+    color: #FFFFFF;
+}
+
+.pill-capsule-btn:not(menubutton):checked,
+headerbar menubutton.pill-capsule-btn > button:checked {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.15);
     color: #FFFFFF;
 }
 
@@ -170,22 +182,43 @@ headerbar menubutton.pill-capsule-btn > button > .arrow {
     margin: 0;
     padding: 0;
     -gtk-icon-size: 0;
+    opacity: 0;
 }
 
 /* --- Window control buttons (close/minimize/maximize from Adwaita) --- */
-headerbar windowcontrols button {
-    min-width: 30px;
-    min-height: 30px;
-    padding: 0;
-    margin: 2px 1px;
-    border-radius: 9999px;
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    color: #BFC6D4;
+headerbar windowcontrols {
+    border-spacing: 4px;
+    margin-right: 4px;
 }
 
-headerbar windowcontrols button:hover {
-    background: rgba(255, 255, 255, 0.12);
+headerbar windowcontrols button {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    margin: 0 2px;
+}
+
+headerbar windowcontrols button > image {
+    min-width: 26px;
+    min-height: 26px;
+    padding: 0;
+    margin: 0;
+    border-radius: 9999px;
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #BFC6D4;
+    transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+headerbar windowcontrols button:hover > image {
+    background-color: rgba(255, 255, 255, 0.14);
+    border-color: rgba(255, 255, 255, 0.18);
+    color: #FFFFFF;
+}
+
+headerbar windowcontrols button:active > image {
+    background-color: rgba(255, 255, 255, 0.22);
     color: #FFFFFF;
 }
 

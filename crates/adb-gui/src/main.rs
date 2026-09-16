@@ -6,6 +6,8 @@
 //! - Content: per-device view — transfer queue, file browser, settings.
 //! - Header bar: refresh, about, settings.
 
+#![allow(deprecated)]
+
 mod app;
 mod device_list;
 mod file_browser;

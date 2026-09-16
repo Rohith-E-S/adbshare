@@ -339,7 +339,7 @@ impl DeviceList {
         root.append(&hint);
 
         let phone_folders_box = gtk4::ListBox::new();
-        phone_folders_box.set_selection_mode(gtk4::SelectionMode::None);
+        phone_folders_box.set_selection_mode(gtk4::SelectionMode::Single);
         phone_folders_box.add_css_class("sidebar-list");
 
         // (label, icon, device path)
@@ -371,7 +371,7 @@ impl DeviceList {
         root.append(&heading("This computer"));
 
         let local_box = gtk4::ListBox::new();
-        local_box.set_selection_mode(gtk4::SelectionMode::None);
+        local_box.set_selection_mode(gtk4::SelectionMode::Single);
         local_box.add_css_class("sidebar-list");
 
         local_box.append(&shortcut_row(
@@ -400,9 +400,20 @@ impl DeviceList {
 
         // Device list — select a phone.
         let on_ev_dev = on_event.clone();
+        let pf_box_dev = phone_folders_box.clone();
+        let loc_box_dev = local_box.clone();
+        let dev_box = device_list_box.clone();
         device_list_box.connect_row_activated(move |_lb, row| {
             let name = row.widget_name().to_string();
             if !name.is_empty() && name != "__empty__" {
+                let mut child = dev_box.first_child();
+                while let Some(c) = child {
+                    c.remove_css_class("active");
+                    child = c.next_sibling();
+                }
+                row.add_css_class("active");
+                pf_box_dev.unselect_all();
+                loc_box_dev.unselect_all();
                 if let Some(cb) = on_ev_dev.borrow().as_ref() {
                     cb(SidebarEvent::SelectDevice(name));
                 }
@@ -411,7 +422,9 @@ impl DeviceList {
 
         // Phone folders — select a place on the phone.
         let on_ev_phone = on_event.clone();
+        let loc_box_for_pf = local_box.clone();
         phone_folders_box.connect_row_activated(move |_lb, row| {
+            loc_box_for_pf.unselect_all();
             let key = row.widget_name().to_string();
             if let Some(path) = key.strip_prefix("dev:") {
                 if let Some(cb) = on_ev_phone.borrow().as_ref() {
@@ -422,7 +435,15 @@ impl DeviceList {
 
         // Local places — browse the host filesystem.
         let on_ev_local = on_event.clone();
+        let pf_box_for_loc = phone_folders_box.clone();
+        let dev_box_for_loc = device_list_box.clone();
         local_box.connect_row_activated(move |_lb, row| {
+            pf_box_for_loc.unselect_all();
+            let mut child = dev_box_for_loc.first_child();
+            while let Some(c) = child {
+                c.remove_css_class("active");
+                child = c.next_sibling();
+            }
             let key = row.widget_name().to_string();
             let target = match key.strip_prefix("local:") {
                 Some("HOME") => dirs::home_dir(),
@@ -479,9 +500,7 @@ impl DeviceList {
         *self.last_applied.borrow_mut() = Some(next);
 
         // Clear existing children.
-        while let Some(child) = self.device_list_box.first_child() {
-            self.device_list_box.remove(&child);
-        }
+        self.clear();
 
         if devices.is_empty() {
             self.device_list_box.append(&onboarding_row());

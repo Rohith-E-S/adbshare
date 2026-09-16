@@ -128,7 +128,7 @@ impl Message {
     }
 
     pub fn decode(header: &[u8; Self::HEADER_LEN], payload: Bytes) -> crate::Result<Self> {
-        let mut h = &header[..];
+        let h = &header[..];
         let command = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
         let arg0 = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
         let arg1 = u32::from_le_bytes([h[8], h[9], h[10], h[11]]);

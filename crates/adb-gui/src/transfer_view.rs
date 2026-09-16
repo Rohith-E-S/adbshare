@@ -138,16 +138,6 @@ impl TransferView {
         parent.append(&self.root);
     }
 
-    /// Used when the caller wants to add a header label above the transfer
-    /// list: they own the wrapping box and call this on it.
-    pub fn transfer_attach(&self, parent: &gtk4::Box) {
-        parent.append(&self.root);
-    }
-
-    pub fn root_box(&self) -> &gtk4::Box {
-        &self.root
-    }
-
     /// Rebuild the entire list from the supplied jobs.
     ///
     /// Jobs are bounded by queue depth so a full rebuild is cheap and avoids
