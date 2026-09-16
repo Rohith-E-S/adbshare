@@ -26,11 +26,26 @@ pub struct DirEntry {
 /// GdkPixbuf loads SVGs from files.
 const ASSET_ICONS: &[(&str, &[u8])] = &[
     ("folder.png", include_bytes!("assets/folder.png")),
-    ("folder-documents.png", include_bytes!("assets/folder-documents.png")),
-    ("folder-download.png", include_bytes!("assets/folder-download.png")),
-    ("folder-music.png", include_bytes!("assets/folder-music.png")),
-    ("folder-pictures.png", include_bytes!("assets/folder-pictures.png")),
-    ("folder-videos.png", include_bytes!("assets/folder-videos.png")),
+    (
+        "folder-documents.png",
+        include_bytes!("assets/folder-documents.png"),
+    ),
+    (
+        "folder-download.png",
+        include_bytes!("assets/folder-download.png"),
+    ),
+    (
+        "folder-music.png",
+        include_bytes!("assets/folder-music.png"),
+    ),
+    (
+        "folder-pictures.png",
+        include_bytes!("assets/folder-pictures.png"),
+    ),
+    (
+        "folder-videos.png",
+        include_bytes!("assets/folder-videos.png"),
+    ),
     ("camera.svg", include_bytes!("assets/camera.svg")),
     ("documents.svg", include_bytes!("assets/documents.svg")),
     ("magisk.svg", include_bytes!("assets/magisk.svg")),
@@ -72,7 +87,11 @@ fn asset_icon_for(entry: &DirEntry) -> Option<&'static str> {
             "folder-download.png"
         } else if lower == "music" {
             "folder-music.png"
-        } else if lower.contains("screenshot") || lower.contains("camera") || lower == "dcim" || lower == "pictures" {
+        } else if lower.contains("screenshot")
+            || lower.contains("camera")
+            || lower == "dcim"
+            || lower == "pictures"
+        {
             "folder-pictures.png"
         } else if lower == "videos" || lower == "movies" || lower == "video" {
             "folder-videos.png"
@@ -85,7 +104,11 @@ fn asset_icon_for(entry: &DirEntry) -> Option<&'static str> {
         Some("apk.svg")
     } else if lower.ends_with(".zip") || lower.ends_with(".7z") || lower.ends_with(".rar") {
         Some("zip.svg")
-    } else if lower.ends_with(".tar") || lower.ends_with(".gz") || lower.ends_with(".tgz") || lower.ends_with(".xz") {
+    } else if lower.ends_with(".tar")
+        || lower.ends_with(".gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".xz")
+    {
         Some("tar.svg")
     } else if lower.ends_with(".pdf")
         || lower.ends_with(".doc")
@@ -112,11 +135,25 @@ fn asset_icon_for(entry: &DirEntry) -> Option<&'static str> {
         || lower.ends_with(".aac")
     {
         Some("podcasts.svg")
-    } else if lower.ends_with(".txt") || lower.ends_with(".log") || lower.ends_with(".json") || lower.ends_with(".xml") {
+    } else if lower.ends_with(".txt")
+        || lower.ends_with(".log")
+        || lower.ends_with(".json")
+        || lower.ends_with(".xml")
+    {
         Some("txt.svg")
-    } else if lower.ends_with(".mp4") || lower.ends_with(".mkv") || lower.ends_with(".avi") || lower.ends_with(".webm") || lower.ends_with(".mov") {
+    } else if lower.ends_with(".mp4")
+        || lower.ends_with(".mkv")
+        || lower.ends_with(".avi")
+        || lower.ends_with(".webm")
+        || lower.ends_with(".mov")
+    {
         Some("movie.svg")
-    } else if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".webp") || lower.ends_with(".gif") {
+    } else if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".gif")
+    {
         Some("wallpaper.svg")
     } else {
         None
@@ -124,7 +161,10 @@ fn asset_icon_for(entry: &DirEntry) -> Option<&'static str> {
 }
 
 /// Selected entries in the list view (indexes map to the entries vec).
-fn selected_entries_from_list(list_box: &gtk4::ListBox, entries: &Rc<RefCell<Vec<DirEntry>>>) -> Vec<DirEntry> {
+fn selected_entries_from_list(
+    list_box: &gtk4::ListBox,
+    entries: &Rc<RefCell<Vec<DirEntry>>>,
+) -> Vec<DirEntry> {
     let entries = entries.borrow();
     list_box
         .selected_rows()
@@ -137,7 +177,10 @@ fn selected_entries_from_list(list_box: &gtk4::ListBox, entries: &Rc<RefCell<Vec
 }
 
 /// Selected entries in the grid view (cards carry their entry name).
-fn selected_entries_from_grid(grid_box: &gtk4::FlowBox, entries: &Rc<RefCell<Vec<DirEntry>>>) -> Vec<DirEntry> {
+fn selected_entries_from_grid(
+    grid_box: &gtk4::FlowBox,
+    entries: &Rc<RefCell<Vec<DirEntry>>>,
+) -> Vec<DirEntry> {
     let entries = entries.borrow();
     grid_box
         .selected_children()
@@ -151,12 +194,17 @@ fn selected_entries_from_grid(grid_box: &gtk4::FlowBox, entries: &Rc<RefCell<Vec
 
 impl DirEntry {
     pub fn display_size(&self) -> String {
-        if self.is_dir { return "Folder".to_string(); }
+        if self.is_dir {
+            return "Folder".to_string();
+        }
         let mut s = self.size as f64;
         for unit in ["B", "KB", "MB", "GB", "TB"] {
             if s < 1024.0 {
-                return if unit == "B" { format!("{} {}", s as u64, unit) }
-                        else { format!("{:.1} {}", s, unit) };
+                return if unit == "B" {
+                    format!("{} {}", s as u64, unit)
+                } else {
+                    format!("{:.1} {}", s, unit)
+                };
             }
             s /= 1024.0;
         }
@@ -164,7 +212,9 @@ impl DirEntry {
     }
 
     pub fn display_date(&self) -> String {
-        if self.mtime <= 0 { return String::new(); }
+        if self.mtime <= 0 {
+            return String::new();
+        }
         let days = self.mtime / 86400;
         let secs = (self.mtime % 86400).abs() as u32;
         let hours = secs / 3600;
@@ -178,25 +228,52 @@ impl DirEntry {
             return "folder-symbolic";
         }
         let lower = self.name.to_lowercase();
-        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
-            || lower.ends_with(".webp") || lower.ends_with(".gif") || lower.ends_with(".svg") {
+        if lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp")
+            || lower.ends_with(".gif")
+            || lower.ends_with(".svg")
+        {
             "image-x-generic-symbolic"
-        } else if lower.ends_with(".mp4") || lower.ends_with(".mkv") || lower.ends_with(".avi")
-            || lower.ends_with(".webm") || lower.ends_with(".mov") {
+        } else if lower.ends_with(".mp4")
+            || lower.ends_with(".mkv")
+            || lower.ends_with(".avi")
+            || lower.ends_with(".webm")
+            || lower.ends_with(".mov")
+        {
             "video-x-generic-symbolic"
-        } else if lower.ends_with(".mp3") || lower.ends_with(".flac") || lower.ends_with(".ogg")
-            || lower.ends_with(".wav") || lower.ends_with(".m4a") || lower.ends_with(".aac") {
+        } else if lower.ends_with(".mp3")
+            || lower.ends_with(".flac")
+            || lower.ends_with(".ogg")
+            || lower.ends_with(".wav")
+            || lower.ends_with(".m4a")
+            || lower.ends_with(".aac")
+        {
             "audio-x-generic-symbolic"
-        } else if lower.ends_with(".pdf") || lower.ends_with(".doc") || lower.ends_with(".docx")
-            || lower.ends_with(".epub") {
+        } else if lower.ends_with(".pdf")
+            || lower.ends_with(".doc")
+            || lower.ends_with(".docx")
+            || lower.ends_with(".epub")
+        {
             "x-office-document-symbolic"
         } else if lower.ends_with(".apk") {
             "application-x-executable-symbolic"
-        } else if lower.ends_with(".zip") || lower.ends_with(".tar") || lower.ends_with(".gz")
-            || lower.ends_with(".7z") || lower.ends_with(".rar") {
+        } else if lower.ends_with(".zip")
+            || lower.ends_with(".tar")
+            || lower.ends_with(".gz")
+            || lower.ends_with(".7z")
+            || lower.ends_with(".rar")
+        {
             "package-x-generic-symbolic"
-        } else if lower.ends_with(".xml") || lower.ends_with(".json") || lower.ends_with(".txt")
-            || lower.ends_with(".log") || lower.ends_with(".rs") || lower.ends_with(".py") || lower.ends_with(".sh") {
+        } else if lower.ends_with(".xml")
+            || lower.ends_with(".json")
+            || lower.ends_with(".txt")
+            || lower.ends_with(".log")
+            || lower.ends_with(".rs")
+            || lower.ends_with(".py")
+            || lower.ends_with(".sh")
+        {
             "text-x-generic-symbolic"
         } else if self.is_symlink {
             "emblem-symbolic-link-symbolic"
@@ -206,9 +283,15 @@ impl DirEntry {
     }
 
     pub fn file_type_desc(&self) -> &'static str {
-        if self.is_dir { return "Folder"; }
+        if self.is_dir {
+            return "Folder";
+        }
         let lower = self.name.to_lowercase();
-        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".webp") {
+        if lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp")
+        {
             "Image"
         } else if lower.ends_with(".mp4") || lower.ends_with(".mkv") || lower.ends_with(".webm") {
             "Video"
@@ -388,7 +471,9 @@ pub struct FileBrowser {
 }
 
 impl Default for FileBrowser {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FileBrowser {
@@ -399,23 +484,21 @@ impl FileBrowser {
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         root.add_css_class("file-canvas");
 
-        // --- Context bar: one line that answers "where am I?" ---
-        // Left: device icon + "Phone name — folder" + dimmed meta line.
-        // Right: item count + refresh. Always visible, never two strips.
-        let info_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+        // ── Context bar: location & metadata at a glance ────────
+        let info_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
         info_bar.add_css_class("context-bar");
-        info_bar.set_margin_start(14);
+        info_bar.set_margin_start(10);
         info_bar.set_margin_end(10);
         info_bar.set_margin_top(8);
-        info_bar.set_margin_bottom(6);
+        info_bar.set_margin_bottom(4);
 
         let info_icon = gtk4::Image::from_icon_name("phone-symbolic");
-        info_icon.set_pixel_size(20);
+        info_icon.set_pixel_size(22);
         info_icon.add_css_class("context-icon");
         info_icon.set_valign(gtk4::Align::Center);
         info_bar.append(&info_icon);
 
-        let info_text = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let info_text = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
         info_text.set_hexpand(true);
         let info_title = gtk4::Label::builder()
             .label("No phone connected")
@@ -425,7 +508,7 @@ impl FileBrowser {
         info_title.add_css_class("context-title");
         info_text.append(&info_title);
         let info_subtitle = gtk4::Label::builder()
-            .label("Connect a phone with USB or Wi-Fi to get started.")
+            .label("Connect a phone with USB or Wi\u{2011}Fi to get started.")
             .xalign(0.0)
             .ellipsize(gtk4::pango::EllipsizeMode::End)
             .build();
@@ -433,10 +516,7 @@ impl FileBrowser {
         info_text.append(&info_subtitle);
         info_bar.append(&info_text);
 
-        let info_count = gtk4::Label::builder()
-            .label("")
-            .xalign(1.0)
-            .build();
+        let info_count = gtk4::Label::builder().label("").xalign(1.0).build();
         info_count.add_css_class("context-count");
         info_count.set_valign(gtk4::Align::Center);
         info_bar.append(&info_count);
@@ -448,16 +528,25 @@ impl FileBrowser {
         search_entry.set_placeholder_text(Some("Search files and folders..."));
         search_bar.connect_entry(&search_entry);
 
-        // --- Navigation Controls (for headerbar / actions) ---
-        let back_button = gtk4::Button::from_icon_name("go-previous-symbolic");
+        // ── Navigation buttons (packed into the header capsule by app.rs) ──
+        // Using explicit 16px icon children for uniform sizing in the header.
+        let nav_icon = |name: &str| -> gtk4::Image {
+            let img = gtk4::Image::from_icon_name(name);
+            img.set_pixel_size(16);
+            img
+        };
+        let back_button = gtk4::Button::new();
+        back_button.set_child(Some(&nav_icon("go-previous-symbolic")));
         back_button.set_tooltip_text(Some("Back (Alt+Left)"));
         back_button.set_sensitive(false);
 
-        let forward_button = gtk4::Button::from_icon_name("go-next-symbolic");
+        let forward_button = gtk4::Button::new();
+        forward_button.set_child(Some(&nav_icon("go-next-symbolic")));
         forward_button.set_tooltip_text(Some("Forward (Alt+Right)"));
         forward_button.set_sensitive(false);
 
-        let up_button = gtk4::Button::from_icon_name("go-up-symbolic");
+        let up_button = gtk4::Button::new();
+        up_button.set_child(Some(&nav_icon("go-up-symbolic")));
         up_button.set_tooltip_text(Some("Parent Folder (Alt+Up)"));
         up_button.set_sensitive(false);
 
@@ -490,14 +579,14 @@ impl FileBrowser {
         path_stack.set_visible_child_name("breadcrumbs");
 
         let path_edit_toggle = gtk4::ToggleButton::builder()
-            .icon_name("document-edit-symbolic")
             .tooltip_text("Toggle Path Entry (Ctrl+L)")
             .build();
+        path_edit_toggle.set_child(Some(&nav_icon("document-edit-symbolic")));
 
         let search_button = gtk4::ToggleButton::builder()
-            .icon_name("edit-find-symbolic")
             .tooltip_text("Search files (Ctrl+F)")
             .build();
+        search_button.set_child(Some(&nav_icon("edit-find-symbolic")));
 
         // NOTE: GTK4 shows either a button's icon-name OR its label, never
         // both — so primary actions get an explicit icon+label child box.
@@ -537,24 +626,20 @@ impl FileBrowser {
         let refresh_button = gtk4::Button::from_icon_name("view-refresh-symbolic");
         refresh_button.set_tooltip_text(Some("Reload (F5)"));
 
-        // --- File View Stack (Grid View & List View) ---
+        // ── File View Stack (Grid + List) ──────────────────────
         let grid_box = gtk4::FlowBox::new();
-        // MULTIPLE enables Ctrl+click, Shift+click and rubber-band selection.
         grid_box.set_selection_mode(gtk4::SelectionMode::Multiple);
         grid_box.set_activate_on_single_click(false);
         grid_box.set_homogeneous(false);
-        grid_box.set_column_spacing(8);
-        grid_box.set_row_spacing(12);
-        // Let the row fill the viewport: many narrow columns on wide
-        // windows, fewer on narrow ones. min 1 (not 3) so a half-tiled
-        // window reflows to fewer columns instead of clipping the last one.
+        grid_box.set_column_spacing(6);
+        grid_box.set_row_spacing(10);
         grid_box.set_max_children_per_line(24);
         grid_box.set_min_children_per_line(1);
         grid_box.set_valign(gtk4::Align::Start);
-        grid_box.set_margin_start(12);
-        grid_box.set_margin_end(12);
-        grid_box.set_margin_top(10);
-        grid_box.set_margin_bottom(12);
+        grid_box.set_margin_start(10);
+        grid_box.set_margin_end(10);
+        grid_box.set_margin_top(8);
+        grid_box.set_margin_bottom(10);
 
         let grid_scroll = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -563,7 +648,6 @@ impl FileBrowser {
             .build();
         grid_scroll.set_child(Some(&grid_box));
 
-        // Overlay hosts the rubber-band selection rectangle.
         let grid_overlay = gtk4::Overlay::new();
         grid_overlay.set_child(Some(&grid_scroll));
 
@@ -571,10 +655,10 @@ impl FileBrowser {
         list_box.set_selection_mode(gtk4::SelectionMode::Multiple);
         list_box.set_activate_on_single_click(false);
         list_box.add_css_class("file-list-view");
-        list_box.set_margin_start(12);
-        list_box.set_margin_end(12);
-        list_box.set_margin_top(6);
-        list_box.set_margin_bottom(6);
+        list_box.set_margin_start(10);
+        list_box.set_margin_end(10);
+        list_box.set_margin_top(4);
+        list_box.set_margin_bottom(4);
 
         let list_scroll = gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -591,7 +675,7 @@ impl FileBrowser {
 
         let status = adw::StatusPage::builder()
             .title("Connect your phone")
-            .description("Plug it in with USB, allow USB debugging on the phone, then pick it in the sidebar. Or browse This computer on the left.")
+            .description("Plug in via USB, allow debugging, then pick the device in the sidebar.\nOr browse your local files under \u{201C}This computer.\u{201D}")
             .icon_name("phone-symbolic")
             .vexpand(true)
             .build();
@@ -734,7 +818,9 @@ impl FileBrowser {
         }
     }
 
-    pub fn view_mode(&self) -> ViewMode { *self.view_mode.borrow() }
+    pub fn view_mode(&self) -> ViewMode {
+        *self.view_mode.borrow()
+    }
 
     pub fn set_view_mode(&self, mode: ViewMode) {
         *self.view_mode.borrow_mut() = mode;
@@ -824,10 +910,8 @@ impl FileBrowser {
         let total = folders + files;
         let sel = self.selected_entries().len();
         if sel > 0 {
-            self.status_label.set_label(&format!(
-                "{} of {} selected",
-                sel, total
-            ));
+            self.status_label
+                .set_label(&format!("{} of {} selected", sel, total));
         } else if total == 0 {
             self.status_label.set_label("This folder is empty");
         } else if hidden > 0 {
@@ -858,7 +942,8 @@ impl FileBrowser {
             self.set_buttons_sensitive(true);
             self.show_list();
             self.info_title.set_label(dev);
-            self.info_subtitle.set_label(&format!("Connected • {}", dev));
+            self.info_subtitle
+                .set_label(&format!("Connected • {}", dev));
             self.info_icon.set_icon_name(Some("phone-symbolic"));
             self.render_breadcrumbs(&PathBuf::from("/"));
         } else {
@@ -877,8 +962,12 @@ impl FileBrowser {
         *self.device_display.borrow_mut() = name.to_string();
     }
 
-    pub fn current_path(&self) -> PathBuf { self.current_path.borrow().clone() }
-    pub fn device(&self) -> Option<String> { self.device.borrow().clone() }
+    pub fn current_path(&self) -> PathBuf {
+        self.current_path.borrow().clone()
+    }
+    pub fn device(&self) -> Option<String> {
+        self.device.borrow().clone()
+    }
 
     /// Switch to browsing this computer's files.
     pub fn set_local_mode(&self) {
@@ -889,19 +978,25 @@ impl FileBrowser {
         self.history_back.borrow_mut().clear();
         self.history_forward.borrow_mut().clear();
         self.set_buttons_sensitive(true);
-        self.info_icon.set_icon_name(Some("drive-harddisk-symbolic"));
+        self.info_icon
+            .set_icon_name(Some("drive-harddisk-symbolic"));
         self.info_title.set_label("This computer");
-        self.info_subtitle.set_label("Your Linux files — pick a folder in the sidebar.");
+        self.info_subtitle
+            .set_label("Your Linux files — pick a folder in the sidebar.");
         self.show_list();
         self.update_nav_buttons();
     }
 
-    pub fn is_local_mode(&self) -> bool { *self.local_mode.borrow() }
+    pub fn is_local_mode(&self) -> bool {
+        *self.local_mode.borrow()
+    }
 
     /// Navigate back through history (button + Alt+Left).
     pub fn go_back(&self) {
         if let Some(prev) = self.history_back.borrow_mut().pop() {
-            self.history_forward.borrow_mut().push(self.current_path.borrow().clone());
+            self.history_forward
+                .borrow_mut()
+                .push(self.current_path.borrow().clone());
             // show_path must not re-push the abandoned path onto history_back.
             self.navigating_history.set(true);
             if let Some(cb) = self.on_event.borrow().as_ref() {
@@ -914,7 +1009,9 @@ impl FileBrowser {
     /// Navigate forward through history (button + Alt+Right).
     pub fn go_forward(&self) {
         if let Some(next) = self.history_forward.borrow_mut().pop() {
-            self.history_back.borrow_mut().push(self.current_path.borrow().clone());
+            self.history_back
+                .borrow_mut()
+                .push(self.current_path.borrow().clone());
             // show_path must not re-push the abandoned path onto history_back.
             self.navigating_history.set(true);
             if let Some(cb) = self.on_event.borrow().as_ref() {
@@ -950,11 +1047,18 @@ impl FileBrowser {
         self.set_entries(all);
     }
 
-    pub fn show_hidden(&self) -> bool { *self.show_hidden.borrow() }
+    pub fn show_hidden(&self) -> bool {
+        *self.show_hidden.borrow()
+    }
 
     /// Select every entry in the active view (Ctrl+A / kebab menu).
     pub fn select_all_active(&self) {
-        if self.file_view_stack.visible_child_name().map(|n| n == "grid").unwrap_or(true) {
+        if self
+            .file_view_stack
+            .visible_child_name()
+            .map(|n| n == "grid")
+            .unwrap_or(true)
+        {
             self.grid_box.select_all();
         } else {
             self.list_box.select_all();
@@ -982,9 +1086,13 @@ impl FileBrowser {
 
     /// FUSE-backed local path for image preview (same mapping as drag-out;
     /// None when unmounted). No persistent cache yet.
-    fn fuse_preview_path(&self, name: &str) -> Option<PathBuf> { self.dnd_fs_path(name) }
+    fn fuse_preview_path(&self, name: &str) -> Option<PathBuf> {
+        self.dnd_fs_path(name)
+    }
 
-    pub fn fuse_mount(&self) -> Option<String> { self.fuse_mount.borrow().clone() }
+    pub fn fuse_mount(&self) -> Option<String> {
+        self.fuse_mount.borrow().clone()
+    }
 
     /// The filesystem path an entry maps to for drag & drop: the local path
     /// in local mode, the FUSE-mounted path in device mode (None if unmounted).
@@ -994,7 +1102,10 @@ impl FileBrowser {
         if self.is_local_mode() {
             Some(p)
         } else {
-            self.fuse_mount.borrow().as_ref().map(|mp| PathBuf::from(format!("{}{}", mp, p.display())))
+            self.fuse_mount
+                .borrow()
+                .as_ref()
+                .map(|mp| PathBuf::from(format!("{}{}", mp, p.display())))
         }
     }
 
@@ -1004,10 +1115,13 @@ impl FileBrowser {
         drag.set_actions(gdk4::DragAction::COPY | gdk4::DragAction::MOVE);
         let fs_path = self.dnd_fs_path(name);
         drag.connect_prepare(move |_src, _x, _y| {
-            let Some(fs_path) = fs_path.clone() else { return None };
+            let Some(fs_path) = fs_path.clone() else {
+                return None;
+            };
             let file = gtk4::gio::File::for_path(&fs_path);
             let file_prov = gdk4::ContentProvider::for_value(&file.to_value());
-            let text_prov = gdk4::ContentProvider::for_value(&fs_path.to_string_lossy().to_string().to_value());
+            let text_prov =
+                gdk4::ContentProvider::for_value(&fs_path.to_string_lossy().to_string().to_value());
             Some(gdk4::ContentProvider::new_union(&[file_prov, text_prov]))
         });
         widget.add_controller(drag);
@@ -1023,13 +1137,18 @@ impl FileBrowser {
         let curr = self.current_path.clone();
         let dir_name = dir_name.to_string();
         drop.connect_drop(move |_target, value, _x, _y| {
-            let dropped: Option<PathBuf> = value.get::<gtk4::gio::File>().ok().and_then(|f| f.path());
+            let dropped: Option<PathBuf> =
+                value.get::<gtk4::gio::File>().ok().and_then(|f| f.path());
             let Some(src) = dropped else { return false };
             let mut target_dir = curr.borrow().clone();
             target_dir.push(&dir_name);
             let from_dir = curr.borrow().clone();
             if let Some(cb) = on_ev.borrow().as_ref() {
-                cb(BrowserEvent::DropFiles { from_dir, target_dir, files: vec![src] });
+                cb(BrowserEvent::DropFiles {
+                    from_dir,
+                    target_dir,
+                    files: vec![src],
+                });
             }
             true
         });
@@ -1062,7 +1181,11 @@ impl FileBrowser {
                     "Folder".to_string()
                 } else {
                     let d = e.display_date();
-                    if d.is_empty() { e.display_size() } else { format!("{} • {}", e.display_size(), d) }
+                    if d.is_empty() {
+                        e.display_size()
+                    } else {
+                        format!("{} • {}", e.display_size(), d)
+                    }
                 })
                 .activatable(true)
                 .build();
@@ -1198,8 +1321,6 @@ impl FileBrowser {
             grid_title.add_css_class("grid-item-title");
             card.append(&grid_title);
 
-
-
             // Right-click: select-under-cursor, then selection-aware menu.
             let card_rc = gtk4::GestureClick::new();
             card_rc.set_button(3);
@@ -1271,12 +1392,10 @@ impl FileBrowser {
 
         // Context bar keeps the human-readable location: folder name as the
         // title, full path as the subtitle. No "device:x:" prefixes.
-        let folder = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("/");
+        let folder = path.file_name().and_then(|n| n.to_str()).unwrap_or("/");
         if self.is_local_mode() {
-            self.info_icon.set_icon_name(Some("drive-harddisk-symbolic"));
+            self.info_icon
+                .set_icon_name(Some("drive-harddisk-symbolic"));
             if path.as_os_str() == "/" {
                 self.info_title.set_label("This computer");
             } else {
@@ -1286,15 +1405,19 @@ impl FileBrowser {
         } else if let Some(dev) = self.device.borrow().clone() {
             let pretty = friendly_folder(folder, &path);
             self.info_title.set_label(&pretty);
-            self.info_subtitle
-                .set_label(&format!("{} • {}", dev_short(&dev), path.to_string_lossy()));
+            self.info_subtitle.set_label(&format!(
+                "{} • {}",
+                dev_short(&dev),
+                path.to_string_lossy()
+            ));
         }
         self.update_nav_buttons();
     }
 
     pub fn set_loading(&self, loading: bool) {
         self.refresh_button.set_sensitive(!loading);
-        self.up_button.set_sensitive(!loading && *self.current_path.borrow() != PathBuf::from("/"));
+        self.up_button
+            .set_sensitive(!loading && *self.current_path.borrow() != PathBuf::from("/"));
         // Visible feedback: the refresh action lives in the overflow menu, so
         // mirror the state in the status bar (unless a transfer owns it).
         if loading && !self.status_progress.is_visible() {
@@ -1376,7 +1499,7 @@ impl FileBrowser {
             let comps: Vec<_> = path.iter().filter(|c| *c != "/").collect();
             let mut accum = PathBuf::from("/");
             for (i, comp) in comps.iter().enumerate() {
-                let sep = gtk4::Label::new(Some("/"));
+                let sep = gtk4::Label::new(Some("›"));
                 sep.add_css_class("nav-pill-sep");
                 self.breadcrumb_container.append(&sep);
 
@@ -1434,8 +1557,8 @@ impl FileBrowser {
             return;
         }
 
-        // Separator /
-        let sep0 = gtk4::Label::new(Some("/"));
+        // Separator ›
+        let sep0 = gtk4::Label::new(Some("›"));
         sep0.add_css_class("nav-pill-sep");
         self.breadcrumb_container.append(&sep0);
 
@@ -1458,7 +1581,7 @@ impl FileBrowser {
             let comps: Vec<_> = rest.iter().filter(|c| *c != "").collect();
             let mut accum = PathBuf::from("/sdcard");
             for (i, comp) in comps.iter().enumerate() {
-                let sep = gtk4::Label::new(Some("/"));
+                let sep = gtk4::Label::new(Some("›"));
                 sep.add_css_class("nav-pill-sep");
                 self.breadcrumb_container.append(&sep);
 
@@ -1485,7 +1608,7 @@ impl FileBrowser {
             let comps: Vec<_> = path.iter().filter(|c| *c != "/").collect();
             let mut accum = PathBuf::from("/");
             for (i, comp) in comps.iter().enumerate() {
-                let sep = gtk4::Label::new(Some("/"));
+                let sep = gtk4::Label::new(Some("›"));
                 sep.add_css_class("nav-pill-sep");
                 self.breadcrumb_container.append(&sep);
 
@@ -1527,7 +1650,8 @@ impl FileBrowser {
         }
         {
             let browser = self.clone();
-            self.forward_button.connect_clicked(move |_| browser.go_forward());
+            self.forward_button
+                .connect_clicked(move |_| browser.go_forward());
         }
 
         // Refresh
@@ -1663,7 +1787,9 @@ impl FileBrowser {
         self.list_box.set_filter_func(move |row| {
             let q = search_query_filter.borrow();
             let query = q.trim().to_lowercase();
-            if query.is_empty() { return true; }
+            if query.is_empty() {
+                return true;
+            }
             if let Some(ar) = row.downcast_ref::<adw::ActionRow>() {
                 ar.title().to_lowercase().contains(&query)
             } else {
@@ -1675,7 +1801,9 @@ impl FileBrowser {
         self.grid_box.set_filter_func(move |child| {
             let q = search_query_grid.borrow();
             let query = q.trim().to_lowercase();
-            if query.is_empty() { return true; }
+            if query.is_empty() {
+                return true;
+            }
             if let Some(inner) = child.child() {
                 inner.widget_name().to_lowercase().contains(&query)
             } else {
@@ -1863,12 +1991,15 @@ impl FileBrowser {
         });
 
         drag.connect_drag_update(move |d, ox, oy| {
-            let (Some((gx, gy)), Some((sx, sy))) =
-                (start_grid_update.borrow().as_ref().copied(), start_ov_update.borrow().as_ref().copied())
-            else {
+            let (Some((gx, gy)), Some((sx, sy))) = (
+                start_grid_update.borrow().as_ref().copied(),
+                start_ov_update.borrow().as_ref().copied(),
+            ) else {
                 return;
             };
-            let Some(band_box) = band_update.borrow().as_ref().cloned() else { return };
+            let Some(band_box) = band_update.borrow().as_ref().cloned() else {
+                return;
+            };
 
             let cur = grid_update.translate_coordinates(&overlay_update, gx + ox, gy + oy);
             let Some((cx, cy)) = cur else { return };
@@ -1887,8 +2018,12 @@ impl FileBrowser {
             let mut child = grid_update.first_child();
             while let Some(fc) = child {
                 child = fc.next_sibling();
-                let Ok(fcc) = fc.downcast::<gtk4::FlowBoxChild>() else { continue };
-                let Some((ax, ay)) = fcc.translate_coordinates(&overlay_update, 0.0, 0.0) else { continue };
+                let Ok(fcc) = fc.downcast::<gtk4::FlowBoxChild>() else {
+                    continue;
+                };
+                let Some((ax, ay)) = fcc.translate_coordinates(&overlay_update, 0.0, 0.0) else {
+                    continue;
+                };
                 let alloc = fcc.allocation();
                 let (ax2, ay2) = (ax + alloc.width() as f64, ay + alloc.height() as f64);
                 let intersects = ax < rect.2 && ax2 > rect.0 && ay < rect.3 && ay2 > rect.1;
@@ -1940,7 +2075,10 @@ impl FileBrowser {
 
         let add_shortcut = |trigger: &str, action: gtk4::CallbackAction| {
             if let Some(t) = gtk4::ShortcutTrigger::parse_string(trigger) {
-                shortcuts.add_shortcut(gtk4::Shortcut::new(Some(t), Some(action.upcast::<gtk4::ShortcutAction>())));
+                shortcuts.add_shortcut(gtk4::Shortcut::new(
+                    Some(t),
+                    Some(action.upcast::<gtk4::ShortcutAction>()),
+                ));
             }
         };
         let emit_ev = |on_ev: &Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>>, ev: BrowserEvent| {
@@ -1948,7 +2086,12 @@ impl FileBrowser {
                 cb(ev);
             }
         };
-        let view_is_grid = |stack: &gtk4::Stack| stack.visible_child_name().map(|n| n == "grid").unwrap_or(true);
+        let view_is_grid = |stack: &gtk4::Stack| {
+            stack
+                .visible_child_name()
+                .map(|n| n == "grid")
+                .unwrap_or(true)
+        };
 
         // Ctrl+A / Escape — select all / clear selection
         {
@@ -1956,53 +2099,102 @@ impl FileBrowser {
             let list = self.list_box.clone();
             let stack = self.file_view_stack.clone();
             let root_sel = self.root.clone();
-            add_shortcut("<Control>a", gtk4::CallbackAction::new(move |_, _| {
-                if focus_in_editable(&root_sel) { return glib::Propagation::Proceed; }
-                if view_is_grid(&stack) { grid.select_all(); } else { list.select_all(); }
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control>a",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if focus_in_editable(&root_sel) {
+                        return glib::Propagation::Proceed;
+                    }
+                    if view_is_grid(&stack) {
+                        grid.select_all();
+                    } else {
+                        list.select_all();
+                    }
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let grid = self.grid_box.clone();
             let list = self.list_box.clone();
             let stack = self.file_view_stack.clone();
-            add_shortcut("Escape", gtk4::CallbackAction::new(move |_, _| {
-                if view_is_grid(&stack) { grid.unselect_all(); } else { list.unselect_all(); }
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "Escape",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if view_is_grid(&stack) {
+                        grid.unselect_all();
+                    } else {
+                        list.unselect_all();
+                    }
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         // Delete — delete the selection (with confirmation)
         {
             let browser = self.clone();
-            add_shortcut("Delete", gtk4::CallbackAction::new(move |_, _| {
-                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
-                let sel = browser.selected_entries();
-                if !sel.is_empty() {
-                    let label = if sel.len() == 1 { sel[0].name.clone() } else { format!("{} items", sel.len()) };
-                    if let Some(w) = browser.root.root() {
-                        show_delete_dialog(&w, &label, sel, &browser.on_event);
+            add_shortcut(
+                "Delete",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if focus_in_editable(&browser.root) {
+                        return glib::Propagation::Proceed;
                     }
-                }
-                glib::Propagation::Proceed
-            }));
+                    let sel = browser.selected_entries();
+                    if !sel.is_empty() {
+                        let label = if sel.len() == 1 {
+                            sel[0].name.clone()
+                        } else {
+                            format!("{} items", sel.len())
+                        };
+                        if let Some(w) = browser.root.root() {
+                            show_delete_dialog(&w, &label, sel, &browser.on_event);
+                        }
+                    }
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         // Alt+Left / Alt+Right / Alt+Up — history & parent
         {
             let browser = self.clone();
-            add_shortcut("<Alt>Left", gtk4::CallbackAction::new(move |_, _| { browser.go_back(); glib::Propagation::Proceed }));
+            add_shortcut(
+                "<Alt>Left",
+                gtk4::CallbackAction::new(move |_, _| {
+                    browser.go_back();
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let browser = self.clone();
-            add_shortcut("<Alt>Right", gtk4::CallbackAction::new(move |_, _| { browser.go_forward(); glib::Propagation::Proceed }));
+            add_shortcut(
+                "<Alt>Right",
+                gtk4::CallbackAction::new(move |_, _| {
+                    browser.go_forward();
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let on_ev = self.on_event.clone();
-            add_shortcut("<Alt>Up", gtk4::CallbackAction::new(move |_, _| { emit_ev(&on_ev, BrowserEvent::Up); glib::Propagation::Proceed }));
+            add_shortcut(
+                "<Alt>Up",
+                gtk4::CallbackAction::new(move |_, _| {
+                    emit_ev(&on_ev, BrowserEvent::Up);
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         // F5 — refresh
         {
             let on_ev = self.on_event.clone();
-            add_shortcut("F5", gtk4::CallbackAction::new(move |_, _| { emit_ev(&on_ev, BrowserEvent::Refresh); glib::Propagation::Proceed }));
+            add_shortcut(
+                "F5",
+                gtk4::CallbackAction::new(move |_, _| {
+                    emit_ev(&on_ev, BrowserEvent::Refresh);
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         // Ctrl+F — reveal the search bar and focus its entry. The entry only
         // receives key events while the SearchBar is in search mode, so
@@ -2010,108 +2202,165 @@ impl FileBrowser {
         {
             let btn = self.search_button.clone();
             let entry = self.search_entry.clone();
-            add_shortcut("<Control>f", gtk4::CallbackAction::new(move |_, _| {
-                if !btn.is_active() {
-                    btn.set_active(true); // toggled handler sets search mode
-                }
-                entry.grab_focus();
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control>f",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if !btn.is_active() {
+                        btn.set_active(true); // toggled handler sets search mode
+                    }
+                    entry.grab_focus();
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let btn = self.path_edit_toggle.clone();
-            add_shortcut("<Control>l", gtk4::CallbackAction::new(move |_, _| { btn.set_active(true); glib::Propagation::Proceed }));
+            add_shortcut(
+                "<Control>l",
+                gtk4::CallbackAction::new(move |_, _| {
+                    btn.set_active(true);
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         // Ctrl+Shift+C — pull selection; Ctrl+U — push
         {
             let browser = self.clone();
             let on_ev = self.on_event.clone();
-            add_shortcut("<Control><Shift>c", gtk4::CallbackAction::new(move |_, _| {
-                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
-                let files: Vec<DirEntry> = browser.selected_entries().into_iter().filter(|e| !e.is_dir).collect();
-                if !files.is_empty() { emit_ev(&on_ev, BrowserEvent::Download(files)); }
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control><Shift>c",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if focus_in_editable(&browser.root) {
+                        return glib::Propagation::Proceed;
+                    }
+                    let files: Vec<DirEntry> = browser
+                        .selected_entries()
+                        .into_iter()
+                        .filter(|e| !e.is_dir)
+                        .collect();
+                    if !files.is_empty() {
+                        emit_ev(&on_ev, BrowserEvent::Download(files));
+                    }
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         // Ctrl+C — copy selection to the in-app clipboard (+ GDK text mirror);
         // Ctrl+V — paste it here via the existing push/pull/local-copy paths.
         {
             let browser = self.clone();
             let on_ev = self.on_event.clone();
-            add_shortcut("<Control>c", gtk4::CallbackAction::new(move |_, _| {
-                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
-                let files: Vec<DirEntry> =
-                    browser.selected_entries().into_iter().filter(|e| !e.is_dir).collect();
-                if !files.is_empty() { emit_ev(&on_ev, BrowserEvent::CopyFiles(files)); }
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control>c",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if focus_in_editable(&browser.root) {
+                        return glib::Propagation::Proceed;
+                    }
+                    let files: Vec<DirEntry> = browser
+                        .selected_entries()
+                        .into_iter()
+                        .filter(|e| !e.is_dir)
+                        .collect();
+                    if !files.is_empty() {
+                        emit_ev(&on_ev, BrowserEvent::CopyFiles(files));
+                    }
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let browser = self.clone();
             let on_ev = self.on_event.clone();
-            add_shortcut("<Control>v", gtk4::CallbackAction::new(move |_, _| {
-                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
-                emit_ev(&on_ev, BrowserEvent::Paste);
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control>v",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if focus_in_editable(&browser.root) {
+                        return glib::Propagation::Proceed;
+                    }
+                    emit_ev(&on_ev, BrowserEvent::Paste);
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let root_push = self.root.clone();
             let on_ev = self.on_event.clone();
-            add_shortcut("<Control>u", gtk4::CallbackAction::new(move |_, _| {
-                // Ctrl+U is "delete to line start" inside text entries.
-                if focus_in_editable(&root_push) { return glib::Propagation::Proceed; }
-                emit_ev(&on_ev, BrowserEvent::Upload);
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control>u",
+                gtk4::CallbackAction::new(move |_, _| {
+                    // Ctrl+U is "delete to line start" inside text entries.
+                    if focus_in_editable(&root_push) {
+                        return glib::Propagation::Proceed;
+                    }
+                    emit_ev(&on_ev, BrowserEvent::Upload);
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         // Ctrl+= / Ctrl+- — grid zoom
         {
             let browser = self.clone();
-            add_shortcut("<Control>plus", gtk4::CallbackAction::new(move |_, _| {
-                browser.zoom_in();
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control>plus",
+                gtk4::CallbackAction::new(move |_, _| {
+                    browser.zoom_in();
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let browser = self.clone();
-            add_shortcut("<Control>equal", gtk4::CallbackAction::new(move |_, _| {
-                browser.zoom_in();
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control>equal",
+                gtk4::CallbackAction::new(move |_, _| {
+                    browser.zoom_in();
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let browser = self.clone();
-            add_shortcut("<Control>minus", gtk4::CallbackAction::new(move |_, _| {
-                browser.zoom_out();
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Control>minus",
+                gtk4::CallbackAction::new(move |_, _| {
+                    browser.zoom_out();
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         // Alt+T — open current dir in terminal; Alt+Return — properties
         {
             let on_ev = self.on_event.clone();
             let curr = self.current_path.clone();
-            add_shortcut("<Alt>t", gtk4::CallbackAction::new(move |_, _| {
-                emit_ev(&on_ev, BrowserEvent::OpenTerminal(curr.borrow().clone()));
-                glib::Propagation::Proceed
-            }));
+            add_shortcut(
+                "<Alt>t",
+                gtk4::CallbackAction::new(move |_, _| {
+                    emit_ev(&on_ev, BrowserEvent::OpenTerminal(curr.borrow().clone()));
+                    glib::Propagation::Proceed
+                }),
+            );
         }
         {
             let browser = self.clone();
-            add_shortcut("<Alt>Return", gtk4::CallbackAction::new(move |_, _| {
-                if focus_in_editable(&browser.root) { return glib::Propagation::Proceed; }
-                let sel = browser.selected_entries();
-                if sel.len() == 1 {
-                    let e = sel.into_iter().next().unwrap();
-                    let mut full = browser.current_path();
-                    full.push(&e.name);
-                    if let Some(w) = browser.root.root() {
-                        let dev = browser.device.borrow().clone().unwrap_or_default();
-                        show_properties_dialog(&w, &e, &full, &dev);
+            add_shortcut(
+                "<Alt>Return",
+                gtk4::CallbackAction::new(move |_, _| {
+                    if focus_in_editable(&browser.root) {
+                        return glib::Propagation::Proceed;
                     }
-                }
-                glib::Propagation::Proceed
-            }));
+                    let sel = browser.selected_entries();
+                    if sel.len() == 1 {
+                        let e = sel.into_iter().next().unwrap();
+                        let mut full = browser.current_path();
+                        full.push(&e.name);
+                        if let Some(w) = browser.root.root() {
+                            let dev = browser.device.borrow().clone().unwrap_or_default();
+                            show_properties_dialog(&w, &e, &full, &dev);
+                        }
+                    }
+                    glib::Propagation::Proceed
+                }),
+            );
         }
     }
 }
@@ -2121,13 +2370,18 @@ impl FileBrowser {
 /// shortcuts (Delete, Ctrl+A, ...) must not fire while the user is typing,
 /// or e.g. pressing Delete mid-text pops the delete-confirmation dialog.
 fn focus_in_editable<W: IsA<gtk4::Widget>>(browser_root: &W) -> bool {
-    let Some(toplevel) = browser_root.root() else { return false };
+    let Some(toplevel) = browser_root.root() else {
+        return false;
+    };
     let focus = toplevel
         .downcast_ref::<gtk4::Window>()
         .and_then(|w| gtk4::prelude::GtkWindowExt::focus(w));
     let mut w = focus;
     while let Some(widget) = w {
-        if widget.is::<gtk4::Editable>() || widget.is::<gtk4::Text>() || widget.is::<gtk4::TextView>() {
+        if widget.is::<gtk4::Editable>()
+            || widget.is::<gtk4::Text>()
+            || widget.is::<gtk4::TextView>()
+        {
             return true;
         }
         w = widget.parent();
@@ -2173,11 +2427,12 @@ fn create_menu_button(
     hbox.append(&lbl);
 
     if let Some(sc) = shortcut {
-        let sc_lbl = gtk4::Label::builder()
-            .label(sc)
-            .xalign(1.0)
-            .build();
-        sc_lbl.add_css_class(if is_highlight { "shortcut-label-accent" } else { "shortcut-label" });
+        let sc_lbl = gtk4::Label::builder().label(sc).xalign(1.0).build();
+        sc_lbl.add_css_class(if is_highlight {
+            "shortcut-label-accent"
+        } else {
+            "shortcut-label"
+        });
         hbox.append(&sc_lbl);
     }
 
@@ -2217,7 +2472,9 @@ fn preview_source_path(browser: &FileBrowser, entry: &DirEntry) -> Option<PathBu
 /// file can vanish under us) and shows it in a `gtk4::Image` inside an
 /// `adw::MessageDialog`. No persistent cache yet (task_0003 minimal).
 fn show_image_preview(parent: &impl IsA<gtk4::Widget>, entry: &DirEntry, src: &PathBuf) {
-    let window = parent.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let window = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
     let tmp = std::env::temp_dir().join(format!("adbshare-preview-{}", entry.name));
     // Best effort: fall back to reading the source directly when the copy fails.
     let shown: PathBuf = match std::fs::copy(src, &tmp) {
@@ -2226,7 +2483,11 @@ fn show_image_preview(parent: &impl IsA<gtk4::Widget>, entry: &DirEntry, src: &P
     };
     let dialog = adw::MessageDialog::builder()
         .heading(&entry.name)
-        .body(&format!("{} • {}", entry.display_size(), entry.display_date()))
+        .body(&format!(
+            "{} • {}",
+            entry.display_size(),
+            entry.display_date()
+        ))
         .transient_for(window.as_ref().unwrap())
         .modal(true)
         .build();
@@ -2264,7 +2525,9 @@ fn show_context_menu(
         format!("{} items", selected.len())
     };
     let emit = |cb: &Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>>, ev: BrowserEvent| {
-        if let Some(f) = cb.borrow().as_ref() { f(ev); }
+        if let Some(f) = cb.borrow().as_ref() {
+            f(ev);
+        }
     };
 
     let popover = gtk4::Popover::new();
@@ -2280,7 +2543,11 @@ fn show_context_menu(
 
     // 1. Open (single selection only)
     let (open_btn, _) = create_menu_button(
-        if focused.is_dir { "folder-open-symbolic" } else { "document-open-symbolic" },
+        if focused.is_dir {
+            "folder-open-symbolic"
+        } else {
+            "document-open-symbolic"
+        },
         "Open",
         Some("Return"),
         false,
@@ -2327,7 +2594,11 @@ fn show_context_menu(
     // Copy between phone and computer — plain words, whole selection.
     let (pull_btn, _) = create_menu_button(
         "folder-download-symbolic",
-        if local { "Copy to Downloads" } else { "Save to computer" },
+        if local {
+            "Copy to Downloads"
+        } else {
+            "Save to computer"
+        },
         Some("Ctrl+Shift+C"),
         true,
         false,
@@ -2369,7 +2640,11 @@ fn show_context_menu(
         false,
         false,
     );
-    let apks: Vec<DirEntry> = selected.iter().filter(|e| e.name.to_lowercase().ends_with(".apk")).cloned().collect();
+    let apks: Vec<DirEntry> = selected
+        .iter()
+        .filter(|e| e.name.to_lowercase().ends_with(".apk"))
+        .cloned()
+        .collect();
     apk_btn.set_sensitive(!apks.is_empty());
     {
         let on_ev = on_event.clone();
@@ -2385,7 +2660,8 @@ fn show_context_menu(
 
     menu_box.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-    let (copy_btn, _) = create_menu_button("edit-copy-symbolic", "Copy", Some("Ctrl+C"), false, false);
+    let (copy_btn, _) =
+        create_menu_button("edit-copy-symbolic", "Copy", Some("Ctrl+C"), false, false);
     {
         let sel = selected.to_vec();
         let on_ev = on_event.clone();
@@ -2400,7 +2676,8 @@ fn show_context_menu(
     }
     menu_box.append(&copy_btn);
 
-    let (paste_btn, _) = create_menu_button("edit-paste-symbolic", "Paste", Some("Ctrl+V"), false, false);
+    let (paste_btn, _) =
+        create_menu_button("edit-paste-symbolic", "Paste", Some("Ctrl+V"), false, false);
     {
         let on_ev = on_event.clone();
         let p = popover.clone();
@@ -2412,7 +2689,13 @@ fn show_context_menu(
     menu_box.append(&paste_btn);
 
     // 8. Move to Trash / 9. Delete Permanently — the whole selection.
-    let (trash_btn, _) = create_menu_button("user-trash-symbolic", "Move to Trash", Some("Delete"), false, false);
+    let (trash_btn, _) = create_menu_button(
+        "user-trash-symbolic",
+        "Move to Trash",
+        Some("Delete"),
+        false,
+        false,
+    );
     {
         let sel = selected.to_vec();
         let label = selection_label.clone();
@@ -2426,7 +2709,9 @@ fn show_context_menu(
                 // Real trash: recoverable via gio (goes to ~/.local/share/Trash).
                 for e in &sel {
                     let target = curr_for_trash.join(&e.name);
-                    let _ = std::process::Command::new("gio").args(["trash", &target.to_string_lossy()]).spawn();
+                    let _ = std::process::Command::new("gio")
+                        .args(["trash", &target.to_string_lossy()])
+                        .spawn();
                 }
             } else {
                 // The daemon delete is permanent; confirm first.
@@ -2438,7 +2723,11 @@ fn show_context_menu(
 
     let (del_btn, _) = create_menu_button(
         "edit-delete-symbolic",
-        if local { "Delete permanently" } else { "Delete from phone" },
+        if local {
+            "Delete permanently"
+        } else {
+            "Delete from phone"
+        },
         Some("Shift+Del"),
         false,
         true,
@@ -2468,7 +2757,11 @@ fn show_context_menu(
     );
     term_btn.set_sensitive(single);
     {
-        let p = if focused.is_dir { curr_path.join(&focused.name) } else { curr_path.clone() };
+        let p = if focused.is_dir {
+            curr_path.join(&focused.name)
+        } else {
+            curr_path.clone()
+        };
         let on_ev = on_event.clone();
         let p_pop = popover.clone();
         term_btn.connect_clicked(move |_| {
@@ -2479,7 +2772,13 @@ fn show_context_menu(
     menu_box.append(&term_btn);
 
     // 12. Properties (single)
-    let (prop_btn, _) = create_menu_button("dialog-information-symbolic", "Properties", Some("Alt+Enter"), false, false);
+    let (prop_btn, _) = create_menu_button(
+        "dialog-information-symbolic",
+        "Properties",
+        Some("Alt+Enter"),
+        false,
+        false,
+    );
     prop_btn.set_sensitive(single);
     {
         let e_prop = focused.clone();
@@ -2501,7 +2800,9 @@ fn show_new_folder_dialog(
     parent: &impl IsA<gtk4::Widget>,
     on_event: &Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>>,
 ) {
-    let window = parent.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let window = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
     let dialog = gtk4::Dialog::builder()
         .title("New Folder")
         .transient_for(window.as_ref().unwrap())
@@ -2544,7 +2845,9 @@ fn show_delete_dialog(
     entries: Vec<DirEntry>,
     on_event: &Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>>,
 ) {
-    let window = parent.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let window = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
     let dialog = gtk4::Dialog::builder()
         .title("Delete Items")
         .transient_for(window.as_ref().unwrap())
@@ -2586,7 +2889,9 @@ fn show_properties_dialog(
     full_path: &PathBuf,
     device: &str,
 ) {
-    let window = parent.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let window = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
     let dialog = gtk4::Dialog::builder()
         .title(&format!("{} Properties", entry.name))
         .transient_for(window.as_ref().unwrap())
@@ -2601,12 +2906,34 @@ fn show_properties_dialog(
 
     let group = adw::PreferencesGroup::new();
 
-    let row_name = adw::ActionRow::builder().title("Name").subtitle(&entry.name).build();
-    let row_type = adw::ActionRow::builder().title("Type").subtitle(entry.file_type_desc()).build();
-    let row_size = adw::ActionRow::builder().title("Size").subtitle(if entry.is_dir { "—".to_string() } else { format!("{} ({} bytes)", entry.display_size(), entry.size) }).build();
-    let row_path = adw::ActionRow::builder().title("Location").subtitle(full_path.to_string_lossy().as_ref()).build();
-    let row_date = adw::ActionRow::builder().title("Modified").subtitle(&entry.display_date()).build();
-    let row_mode = adw::ActionRow::builder().title("Permissions").subtitle(format!("{:#o}", entry.mode & 0o7777)).build();
+    let row_name = adw::ActionRow::builder()
+        .title("Name")
+        .subtitle(&entry.name)
+        .build();
+    let row_type = adw::ActionRow::builder()
+        .title("Type")
+        .subtitle(entry.file_type_desc())
+        .build();
+    let row_size = adw::ActionRow::builder()
+        .title("Size")
+        .subtitle(if entry.is_dir {
+            "—".to_string()
+        } else {
+            format!("{} ({} bytes)", entry.display_size(), entry.size)
+        })
+        .build();
+    let row_path = adw::ActionRow::builder()
+        .title("Location")
+        .subtitle(full_path.to_string_lossy().as_ref())
+        .build();
+    let row_date = adw::ActionRow::builder()
+        .title("Modified")
+        .subtitle(&entry.display_date())
+        .build();
+    let row_mode = adw::ActionRow::builder()
+        .title("Permissions")
+        .subtitle(format!("{:#o}", entry.mode & 0o7777))
+        .build();
 
     // The name/location rows receive raw file names and paths: switch the
     // rows to plain text so names with &, < or > render correctly.

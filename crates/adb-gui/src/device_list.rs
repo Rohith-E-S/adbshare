@@ -43,9 +43,15 @@ impl DeviceEntry {
 
     /// Short transport label shown next to the name.
     pub fn transport_label(&self) -> &'static str {
-        if self.transport == "wifi" { "Wi-Fi" } else { "USB" }
+        if self.transport == "wifi" {
+            "Wi-Fi"
+        } else {
+            "USB"
+        }
     }
 }
+
+// ─── Internal helpers ────────────────────────────────────────────────────
 
 /// "23.4 / 128 GB" style capacity string.
 fn format_capacity((used, total): (u64, u64)) -> String {
@@ -55,17 +61,30 @@ fn format_capacity((used, total): (u64, u64)) -> String {
         unit = "TB";
         div = 1024.0_f64.powi(4);
     }
-    format!("{:.1} of {:.0} {} used", used as f64 / div, total as f64 / div, unit)
+    format!(
+        "{:.1} of {:.0} {} used",
+        used as f64 / div,
+        total as f64 / div,
+        unit
+    )
 }
 
+/// Section heading — clean monospace uppercase with generous letter-spacing.
 fn heading(text: &str) -> gtk4::Label {
     let lbl = gtk4::Label::builder().label(text).xalign(0.0).build();
     lbl.add_css_class("sidebar-heading");
     lbl
 }
 
-/// One connected phone: status dot + name + transport badge on row 1,
-/// mono serial + battery on row 2, storage bar + caption on row 3.
+/// Build a single device card.
+///
+/// Layout:
+///   ┌─────────────────────────────────────────────┐
+///   │  ● 📱  Model Name              [USB] badge  │
+///   │        serial-string            🔋 75%       │
+///   │        ━━━━━━━━━━━━━━━━━━━░░░░░░░           │
+///   │        23.4 of 128 GB used                   │
+///   └─────────────────────────────────────────────┘
 fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
     let row = gtk4::ListBoxRow::builder()
         .activatable(true)
@@ -76,11 +95,17 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
         row.add_css_class("active");
     }
 
-    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    let card = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    card.set_margin_start(2);
+    card.set_margin_end(2);
+    card.set_margin_top(2);
+    card.set_margin_bottom(2);
 
-    // Row 1: status dot + name .... transport badge.
+    // ── Top row: LED dot + phone icon + name … transport badge ──
     let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     top.set_valign(gtk4::Align::Center);
+
+    // Status LED with glow
     let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     dot.add_css_class("led");
     dot.add_css_class(if entry.transport == "wifi" {
@@ -92,6 +117,7 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
     dot.set_size_request(8, 8);
     top.append(&dot);
 
+    // Phone icon
     let icon = gtk4::Image::from_icon_name("phone-symbolic");
     icon.set_pixel_size(16);
     icon.add_css_class(if selected {
@@ -101,6 +127,7 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
     });
     top.append(&icon);
 
+    // Device display name
     let name_lbl = gtk4::Label::builder()
         .label(entry.display_name())
         .xalign(0.0)
@@ -110,6 +137,7 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
     name_lbl.add_css_class("device-name");
     top.append(&name_lbl);
 
+    // Transport badge (USB / Wi-Fi)
     let chip = gtk4::Label::new(Some(entry.transport_label()));
     chip.add_css_class(if selected {
         "usb-badge"
@@ -118,11 +146,12 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
     });
     chip.set_valign(gtk4::Align::Center);
     top.append(&chip);
-    vbox.append(&top);
+    card.append(&top);
 
-    // Row 2: serial + battery, both dimmed mono.
+    // ── Middle row: serial + battery pill ──
     let mid = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     mid.set_margin_start(24);
+
     let serial_lbl = gtk4::Label::builder()
         .label(&entry.serial)
         .xalign(0.0)
@@ -131,6 +160,7 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
         .build();
     serial_lbl.add_css_class("device-subline");
     mid.append(&serial_lbl);
+
     if let Some(pct) = entry.battery_pct {
         let batt = gtk4::Label::new(Some(&format!("{}%", pct)));
         batt.add_css_class("battery-pill");
@@ -140,59 +170,104 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
         batt.set_valign(gtk4::Align::Center);
         mid.append(&batt);
     }
-    vbox.append(&mid);
+    card.append(&mid);
 
-    // Row 3: storage bar + caption, only when the daemon knows it.
+    // ── Bottom row: storage bar + caption (only when known) ──
     if let Some((used, total)) = entry.storage.filter(|(_, t)| *t > 0) {
         let frac = ((used as f64) / (total as f64)).clamp(0.0, 1.0);
+
         let bar = gtk4::ProgressBar::new();
         bar.set_show_text(false);
         bar.set_fraction(frac);
         bar.add_css_class("device-storage-bar");
         bar.set_margin_start(24);
-        bar.set_margin_top(2);
-        vbox.append(&bar);
+        bar.set_margin_top(4);
+        card.append(&bar);
+
         let cap = gtk4::Label::builder()
             .label(format_capacity((used, total)))
             .xalign(0.0)
             .build();
         cap.add_css_class("device-subline");
         cap.set_margin_start(24);
-        vbox.append(&cap);
+        cap.set_margin_top(1);
+        card.append(&cap);
     }
 
-    row.set_child(Some(&vbox));
+    row.set_child(Some(&card));
     row
 }
 
-/// Simple icon + label row used for folder shortcuts.
-fn shortcut_row(key: &str, label: &str, icon_name: &str, dim_icon: bool) -> gtk4::ListBoxRow {
+/// Simple icon + label row used for folder shortcuts in groups 2 & 3.
+fn shortcut_row(key: &str, label: &str, icon_name: &str, css_icon_class: &str) -> gtk4::ListBoxRow {
     let row = gtk4::ListBoxRow::builder()
         .activatable(true)
         .name(key)
         .build();
     row.add_css_class("sidebar-row");
-    let box_ = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
-    box_.set_margin_start(2);
-    box_.set_margin_end(2);
+
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+    hbox.set_margin_start(4);
+    hbox.set_margin_end(4);
+
     let img = gtk4::Image::from_icon_name(icon_name);
     img.set_pixel_size(16);
-    img.add_css_class(if dim_icon {
-        "sidebar-icon-dim"
-    } else {
-        "sidebar-icon-places"
-    });
-    box_.append(&img);
+    img.add_css_class(css_icon_class);
+    hbox.append(&img);
+
     let lbl = gtk4::Label::builder()
         .label(label)
         .xalign(0.0)
         .hexpand(true)
         .ellipsize(gtk4::pango::EllipsizeMode::End)
         .build();
-    box_.append(&lbl);
-    row.set_child(Some(&box_));
+    hbox.append(&lbl);
+
+    row.set_child(Some(&hbox));
     row
 }
+
+/// Build the onboarding card shown when no devices are connected.
+fn onboarding_row() -> gtk4::ListBoxRow {
+    let row = gtk4::ListBoxRow::builder()
+        .sensitive(false)
+        .name("__empty__")
+        .build();
+    row.add_css_class("onboarding-card");
+
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    vbox.set_margin_start(6);
+    vbox.set_margin_end(6);
+    vbox.set_margin_top(8);
+    vbox.set_margin_bottom(8);
+
+    let title = gtk4::Label::builder()
+        .label("No phone connected")
+        .xalign(0.0)
+        .build();
+    title.add_css_class("onboarding-title");
+    vbox.append(&title);
+
+    let steps = [
+        "Connect the phone with a USB cable.",
+        "On the phone: allow USB debugging, then tap \u{201C}Allow\u{201D}.",
+        "Or use \u{201C}Connect via Wi-Fi\u{201D} below.",
+    ];
+    for (n, step) in steps.iter().enumerate() {
+        let step_lbl = gtk4::Label::builder()
+            .label(format!("{}. {}", n + 1, step))
+            .xalign(0.0)
+            .wrap(true)
+            .build();
+        step_lbl.add_css_class("onboarding-step");
+        vbox.append(&step_lbl);
+    }
+
+    row.set_child(Some(&vbox));
+    row
+}
+
+// ─── Public API ──────────────────────────────────────────────────────────
 
 pub struct DeviceList {
     root: gtk4::Box,
@@ -207,36 +282,40 @@ pub struct DeviceList {
 
 impl DeviceList {
     pub fn new() -> Self {
-        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-        root.set_margin_start(8);
-        root.set_margin_end(8);
-        root.set_margin_top(8);
-        root.set_margin_bottom(8);
+        let root = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        root.set_margin_start(6);
+        root.set_margin_end(6);
+        root.set_margin_top(6);
+        root.set_margin_bottom(12);
 
-        // ---- Group 1: which phone? ----
+        let on_event: Rc<RefCell<Option<Box<dyn Fn(SidebarEvent)>>>> = Rc::new(RefCell::new(None));
+
+        // ════════════════════════════════════════════════════════════════
+        // Group 1 — "PHONES & TABLETS"
+        // ════════════════════════════════════════════════════════════════
         root.append(&heading("Phones & tablets"));
+
         let device_list_box = gtk4::ListBox::new();
         device_list_box.set_selection_mode(gtk4::SelectionMode::Single);
         device_list_box.add_css_class("sidebar-list");
         root.append(&device_list_box);
 
-        let on_event: Rc<RefCell<Option<Box<dyn Fn(SidebarEvent)>>>> =
-            Rc::new(RefCell::new(None));
-
-        // Always-visible Wi-Fi connect action directly under the phones.
-        // (Explicit icon+label child: GTK4 renders either/or, never both.)
+        // ── Wi-Fi connect button (between group 1 and 2) ──
         {
             let connect_btn = gtk4::Button::new();
             let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             hbox.set_halign(gtk4::Align::Center);
-            hbox.append(&gtk4::Image::from_icon_name("network-wireless-symbolic"));
-            hbox.append(&gtk4::Label::new(Some("Connect via Wi-Fi…")));
+            let wifi_icon = gtk4::Image::from_icon_name("network-wireless-symbolic");
+            wifi_icon.set_pixel_size(16);
+            hbox.append(&wifi_icon);
+            hbox.append(&gtk4::Label::new(Some("Connect via Wi-Fi\u{2026}")));
             connect_btn.set_child(Some(&hbox));
             connect_btn.add_css_class("connect-button");
-            connect_btn.set_margin_top(4);
-            connect_btn.set_tooltip_text(Some(
-                "Pair once on the phone, then connect by IP address",
-            ));
+            connect_btn.set_margin_top(6);
+            connect_btn.set_margin_bottom(4);
+            connect_btn
+                .set_tooltip_text(Some("Pair once on the phone, then connect by IP address"));
+
             let on_ev = on_event.clone();
             connect_btn.connect_clicked(move |_| {
                 if let Some(cb) = on_ev.borrow().as_ref() {
@@ -246,8 +325,11 @@ impl DeviceList {
             root.append(&connect_btn);
         }
 
-        // ---- Group 2: where on the phone? ----
+        // ════════════════════════════════════════════════════════════════
+        // Group 2 — "PHONE FOLDERS"
+        // ════════════════════════════════════════════════════════════════
         root.append(&heading("Phone folders"));
+
         let hint = gtk4::Label::builder()
             .label("Select a phone above to browse its folders.")
             .xalign(0.0)
@@ -259,6 +341,7 @@ impl DeviceList {
         let phone_folders_box = gtk4::ListBox::new();
         phone_folders_box.set_selection_mode(gtk4::SelectionMode::None);
         phone_folders_box.add_css_class("sidebar-list");
+
         // (label, icon, device path)
         let phone_items: &[(&str, &str, &str)] = &[
             ("Internal storage", "phone-symbolic", "/sdcard"),
@@ -266,33 +349,56 @@ impl DeviceList {
             ("Camera", "camera-photo-symbolic", "/sdcard/DCIM"),
             ("Pictures", "folder-pictures-symbolic", "/sdcard/Pictures"),
             ("Music", "folder-music-symbolic", "/sdcard/Music"),
-            ("Documents", "folder-documents-symbolic", "/sdcard/Documents"),
+            (
+                "Documents",
+                "folder-documents-symbolic",
+                "/sdcard/Documents",
+            ),
         ];
         for (label, icon, path) in phone_items {
             phone_folders_box.append(&shortcut_row(
                 &format!("dev:{path}"),
                 label,
                 icon,
-                false,
+                "sidebar-icon-places",
             ));
         }
         root.append(&phone_folders_box);
 
-        // ---- Group 3: this computer (unmistakably local) ----
+        // ════════════════════════════════════════════════════════════════
+        // Group 3 — "THIS COMPUTER"
+        // ════════════════════════════════════════════════════════════════
         root.append(&heading("This computer"));
+
         let local_box = gtk4::ListBox::new();
         local_box.set_selection_mode(gtk4::SelectionMode::None);
         local_box.add_css_class("sidebar-list");
-        for (label, icon, key) in [
-            ("Home", "user-home-symbolic", "local:HOME"),
-            ("Downloads", "folder-download-symbolic", "local:DOWNLOADS"),
-            ("Trash", "user-trash-symbolic", "local:TRASH"),
-        ] {
-            local_box.append(&shortcut_row(key, label, icon, true));
-        }
+
+        local_box.append(&shortcut_row(
+            "local:HOME",
+            "Home",
+            "user-home-symbolic",
+            "sidebar-icon-dim",
+        ));
+        local_box.append(&shortcut_row(
+            "local:DOWNLOADS",
+            "Downloads",
+            "folder-download-symbolic",
+            "sidebar-icon-dim",
+        ));
+        local_box.append(&shortcut_row(
+            "local:TRASH",
+            "Trash",
+            "user-trash-symbolic",
+            "sidebar-icon-trash",
+        ));
         root.append(&local_box);
 
-        // --- wiring ---
+        // ════════════════════════════════════════════════════════════════
+        // Event wiring
+        // ════════════════════════════════════════════════════════════════
+
+        // Device list — select a phone.
         let on_ev_dev = on_event.clone();
         device_list_box.connect_row_activated(move |_lb, row| {
             let name = row.widget_name().to_string();
@@ -303,6 +409,7 @@ impl DeviceList {
             }
         });
 
+        // Phone folders — select a place on the phone.
         let on_ev_phone = on_event.clone();
         phone_folders_box.connect_row_activated(move |_lb, row| {
             let key = row.widget_name().to_string();
@@ -313,6 +420,7 @@ impl DeviceList {
             }
         });
 
+        // Local places — browse the host filesystem.
         let on_ev_local = on_event.clone();
         local_box.connect_row_activated(move |_lb, row| {
             let key = row.widget_name().to_string();
@@ -369,44 +477,14 @@ impl DeviceList {
             return;
         }
         *self.last_applied.borrow_mut() = Some(next);
+
+        // Clear existing children.
         while let Some(child) = self.device_list_box.first_child() {
             self.device_list_box.remove(&child);
         }
+
         if devices.is_empty() {
-            let row = gtk4::ListBoxRow::builder()
-                .sensitive(false)
-                .name("__empty__")
-                .build();
-            row.add_css_class("onboarding-card");
-            let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-            vbox.set_margin_start(4);
-            vbox.set_margin_end(4);
-            vbox.set_margin_top(4);
-            vbox.set_margin_bottom(4);
-            let title = gtk4::Label::builder()
-                .label("No phone connected")
-                .xalign(0.0)
-                .build();
-            title.add_css_class("onboarding-title");
-            vbox.append(&title);
-            for (n, step) in [
-                "Connect the phone with a USB cable.",
-                "On the phone: allow USB debugging, then tap “Allow”.",
-                "Or use “Connect via Wi-Fi” below.",
-            ]
-            .iter()
-            .enumerate()
-            {
-                let step_lbl = gtk4::Label::builder()
-                    .label(format!("{}. {}", n + 1, step))
-                    .xalign(0.0)
-                    .wrap(true)
-                    .build();
-                step_lbl.add_css_class("onboarding-step");
-                vbox.append(&step_lbl);
-            }
-            row.set_child(Some(&vbox));
-            self.device_list_box.append(&row);
+            self.device_list_box.append(&onboarding_row());
         } else {
             let mut selected_row: Option<gtk4::ListBoxRow> = None;
             for d in devices {
@@ -424,6 +502,7 @@ impl DeviceList {
                 self.device_list_box.select_row(Some(&row));
             }
         }
+
         self.set_phone_folders_enabled(selected.is_some() || !devices.is_empty());
     }
 
@@ -432,7 +511,8 @@ impl DeviceList {
     /// what to do only while there is nothing to browse.
     pub fn set_phone_folders_enabled(&self, enabled: bool) {
         self.phone_folders_box.set_sensitive(enabled);
-        self.phone_folders_box.set_opacity(if enabled { 1.0 } else { 0.45 });
+        self.phone_folders_box
+            .set_opacity(if enabled { 1.0 } else { 0.45 });
         self.phone_hint.set_visible(!enabled);
     }
 
