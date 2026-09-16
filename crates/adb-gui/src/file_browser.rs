@@ -372,6 +372,7 @@ pub enum BrowserEvent {
     Delete(Vec<DirEntry>),
     OpenExternal(PathBuf),
     InstallApk(DirEntry),
+    SideloadApkPrompt,
     OpenTerminal(PathBuf),
     PauseTransfer,
     CancelTransfer,
@@ -883,6 +884,16 @@ impl FileBrowser {
                 total,
                 if total == 1 { "" } else { "s" }
             ));
+        }
+    }
+
+    /// Set an arbitrary status message in the bottom status bar, or restore
+    /// normal item count if `text` is empty.
+    pub fn set_status(&self, text: &str) {
+        if text.is_empty() {
+            self.refresh_selection_status();
+        } else {
+            self.status_label.set_label(text);
         }
     }
 
@@ -2674,8 +2685,8 @@ fn show_context_menu(
 
     // Install APK (only when the selection contains APKs)
     let (apk_btn, _) = create_menu_button(
-        "application-x-executable-symbolic",
-        "Install app from APK",
+        "system-software-install-symbolic",
+        "Install APK on phone",
         None,
         false,
         false,

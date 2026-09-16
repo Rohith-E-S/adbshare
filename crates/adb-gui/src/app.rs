@@ -391,6 +391,16 @@ impl AdbshareApp {
                 });
             }
             kebab_menu.append(&select_all_item);
+            let install_apk_item = menu_item("system-software-install-symbolic", "Install APK…");
+            {
+                let browser_apk = browser.clone();
+                let kp = kebab_pop.clone();
+                install_apk_item.connect_clicked(move |_| {
+                    kp.popdown();
+                    browser_apk.emit(crate::file_browser::BrowserEvent::SideloadApkPrompt);
+                });
+            }
+            kebab_menu.append(&install_apk_item);
             kebab_menu.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
             let files_item = menu_item("system-file-manager-symbolic", "Open in Files");
             {
@@ -1438,6 +1448,54 @@ fn handle_browser_event(
         });
     }
 
+    fn push_dropped_files_to_device(
+        device: String,
+        files: Vec<PathBuf>,
+        from_dir: PathBuf,
+        target_dir: PathBuf,
+        mount: Option<String>,
+        dir_tx: async_channel::Sender<(String, PathBuf, Result<Vec<FsDirEntry>, String>)>,
+        op_tx: async_channel::Sender<(Option<String>, Result<String, String>)>,
+        rt: tokio::runtime::Handle,
+    ) {
+        rt.spawn(async move {
+            for src in files {
+                let Some(name) = src.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let dst = target_dir.join(name);
+                match src.strip_prefix(mount.as_deref().unwrap_or("/nonexistent")) {
+                    Ok(rel) => {
+                        if src.parent() == Some(target_dir.as_path()) {
+                            continue;
+                        }
+                        let device_src = format!("/{}", rel.to_string_lossy());
+                        if let Err(e) =
+                            rename(&device, &device_src, &dst.to_string_lossy()).await
+                        {
+                            let _ = op_tx.try_send((None, Err(format!("move: {e}"))));
+                        }
+                    }
+                    Err(_) => {
+                        if let Err(e) = enqueue_push(
+                            &device,
+                            &src.to_string_lossy(),
+                            &dst.to_string_lossy(),
+                        )
+                        .await
+                        {
+                            let _ = op_tx.try_send((None, Err(format!("push: {e}"))));
+                        }
+                    }
+                }
+            }
+            let res = list_dir(&device, &from_dir.to_string_lossy())
+                .await
+                .map_err(|e| e.to_string());
+            let _ = dir_tx.send((device, from_dir, res)).await;
+        });
+    }
+
     match ev {
         BrowserEvent::DropFiles {
             from_dir,
@@ -1479,51 +1537,86 @@ fn handle_browser_event(
                 ));
                 return;
             };
+
+            let apk_files: Vec<PathBuf> = files
+                .iter()
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("apk"))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+
             let mount = handles.browser.fuse_mount();
-            let dir_tx = dir_tx.clone();
-            rt.spawn(async move {
-                for src in files {
-                    let Some(name) = src.file_name().and_then(|n| n.to_str()) else {
-                        continue;
-                    };
-                    let dst = target_dir.join(name);
-                    match src.strip_prefix(mount.as_deref().unwrap_or("/nonexistent")) {
-                        // Source lives on the device (dragged via the FUSE mount): move it.
-                        Ok(rel) => {
-                            // Dropped back into its own folder: nothing to do.
-                            if src.parent() == Some(target_dir.as_path()) {
-                                continue;
-                            }
-                            // The device proxy resolves paths from the device
-                            // root, so the stripped relative path needs a
-                            // leading '/' (e.g. "sdcard/Download/a" ->
-                            // "/sdcard/Download/a").
-                            let device_src = format!("/{}", rel.to_string_lossy());
-                            if let Err(e) =
-                                rename(&device, &device_src, &dst.to_string_lossy()).await
-                            {
-                                let _ = op_tx.try_send((None, Err(format!("move: {e}"))));
-                            }
+
+            if !apk_files.is_empty() {
+                let apk_names = apk_files
+                    .iter()
+                    .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let dialog = adw::MessageDialog::builder()
+                    .heading("Install or Copy APK?")
+                    .body(format!(
+                        "You dropped '{apk_names}'. Would you like to install it to the connected phone or copy it to this folder?"
+                    ))
+                    .modal(true)
+                    .transient_for(&window)
+                    .build();
+                dialog.add_response("install", "Install APK");
+                dialog.set_response_appearance("install", adw::ResponseAppearance::Suggested);
+                dialog.add_response("copy", "Copy to Folder");
+                dialog.add_response("cancel", "Cancel");
+
+                let handles_d = handles.clone();
+                let op_tx_d = op_tx.clone();
+                let rt_d = rt.clone();
+                let dev_d = device.clone();
+                let files_d = files.clone();
+                let from_dir_d = from_dir.clone();
+                let target_dir_d = target_dir.clone();
+                let mount_d = mount.clone();
+                let dir_tx_d = dir_tx.clone();
+
+                dialog.connect_response(None, move |_, resp| {
+                    if resp == "install" {
+                        for apk in apk_files.clone() {
+                            let path_str = apk.to_string_lossy().to_string();
+                            let name = apk
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("app.apk")
+                                .to_string();
+                            run_apk_install(dev_d.clone(), path_str, name, &handles_d, &op_tx_d, &rt_d);
                         }
-                        // External local file: push (copy) to the device.
-                        Err(_) => {
-                            if let Err(e) = enqueue_push(
-                                &device,
-                                &src.to_string_lossy(),
-                                &dst.to_string_lossy(),
-                            )
-                            .await
-                            {
-                                let _ = op_tx.try_send((None, Err(format!("push: {e}"))));
-                            }
-                        }
+                    } else if resp == "copy" {
+                        push_dropped_files_to_device(
+                            dev_d.clone(),
+                            files_d.clone(),
+                            from_dir_d.clone(),
+                            target_dir_d.clone(),
+                            mount_d.clone(),
+                            dir_tx_d.clone(),
+                            op_tx_d.clone(),
+                            rt_d.clone(),
+                        );
                     }
-                }
-                let res = list_dir(&device, &from_dir.to_string_lossy())
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = dir_tx.send((device, from_dir, res)).await;
-            });
+                });
+                dialog.present();
+            } else {
+                push_dropped_files_to_device(
+                    device,
+                    files,
+                    from_dir,
+                    target_dir,
+                    mount,
+                    dir_tx.clone(),
+                    op_tx.clone(),
+                    rt.clone(),
+                );
+            }
         }
         BrowserEvent::CopyFiles(entries) => {
             let from_local = handles.browser.is_local_mode();
@@ -2074,8 +2167,6 @@ fn handle_browser_event(
         }
         BrowserEvent::InstallApk(entry) => {
             let curr = handles.browser.current_path();
-            let fuse = handles.browser.fuse_mount();
-            let local = handles.browser.is_local_mode();
             let Some(device) = handles.selected_device.lock().clone() else {
                 let _ = op_tx.try_send((
                     None,
@@ -2083,40 +2174,52 @@ fn handle_browser_event(
                 ));
                 return;
             };
-            let mut target = curr.clone();
-            target.push(&entry.name);
-            // Daemon runs `adb -s SERIAL install -r <host-local path>`; when
-            // browsing the device the host-local path is the FUSE mount.
-            let apk_local = if local {
-                target.to_string_lossy().to_string()
-            } else {
-                match fuse {
-                    Some(mp) => format!("{}{}", mp.trim_end_matches('/'), target.display()),
-                    None => {
-                        let _ = op_tx.try_send((
-                            None,
-                            Err(
-                                "Installing an APK needs the FUSE mount to read the file locally."
-                                    .into(),
-                            ),
-                        ));
-                        return;
-                    }
+            let target = curr.join(&entry.name);
+            let apk_path = target.to_string_lossy().to_string();
+            run_apk_install(device, apk_path, entry.name, handles, op_tx, &rt);
+        }
+        BrowserEvent::SideloadApkPrompt => {
+            let device = match handles.selected_device.lock().clone() {
+                Some(d) => d,
+                None => {
+                    let _ = op_tx.try_send((
+                        None,
+                        Err("No device connected — please connect an Android device to install APKs.".into()),
+                    ));
+                    return;
                 }
             };
-            let op_tx = op_tx.clone();
-            rt.spawn(async move {
-                let r = install_apk(&device, &apk_local)
-                    .await
-                    .map(|_| "APK installed".to_string())
-                    .map_err(|e| e.to_string());
-                let title = if r.is_ok() {
-                    Some("APK installed".into())
-                } else {
-                    Some("Install APK".into())
-                };
-                let _ = op_tx.send((title, r)).await;
+            let chooser = gtk4::FileChooserNative::builder()
+                .title("Select APK to Install")
+                .modal(true)
+                .action(gtk4::FileChooserAction::Open)
+                .build();
+            chooser.set_transient_for(Some(&window));
+            let filter = gtk4::FileFilter::new();
+            filter.set_name(Some("Android Packages (*.apk)"));
+            filter.add_pattern("*.apk");
+            filter.add_pattern("*.APK");
+            chooser.add_filter(&filter);
+
+            let handles_cb = handles.clone();
+            let op_tx_cb = op_tx.clone();
+            let rt_cb = rt.clone();
+            chooser.connect_response(move |chooser, resp| {
+                if resp == gtk4::ResponseType::Accept {
+                    if let Some(file) = chooser.file() {
+                        if let Some(path) = file.path() {
+                            let path_str = path.to_string_lossy().to_string();
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("app.apk")
+                                .to_string();
+                            run_apk_install(device.clone(), path_str, name, &handles_cb, &op_tx_cb, &rt_cb);
+                        }
+                    }
+                }
             });
+            chooser.show();
         }
         BrowserEvent::OpenTerminal(path) => {
             let cmd = if handles.browser.is_local_mode() {
@@ -2267,6 +2370,50 @@ async fn mountpoint_for(device: &str) -> anyhow::Result<String> {
 async fn install_apk(device: &str, path: &str) -> anyhow::Result<String> {
     let proxy = get_manager().await?;
     Ok(proxy.install_apk(device, path).await?)
+}
+
+fn run_apk_install(
+    device: String,
+    apk_path: String,
+    display_name: String,
+    handles: &UiHandles,
+    op_tx: &async_channel::Sender<(Option<String>, Result<String, String>)>,
+    rt: &tokio::runtime::Handle,
+) {
+    let dev = device.clone();
+    let path = apk_path.clone();
+    let name = display_name.clone();
+    let op_tx = op_tx.clone();
+    let browser = handles.browser.clone();
+    let rt = rt.clone();
+
+    browser.set_status(&format!("Installing {name} on {dev}…"));
+
+    glib::spawn_future_local(async move {
+        let dev_bg = dev.clone();
+        let path_bg = path.clone();
+        let res = rt
+            .spawn(async move { install_apk(&dev_bg, &path_bg).await })
+            .await;
+
+        browser.set_status("");
+
+        let (title, r) = match res {
+            Ok(Ok(_)) => (
+                Some("APK Installed".into()),
+                Ok(format!("Successfully installed '{name}' on {dev}.")),
+            ),
+            Ok(Err(e)) => (
+                Some("Installation Failed".into()),
+                Err(format!("Could not install '{name}':\n\n{e}")),
+            ),
+            Err(join_err) => (
+                Some("Installation Failed".into()),
+                Err(format!("Install task failed: {join_err}")),
+            ),
+        };
+        let _ = op_tx.send((title, r)).await;
+    });
 }
 
 fn show_error_dialog(window: &adw::ApplicationWindow, title: &str, msg: &str) {

@@ -1121,32 +1121,79 @@ impl ManagerInterface {
         Ok(text)
     }
 
-    /// `adb -s SERIAL install -r path` with a 120s timeout. `path` is a
-    /// host-local APK file (local view path, or the FUSE-mounted path when
-    /// browsing the device). Returns combined adb output on success.
+    /// `adb install -r` with a 120s timeout. Supports both host-local APK paths
+    /// and device-local paths (e.g. `/sdcard/...` or `/storage/...`).
     async fn install_apk(&self, device: &str, path: &str) -> zbus::fdo::Result<String> {
         if device.is_empty() || path.is_empty() {
             return Err(zbus::fdo::Error::InvalidArgs("device and path are required".into()));
         }
-        let out = tokio::time::timeout(
-            Duration::from_secs(120),
+
+        let is_device_path = path.starts_with("/sdcard/")
+            || path.starts_with("/storage/")
+            || path.starts_with("/data/")
+            || !std::path::Path::new(path).exists();
+
+        let cmd = if is_device_path {
+            if path.starts_with("/data/local/tmp/") {
+                let escaped_path = path.replace('\'', "'\\''");
+                Command::new("adb")
+                    .args(["-s", device, "shell", &format!("pm install -r '{escaped_path}'")])
+                    .kill_on_drop(true)
+                    .output()
+            } else {
+                let escaped_path = path.replace('\'', "'\\''");
+                let script = format!(
+                    "tmp=\"/data/local/tmp/adbshare_$$.apk\" && cp '{escaped_path}' \"$tmp\" && pm install -r \"$tmp\"; res=$?; rm -f \"$tmp\"; exit $res"
+                );
+                Command::new("adb")
+                    .args(["-s", device, "shell", &script])
+                    .kill_on_drop(true)
+                    .output()
+            }
+        } else {
             Command::new("adb")
                 .args(["-s", device, "install", "-r", path])
                 .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| zbus::fdo::Error::Failed(format!("adb install timed out after 120s")))?
-        .map_err(|e| zbus::fdo::Error::Failed(format!("adb install: {e}")))?;
+                .output()
+        };
+
+        let out = tokio::time::timeout(Duration::from_secs(120), cmd)
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("Installation timed out after 120s".into()))?
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to execute adb: {e}")))?;
+
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
-        if !out.status.success() {
-            return Err(zbus::fdo::Error::Failed(text));
+
+        let trimmed = text.trim();
+        let is_failure = !out.status.success()
+            || trimmed.contains("Failure [")
+            || trimmed.starts_with("Failure")
+            || trimmed.contains("INSTALL_FAILED");
+
+        if is_failure {
+            let user_msg = if trimmed.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
+                "Cannot install: a newer version of this application is already installed on the device."
+            } else if trimmed.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") {
+                "Cannot install: signatures do not match the installed version. Please uninstall the existing app first."
+            } else if trimmed.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE") {
+                "Cannot install: device has insufficient storage space."
+            } else if trimmed.contains("INSTALL_FAILED_CONFLICTING_PROVIDER") {
+                "Cannot install: conflicting content provider with an existing application."
+            } else if trimmed.contains("INSTALL_FAILED_NO_MATCHING_ABIS") {
+                "Cannot install: APK is incompatible with this device's CPU architecture."
+            } else if trimmed.contains("INSTALL_PARSE_FAILED") {
+                "Cannot install: corrupted or invalid APK file."
+            } else {
+                trimmed
+            };
+            return Err(zbus::fdo::Error::Failed(format!("{user_msg}\n\n{trimmed}")));
         }
-        Ok(text)
+
+        Ok(trimmed.to_string())
     }
 }
 
