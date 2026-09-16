@@ -938,59 +938,7 @@ popover separator {
     letter-spacing: 0.02em;
 }
 
-/* ── Floating transfer dock ─────────────────────────────────────────── */
 
-.transfer-dock {
-    background: #181D27;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 14px;
-    padding: 10px 18px;
-    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.04);
-    color: #E0E4EB;
-}
-
-.transfer-dock .dock-summary {
-    font-size: 12px;
-    font-weight: 600;
-    color: #FFFFFF;
-}
-
-.transfer-dock .dock-speed {
-    font-family: monospace;
-    font-size: 14px;
-    font-weight: 700;
-    color: #FFFFFF;
-}
-
-.transfer-dock .dock-separator {
-    background-color: rgba(255, 255, 255, 0.08);
-    min-width: 1px;
-}
-
-.transfer-dock .dock-mini-name {
-    font-size: 12px;
-    color: #E0E4EB;
-}
-
-.transfer-dock .dock-mini-pct {
-    font-family: monospace;
-    font-size: 11px;
-    color: #BFC6D4;
-}
-
-.transfer-dock progressbar trough {
-    background-color: rgba(255, 255, 255, 0.06);
-    border-radius: 9999px;
-    min-height: 3px;
-    border: none;
-}
-
-.transfer-dock progressbar progress {
-    background: linear-gradient(to right, rgba(255,255,255,0.5), #FFFFFF);
-    border-radius: 9999px;
-    min-height: 3px;
-    border: none;
-}
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  GENERIC HELPERS

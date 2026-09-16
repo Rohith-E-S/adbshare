@@ -13,7 +13,6 @@ use libadwaita::{prelude::*, *};
 use crate::device_list::{DeviceList, SidebarEvent};
 use crate::file_browser::ViewMode;
 use crate::file_browser::{BrowserEvent, DirEntry as FsDirEntry, FileBrowser};
-use crate::transfer_dock::TransferDock;
 use crate::transfer_view::{JobInfo, TransferView};
 
 #[zbus::proxy(
@@ -57,7 +56,6 @@ mod adbshare_dbus_proxy {
 struct UiHandles {
     browser: FileBrowser,
     transfer: TransferView,
-    dock: TransferDock,
     selected_device: parking_lot::Mutex<Option<String>>,
     /// Cache of live device metadata from the daemon.
     devices: parking_lot::Mutex<Vec<crate::device_list::DeviceEntry>>,
@@ -538,14 +536,7 @@ impl AdbshareApp {
             });
             window.add_controller(key_ctrl);
 
-            // Bottom status bar owns transfer progress; the small dock card
-            // only appears while jobs run and opens the full list on click.
-            let window_overlay = gtk4::Overlay::new();
-            window_overlay.set_child(Some(&main_layout));
-
-            let dock = TransferDock::new();
-            window_overlay.add_overlay(&dock.root);
-            window.set_content(Some(&window_overlay));
+            window.set_content(Some(&main_layout));
 
             // Drop files from other apps onto the canvas -> push/copy into
             // the directory being browsed.
@@ -576,38 +567,12 @@ impl AdbshareApp {
             let handles = std::rc::Rc::new(UiHandles {
                 browser,
                 transfer,
-                dock,
                 selected_device: parking_lot::Mutex::new(None),
                 devices: parking_lot::Mutex::new(Vec::new()),
                 active_jobs: parking_lot::Mutex::new(Vec::new()),
                 transfers_paused: parking_lot::Mutex::new(false),
                 clipboard: parking_lot::Mutex::new(None),
             });
-
-            // Dock controls reuse the banner's Pause/Cancel event flow;
-            // clicking anywhere else on the dock opens the full
-            // Operations & Transfers popover.
-            {
-                let browser_dock = handles.browser.clone();
-                handles.dock.pause_button.connect_clicked(move |_| {
-                    browser_dock.emit(BrowserEvent::PauseTransfer);
-                });
-            }
-            {
-                let browser_dock = handles.browser.clone();
-                handles.dock.cancel_button.connect_clicked(move |_| {
-                    browser_dock.emit(BrowserEvent::CancelTransfer);
-                });
-            }
-            {
-                let tp = trans_pop.clone();
-                let click = gtk4::GestureClick::new();
-                // Primary button only: right-/middle-clicks must not open the
-                // transfers popover.
-                click.set_button(1);
-                click.connect_released(move |_, _, _, _| tp.popup());
-                handles.dock.root.add_controller(click);
-            }
 
             // --- D-Bus channels ---
             let (devices_tx, devices_rx) = async_channel::unbounded::<Result<Vec<crate::device_list::DeviceEntry>, String>>();
@@ -916,8 +881,8 @@ impl AdbshareApp {
                 });
             }
 
-            // --- Drain jobs -> status bar, dock card, header count, full list ---
-            // One job list, three views of it. The status bar owns progress.
+            // --- Drain jobs -> status bar, header count, full list ---
+            // The status bar owns progress.
             let handles_jobs = handles.clone();
             let browser_drain = handles.browser.clone();
             let btn_drain = transfers_btn.clone();
@@ -927,7 +892,7 @@ impl AdbshareApp {
                     match result {
                         Ok(jobs) => {
                             // Paused jobs count as active: they must stay
-                            // visible (banner + dock) and resumable.
+                            // visible and resumable.
                             let active: Vec<_> = jobs.iter().filter(|j| {
                                 j.state == "Running" || j.state == "Pending" || j.state == "Paused"
                             }).collect();
@@ -991,7 +956,6 @@ impl AdbshareApp {
                             };
                             browser_drain.status_pause_btn.set_icon_name(icon);
                             browser_drain.status_pause_btn.set_tooltip_text(Some(tip));
-                            handles_jobs.dock.update(&jobs, paused);
                             handles_jobs.transfer.update_jobs(jobs);
                         }
                         Err(e) => tracing::warn!(error=%e, "list_jobs failed"),
