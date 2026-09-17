@@ -130,8 +130,43 @@ impl NetstatWatcher {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        rt.block_on(async move { query_adb_server(&host, port).await })
+        rt.block_on(async move {
+            match query_adb_server(&host, port).await {
+                Ok(devices) => Ok(devices),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // The adb server isn't running (cold boot, first run
+                    // after install). Start it — same as running any adb
+                    // command does — then retry the query.
+                    ensure_adb_server(&host, port).await?;
+                    query_adb_server(&host, port).await
+                }
+                Err(e) => Err(e),
+            }
+        })
     }
+}
+
+/// Start the adb server on demand (`adb start-server`), mirroring what the
+/// adb CLI itself does when its server is down. Only meaningful for a local
+/// server; remote `--adb-server` targets are left alone.
+async fn ensure_adb_server(host: &str, port: u16) -> std::io::Result<()> {
+    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+        return Err(std::io::Error::other(format!("adb server at {host}:{port} unreachable")));
+    }
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("adb")
+            .arg("start-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+    )
+    .await
+    .map_err(|_| std::io::Error::other("adb start-server timed out"))??;
+    if !status.success() {
+        return Err(std::io::Error::other("adb start-server failed"));
+    }
+    Ok(())
 }
 
 impl WatcherImpl for NetstatWatcher {
@@ -330,4 +365,28 @@ impl WatcherImpl for UsbWatcher {
 }
 
 use tokio::net::TcpStream;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ensure_adb_server_rejects_remote_host() {
+        let err = ensure_adb_server("10.0.0.5", 5037).await.unwrap_err();
+        assert!(err.to_string().contains("10.0.0.5:5037 unreachable"));
+    }
+
+    #[test]
+    fn adb_start_server_binary_available() {
+        // The daemon relies on `adb start-server`; fail loudly if the
+        // environment lacks it (CI installs android-tools).
+        assert!(std::process::Command::new("adb")
+            .arg("start-server")
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok());
+    }
+}
 
