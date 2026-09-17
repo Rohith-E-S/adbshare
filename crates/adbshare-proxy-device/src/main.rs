@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::CString;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -201,32 +202,46 @@ fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
                 if rest.len() < 4 { out.push(0x08); out.extend_from_slice(b"short"); }
                 else {
                     let mode = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
-                    let r = unsafe { libc::mkdir(path.as_ptr() as *const _, mode) };
-                    if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"mkdir"); }
+                    match cstring(&path) {
+                        Some(p) => {
+                            let r = unsafe { libc::mkdir(p.as_ptr(), mode) };
+                            if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"mkdir"); }
+                        }
+                        None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+                    }
                 }
             }
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         0x08 => match read_path(args) {
-            Some((path, _)) => {
-                let r = unsafe { libc::unlink(path.as_ptr() as *const _) };
-                if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"unlink"); }
-            }
+            Some((path, _)) => match cstring(&path) {
+                Some(p) => {
+                    let r = unsafe { libc::unlink(p.as_ptr()) };
+                    if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"unlink"); }
+                }
+                None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+            },
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         0x09 => match read_path(args) {
-            Some((path, _)) => {
-                let r = unsafe { libc::rmdir(path.as_ptr() as *const _) };
-                if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"rmdir"); }
-            }
+            Some((path, _)) => match cstring(&path) {
+                Some(p) => {
+                    let r = unsafe { libc::rmdir(p.as_ptr()) };
+                    if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"rmdir"); }
+                }
+                None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+            },
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         0x0A => match read_path(args) {
-            Some((src, rest)) => match read_path(&rest) {
-                Some((dst, _)) => {
-                    let r = unsafe { libc::rename(src.as_ptr() as *const _, dst.as_ptr() as *const _) };
-                    if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"rename"); }
-                }
+            Some((src, rest)) => match read_path(rest) {
+                Some((dst, _)) => match (cstring(&src), cstring(&dst)) {
+                    (Some(s), Some(d)) => {
+                        let r = unsafe { libc::rename(s.as_ptr(), d.as_ptr()) };
+                        if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"rename"); }
+                    }
+                    _ => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+                },
                 None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
             },
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
@@ -236,45 +251,59 @@ fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
                 if rest.len() < 8 { out.push(0x08); out.extend_from_slice(b"short"); }
                 else {
                     let size = u64::from_le_bytes(rest[0..8].try_into().unwrap());
-                    let r = unsafe { libc::truncate(path.as_ptr() as *const _, size as i64) };
-                    if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"truncate"); }
+                    match cstring(&path) {
+                        Some(p) => {
+                            let r = unsafe { libc::truncate(p.as_ptr(), size as i64) };
+                            if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"truncate"); }
+                        }
+                        None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+                    }
                 }
             }
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         0x0C => match read_path(args) {
-            Some((path, _)) => {
-                let mut buf = vec![0u8; 4096];
-                let r = unsafe { libc::realpath(path.as_ptr() as *const _, buf.as_mut_ptr() as *mut _) };
-                if r.is_null() { out.push(0x01); out.extend_from_slice(b"realpath"); }
-                else {
-                    let len = unsafe { libc::strlen(r) };
-                    out.push(0);
-                    out.extend_from_slice(&(len as u32).to_le_bytes());
-                    out.extend_from_slice(unsafe { std::slice::from_raw_parts(r as *const u8, len) });
+            Some((path, _)) => match cstring(&path) {
+                Some(p) => {
+                    let mut buf = vec![0u8; 4096];
+                    let r = unsafe { libc::realpath(p.as_ptr(), buf.as_mut_ptr() as *mut _) };
+                    if r.is_null() { out.push(0x01); out.extend_from_slice(b"realpath"); }
+                    else {
+                        let len = unsafe { libc::strlen(r) };
+                        out.push(0);
+                        out.extend_from_slice(&(len as u32).to_le_bytes());
+                        out.extend_from_slice(unsafe { std::slice::from_raw_parts(r as *const u8, len) });
+                    }
                 }
-            }
+                None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+            },
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         0x0D => match read_path(args) {
-            Some((path, _)) => {
-                let mut buf = vec![0u8; 4096];
-                let n = unsafe { libc::readlink(path.as_ptr() as *const _, buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n < 0 { out.push(0x07); out.extend_from_slice(b"readlink"); }
-                else {
-                    out.push(0);
-                    out.extend_from_slice(&(n as u32).to_le_bytes());
-                    out.extend_from_slice(&buf[..n as usize]);
+            Some((path, _)) => match cstring(&path) {
+                Some(p) => {
+                    let mut buf = vec![0u8; 4096];
+                    let n = unsafe { libc::readlink(p.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n < 0 { out.push(0x07); out.extend_from_slice(b"readlink"); }
+                    else {
+                        out.push(0);
+                        out.extend_from_slice(&(n as u32).to_le_bytes());
+                        out.extend_from_slice(&buf[..n as usize]);
+                    }
                 }
-            }
+                None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+            },
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         0x0E => match read_path(args) {
-            Some((target, rest)) => match read_path(&rest) {
-                Some((linkpath, _)) => {
-                    let r = unsafe { libc::symlink(target.as_ptr() as *const _, linkpath.as_ptr() as *const _) };
-                    if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"symlink"); }
-                }
+            Some((target, rest)) => match read_path(rest) {
+                Some((linkpath, _)) => match (cstring(&target), cstring(&linkpath)) {
+                    (Some(t), Some(l)) => {
+                        let r = unsafe { libc::symlink(t.as_ptr(), l.as_ptr()) };
+                        if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"symlink"); }
+                    }
+                    _ => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+                },
                 None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
             },
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
@@ -292,24 +321,32 @@ fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
                         libc::timeval { tv_sec: atime as libc::time_t, tv_usec: 0 },
                         libc::timeval { tv_sec: mtime as libc::time_t, tv_usec: 0 },
                     ];
-                    let r = unsafe { libc::utimes(path.as_ptr() as *const _, times.as_ptr()) };
-                    if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"utimes"); }
+                    match cstring(&path) {
+                        Some(p) => {
+                            let r = unsafe { libc::utimes(p.as_ptr(), times.as_ptr()) };
+                            if r == 0 { out.push(0); } else { out.push(0x07); out.extend_from_slice(b"utimes"); }
+                        }
+                        None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+                    }
                 }
             }
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         0x11 => match read_path(args) {
-            Some((path, _)) => {
-                let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-                let r = unsafe { libc::statvfs(path.as_ptr() as *const _, &mut st) };
-                if r != 0 { out.push(0x07); out.extend_from_slice(b"statvfs"); }
-                else {
-                    out.push(0);
-                    out.extend_from_slice(&st.f_bavail.to_le_bytes());
-                    out.extend_from_slice(&st.f_blocks.to_le_bytes());
-                    out.extend_from_slice(&st.f_bsize.to_le_bytes());
+            Some((path, _)) => match cstring(&path) {
+                Some(p) => {
+                    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+                    let r = unsafe { libc::statvfs(p.as_ptr(), &mut st) };
+                    if r != 0 { out.push(0x07); out.extend_from_slice(b"statvfs"); }
+                    else {
+                        out.push(0);
+                        out.extend_from_slice(&st.f_bavail.to_le_bytes());
+                        out.extend_from_slice(&st.f_blocks.to_le_bytes());
+                        out.extend_from_slice(&st.f_bsize.to_le_bytes());
+                    }
                 }
-            }
+                None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+            },
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
         _ => { out.push(0x0B); out.extend_from_slice(b"unknown op"); }
@@ -325,6 +362,12 @@ fn read_path(args: &[u8]) -> Option<(Vec<u8>, &[u8])> {
     let len = u32::from_le_bytes([args[0], args[1], args[2], args[3]]) as usize;
     if len > MAX_PATH || args.len() < 4 + len { return None; }
     Some((args[4..4+len].to_vec(), &args[4+len..]))
+}
+
+/// NUL-terminate a wire path for libc, rejecting embedded NUL bytes so a
+/// hostile client cannot smuggle a shorter path past the declared length.
+fn cstring(path: &[u8]) -> Option<CString> {
+    CString::new(path.to_vec()).ok()
 }
 
 fn handle_open(args: &[u8]) -> std::result::Result<u32, (u8, &'static str)> {
@@ -426,4 +469,24 @@ fn do_listdir(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, &'static str)> {
     }
     unsafe { libc::closedir(dir) };
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cstring_rejects_embedded_nul() {
+        assert!(cstring(b"/tmp/ok").is_some());
+        assert!(cstring(b"/tmp/a\0/hidden").is_none());
+    }
+
+    #[test]
+    fn dispatch_unlink_rejects_nul_path() {
+        let mut args = 9u32.to_le_bytes().to_vec();
+        args.extend_from_slice(b"/tmp/a\0/hidden");
+        let out = dispatch(0x08, &args);
+        assert_eq!(out[4], 0x08);
+        assert_eq!(&out[5..], b"bad path");
+    }
 }
