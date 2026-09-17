@@ -148,9 +148,16 @@ impl NetstatWatcher {
 
 /// Start the adb server on demand (`adb start-server`), mirroring what the
 /// adb CLI itself does when its server is down. Only meaningful for a local
-/// server; remote `--adb-server` targets are left alone.
+/// server; remote `--adb-server` targets are left alone. Honors a non-default
+/// port via `ANDROID_ADB_SERVER_PORT`/`$ADB_SERVER_PORT` equivalent `-P`.
 async fn ensure_adb_server(host: &str, port: u16) -> std::io::Result<()> {
-    ensure_adb_server_via("adb", &["start-server"], host, port).await
+    let mut args: Vec<String> = vec!["start-server".into()];
+    if port != 5037 {
+        args.push("-P".into());
+        args.push(port.to_string());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    ensure_adb_server_via("adb", &arg_refs, host, port).await
 }
 
 /// Testable core of [`ensure_adb_server`]: run `program args` and require
@@ -164,16 +171,16 @@ async fn ensure_adb_server_via(
     if host != "127.0.0.1" && host != "localhost" && host != "::1" {
         return Err(std::io::Error::other(format!("adb server at {host}:{port} unreachable")));
     }
-    let status = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new(program)
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status(),
-    )
-    .await
-    .map_err(|_| std::io::Error::other("adb start-server timed out"))??;
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| std::io::Error::other(format!("spawn {program}: {e}")))?;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        .await
+        .map_err(|_| std::io::Error::other("adb start-server timed out"))??;
     if !status.success() {
         return Err(std::io::Error::other("adb start-server failed"));
     }
