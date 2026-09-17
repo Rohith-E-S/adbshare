@@ -118,6 +118,116 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn mkdir_encodes_path_before_mode() {
+        use crate::ProxyClient;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cases = [("/new-directory", 0o755u32), ("/資料/café", 0o700)];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for (path, mode) in cases {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(&(path.len() as u32).to_le_bytes());
+                expected.extend_from_slice(path.as_bytes());
+                expected.extend_from_slice(&mode.to_le_bytes());
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], 0x07);
+                assert_eq!(u32::from_le_bytes(header[1..].try_into().unwrap()) as usize, expected.len());
+                let mut args = vec![0; expected.len()];
+                stream.read_exact(&mut args).await.unwrap();
+                assert_eq!(args, expected);
+                stream.write_all(&[1, 0, 0, 0, 0]).await.unwrap();
+            }
+        });
+        let client = ProxyClient::connect(addr, 1).await.unwrap();
+        for (path, mode) in cases {
+            tokio::time::timeout(std::time::Duration::from_secs(3), client.mkdir(path, mode)).await.unwrap().unwrap();
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncate_encodes_path_before_size() {
+        use crate::ProxyClient;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cases = [("/file", 0u64), ("/資料/café.txt", 12345), ("/large-file", 4_294_967_297)];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for (path, size) in cases {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(&(path.len() as u32).to_le_bytes());
+                expected.extend_from_slice(path.as_bytes());
+                expected.extend_from_slice(&size.to_le_bytes());
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], 0x0B);
+                assert_eq!(u32::from_le_bytes(header[1..].try_into().unwrap()) as usize, expected.len());
+                let mut args = vec![0; expected.len()];
+                stream.read_exact(&mut args).await.unwrap();
+                assert_eq!(args, expected);
+                stream.write_all(&[1, 0, 0, 0, 0]).await.unwrap();
+            }
+        });
+        let client = ProxyClient::connect(addr, 1).await.unwrap();
+        for (path, size) in cases {
+            tokio::time::timeout(std::time::Duration::from_secs(3), client.truncate(path, size)).await.unwrap().unwrap();
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn path_operations_return_exact_length_prefixed_strings() {
+        use crate::ProxyClient;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cases = [
+            (Op::ReadLink, "/link", "../target/file.txt"),
+            (Op::ReadLink, "/資料/link", "../写真/café.txt"),
+            (Op::RealPath, "/directory/../file", "/file"),
+            (Op::RealPath, "/資料/../写真/café.txt", "/写真/café.txt"),
+        ];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for (op, path, result) in cases {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(&(path.len() as u32).to_le_bytes());
+                expected.extend_from_slice(path.as_bytes());
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], op as u8);
+                assert_eq!(u32::from_le_bytes(header[1..].try_into().unwrap()) as usize, expected.len());
+                let mut args = vec![0; expected.len()];
+                stream.read_exact(&mut args).await.unwrap();
+                assert_eq!(args, expected);
+                stream.write_all(&((5 + result.len()) as u32).to_le_bytes()).await.unwrap();
+                stream.write_all(&[0]).await.unwrap();
+                stream.write_all(&(result.len() as u32).to_le_bytes()).await.unwrap();
+                stream.write_all(result.as_bytes()).await.unwrap();
+            }
+        });
+        let client = ProxyClient::connect(addr, 1).await.unwrap();
+        for (op, path, expected) in cases {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                match op {
+                    Op::ReadLink => client.read_link(path).await,
+                    Op::RealPath => client.real_path(path).await,
+                    _ => unreachable!(),
+                }
+            }).await.unwrap().unwrap();
+            assert_eq!(result, expected);
+        }
+        server.await.unwrap();
+    }
+
     #[test]
     fn stat_roundtrip() {
         let stat = Stat {

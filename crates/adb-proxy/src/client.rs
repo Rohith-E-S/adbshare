@@ -388,9 +388,9 @@ impl ProxyClient {
         let (conn, _permit) = self.acquire().await?;
         let res = async {
             let mut args = Vec::new();
-            args.extend_from_slice(&mode.to_le_bytes());
             args.extend_from_slice(&(path.len() as u32).to_le_bytes());
             args.extend_from_slice(path.as_bytes());
+            args.extend_from_slice(&mode.to_le_bytes());
             conn.request(Op::Mkdir, &args).await.map(|_| ())
         }.await;
         self.release(conn);
@@ -463,9 +463,9 @@ impl ProxyClient {
         let (conn, _permit) = self.acquire().await?;
         let res = async {
             let mut args = Vec::new();
-            args.extend_from_slice(&size.to_le_bytes());
             args.extend_from_slice(&(path.len() as u32).to_le_bytes());
             args.extend_from_slice(path.as_bytes());
+            args.extend_from_slice(&size.to_le_bytes());
             conn.request(Op::Truncate, &args).await.map(|_| ())
         }.await;
         self.release(conn);
@@ -495,7 +495,7 @@ impl ProxyClient {
             args.extend_from_slice(&(path.len() as u32).to_le_bytes());
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::ReadLink, &args).await?;
-            String::from_utf8(resp.to_vec()).map_err(|_| ProxyError::Invalid("readlink utf8".into()))
+            parse_string(&resp)
         }.await;
         self.release(conn);
         res
@@ -508,7 +508,7 @@ impl ProxyClient {
             args.extend_from_slice(&(path.len() as u32).to_le_bytes());
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::RealPath, &args).await?;
-            String::from_utf8(resp.to_vec()).map_err(|_| ProxyError::Invalid("realpath utf8".into()))
+            parse_string(&resp)
         }.await;
         self.release(conn);
         res
@@ -676,6 +676,18 @@ impl Drop for ProxyFile {
             }
         }
     }
+}
+
+fn parse_string(data: &[u8]) -> Result<String> {
+    if data.len() < 4 {
+        return Err(ProxyError::Invalid("string length prefix".into()));
+    }
+    let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+    if data.len() - 4 != len {
+        return Err(ProxyError::Invalid("string payload length".into()));
+    }
+    String::from_utf8(data[4..].to_vec())
+        .map_err(|_| ProxyError::Invalid("string utf8".into()))
 }
 
 fn parse_dir_entries(data: &[u8]) -> Result<Vec<DirEntry>> {

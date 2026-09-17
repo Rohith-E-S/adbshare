@@ -64,8 +64,8 @@ jobs:
         # Xvfb gives the GUI regression test (hidden-files toggle) a
         # virtual display; GTK needs one to init.
         run: |
-          dnf install -y --setopt=install_weak_deps=False xorg-x11-server-Xvfb
-          xvfb-run -a cargo test --workspace --locked
+          dnf install -y --setopt=install_weak_deps=False xorg-x11-server-Xvfb dbus-daemon
+          dbus-run-session -- xvfb-run -a env GSK_RENDERER=cairo cargo test --workspace --locked
 
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
