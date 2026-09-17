@@ -77,27 +77,10 @@ headerbar .title {
     color: #FFFFFF;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
- *  HEADER — pixel-perfect 36px uniform height for every element
- *
- *  GTK4 Button / ToggleButton / MenuButton all have different default
- *  internal padding.  We strip it all and use min-height to force
- *  every element to exactly 36px outer.
- * ═══════════════════════════════════════════════════════════════════════ */
-
-/* --- Reset: strip ALL default button sizing inside the header --- */
-headerbar button,
-headerbar button.flat,
-headerbar button.image-button,
-headerbar button.text-button,
-headerbar togglebutton > button,
-headerbar menubutton > button,
-headerbar .pill-capsule button,
-headerbar .pill-capsule togglebutton > button {
-    padding: 0;
+headerbar.sleek-headerbar .pill-capsule > button.capsule-btn,
+headerbar.sleek-headerbar .omnibar-pill > button.omnibar-sub-btn,
+headerbar.sleek-headerbar menubutton.pill-capsule-btn > button {
     margin: 0;
-    min-height: 0;
-    min-width: 0;
 }
 
 /* --- Capsule group: the rounded container holding 2–4 icon buttons --- */
@@ -105,13 +88,12 @@ headerbar .pill-capsule togglebutton > button {
     background: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 10px;
-    padding: 3px;
-    min-height: 36px;
+    padding: 2px;
+    min-height: 30px;
 }
 
 /* --- Individual icon buttons inside a capsule --- */
-.capsule-btn,
-.capsule-btn.flat {
+headerbar.sleek-headerbar .pill-capsule > button.capsule-btn {
     border-radius: 7px;
     padding: 0;
     min-width: 30px;
@@ -122,13 +104,13 @@ headerbar .pill-capsule togglebutton > button {
     transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.capsule-btn:hover {
+headerbar.sleek-headerbar .pill-capsule > button.capsule-btn:hover {
     background: rgba(255, 255, 255, 0.08);
     color: #FFFFFF;
 }
 
-.capsule-btn:checked,
-.capsule-btn:active {
+headerbar.sleek-headerbar .pill-capsule > button.capsule-btn:checked,
+headerbar.sleek-headerbar .pill-capsule > button.capsule-btn:active {
     background: rgba(255, 255, 255, 0.12);
     color: #FFFFFF;
 }
@@ -149,34 +131,34 @@ menubutton.pill-capsule-btn {
 }
 
 .pill-capsule-btn:not(menubutton),
-headerbar menubutton.pill-capsule-btn > button {
+headerbar.sleek-headerbar menubutton.pill-capsule-btn > button {
     background: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 10px;
-    padding: 0 10px;
-    min-height: 36px;
-    min-width: 36px;
+    padding: 0;
+    min-height: 34px;
+    min-width: 34px;
     color: #BFC6D4;
     transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .pill-capsule-btn:not(menubutton):hover,
-headerbar menubutton.pill-capsule-btn > button:hover {
+headerbar.sleek-headerbar menubutton.pill-capsule-btn > button:hover {
     background: rgba(255, 255, 255, 0.08);
     border-color: rgba(255, 255, 255, 0.1);
     color: #FFFFFF;
 }
 
 .pill-capsule-btn:not(menubutton):checked,
-headerbar menubutton.pill-capsule-btn > button:checked {
+headerbar.sleek-headerbar menubutton.pill-capsule-btn > button:checked {
     background: rgba(255, 255, 255, 0.12);
     border-color: rgba(255, 255, 255, 0.15);
     color: #FFFFFF;
 }
 
 /* Hide the built-in dropdown arrow on MenuButtons */
-headerbar menubutton.pill-capsule-btn > button > arrow,
-headerbar menubutton.pill-capsule-btn > button > .arrow {
+headerbar.sleek-headerbar menubutton.pill-capsule-btn > button > arrow,
+headerbar.sleek-headerbar menubutton.pill-capsule-btn > button > .arrow {
     min-width: 0;
     min-height: 0;
     margin: 0;
@@ -186,20 +168,22 @@ headerbar menubutton.pill-capsule-btn > button > .arrow {
 }
 
 /* --- Window control buttons (close/minimize/maximize from Adwaita) --- */
-headerbar windowcontrols {
+headerbar.sleek-headerbar windowcontrols {
     border-spacing: 4px;
     margin-right: 4px;
 }
 
-headerbar windowcontrols button {
+headerbar.sleek-headerbar windowcontrols button {
     background: transparent;
     border: none;
     box-shadow: none;
+    min-width: 36px;
+    min-height: 36px;
     padding: 0;
     margin: 0 2px;
 }
 
-headerbar windowcontrols button > image {
+headerbar.sleek-headerbar windowcontrols button > image {
     min-width: 26px;
     min-height: 26px;
     padding: 0;
@@ -211,13 +195,13 @@ headerbar windowcontrols button > image {
     transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-headerbar windowcontrols button:hover > image {
+headerbar.sleek-headerbar windowcontrols button:hover > image {
     background-color: rgba(255, 255, 255, 0.14);
     border-color: rgba(255, 255, 255, 0.18);
     color: #FFFFFF;
 }
 
-headerbar windowcontrols button:active > image {
+headerbar.sleek-headerbar windowcontrols button:active > image {
     background-color: rgba(255, 255, 255, 0.22);
     color: #FFFFFF;
 }
@@ -231,7 +215,7 @@ headerbar windowcontrols button:active > image {
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 10px;
     padding: 0 10px;
-    min-height: 36px;
+    min-height: 34px;
     transition: all 200ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
@@ -247,24 +231,29 @@ headerbar windowcontrols button:active > image {
     opacity: 0.7;
 }
 
-.omnibar-sub-btn,
-.omnibar-sub-btn.flat {
+headerbar.sleek-headerbar .omnibar-pill > stack > entry {
+    min-height: 32px;
+    padding: 0 10px;
+    margin: 0;
+}
+
+headerbar.sleek-headerbar .omnibar-pill > button.omnibar-sub-btn {
     border-radius: 7px;
-    padding: 0 6px;
-    min-height: 26px;
-    min-width: 26px;
+    padding: 0;
+    min-height: 30px;
+    min-width: 30px;
     border: none;
     background: transparent;
     color: #667085;
     transition: all 150ms ease;
 }
 
-.omnibar-sub-btn:hover {
+headerbar.sleek-headerbar .omnibar-pill > button.omnibar-sub-btn:hover {
     background: rgba(255, 255, 255, 0.08);
     color: #FFFFFF;
 }
 
-.omnibar-sub-btn:checked {
+headerbar.sleek-headerbar .omnibar-pill > button.omnibar-sub-btn:checked {
     background: rgba(255, 255, 255, 0.12);
     color: #FFFFFF;
 }
