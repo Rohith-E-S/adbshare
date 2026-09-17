@@ -61,7 +61,11 @@ impl AsyncRead for Stream {
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if let Some(pending) = self.incoming.lock().take() {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let pending = self.incoming.lock().take();
+        if let Some(pending) = pending {
             let n = pending.len().min(buf.remaining());
             buf.put_slice(&pending[..n]);
             if n < pending.len() {
@@ -391,5 +395,90 @@ impl Drop for AdbConnection {
         if let Some(tx) = self.reader_close_tx.take() {
             let _ = tx.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::time::Duration;
+
+    fn with_timeout(test: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            test();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5)).expect("stream read did not complete");
+        worker.join().unwrap();
+    }
+
+    fn stream() -> (mpsc::Sender<Bytes>, Stream) {
+        let (tx, rx) = mpsc::channel(4);
+        let (write_tx, _) = mpsc::channel(1);
+        (tx, Stream {
+            id: StreamId(1, 2),
+            rx,
+            incoming: Arc::new(PlMutex::new(None)),
+            write_tx,
+            close_tx: None,
+        })
+    }
+
+    fn read(stream: &mut Stream, bytes: &mut [u8]) -> Poll<usize> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf = ReadBuf::new(bytes);
+        Pin::new(stream).poll_read(&mut cx, &mut buf).map(|result| {
+            result.unwrap();
+            buf.filled().len()
+        })
+    }
+
+    #[test]
+    fn partial_reads_preserve_buffered_data_and_chunk_order() {
+        with_timeout(|| {
+            let (tx, mut stream) = stream();
+            tx.try_send(Bytes::from_static(b"abcdef")).unwrap();
+            tx.try_send(Bytes::from_static(b"ghij")).unwrap();
+            drop(tx);
+
+            let mut buf = [0; 2];
+            for expected in [b"ab", b"cd", b"ef", b"gh", b"ij"] {
+                assert_eq!(read(&mut stream, &mut buf), Poll::Ready(2));
+                assert_eq!(&buf, expected);
+            }
+            assert_eq!(read(&mut stream, &mut buf), Poll::Ready(0));
+            assert!(stream.incoming.lock().is_none());
+        });
+    }
+
+    #[test]
+    fn zero_length_reads_are_ready_without_consuming_data() {
+        with_timeout(|| {
+            let (tx, mut stream) = stream();
+            assert_eq!(read(&mut stream, &mut []), Poll::Ready(0));
+            assert_eq!(read(&mut stream, &mut [0]), Poll::Pending);
+
+            tx.try_send(Bytes::from_static(b"abcd")).unwrap();
+            assert_eq!(read(&mut stream, &mut []), Poll::Ready(0));
+            assert_eq!(stream.rx.len(), 1);
+            assert!(stream.incoming.lock().is_none());
+
+            let mut buf = [0; 2];
+            assert_eq!(read(&mut stream, &mut buf), Poll::Ready(2));
+            assert_eq!(&buf, b"ab");
+            assert_eq!(read(&mut stream, &mut []), Poll::Ready(0));
+            assert_eq!(stream.incoming.lock().as_deref(), Some(&b"cd"[..]));
+            assert_eq!(read(&mut stream, &mut buf), Poll::Ready(2));
+            assert_eq!(&buf, b"cd");
+            assert_eq!(read(&mut stream, &mut buf), Poll::Pending);
+
+            drop(tx);
+            assert_eq!(read(&mut stream, &mut []), Poll::Ready(0));
+            assert_eq!(read(&mut stream, &mut buf), Poll::Ready(0));
+        });
     }
 }
