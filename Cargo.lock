@@ -123,6 +123,7 @@ dependencies = [
 name = "adbshare-proxy-device"
 version = "0.1.0"
 dependencies = [
+ "adb-proxy",
  "libc",
  "tokio",
 ]

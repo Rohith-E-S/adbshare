@@ -10,6 +10,10 @@ publish = false
 libc = "0.2"
 tokio = { version = "1.41", default-features = false, features = ["net", "rt", "io-util", "macros"] }
 
+[dev-dependencies]
+adb-proxy = { path = "../adb-proxy" }
+tokio = { version = "1.41", default-features = false, features = ["time"] }
+
 [[bin]]
 name = "adbshare-proxy"
 path = "src/main.rs"
