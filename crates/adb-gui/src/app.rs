@@ -43,6 +43,7 @@ trait Manager {
     async fn cancel_job(&self, id: u64) -> zbus::Result<bool>;
     async fn mkdir(&self, device: &str, path: &str) -> zbus::Result<()>;
     async fn rename(&self, device: &str, src: &str, dst: &str) -> zbus::Result<()>;
+    async fn copy_file(&self, device: &str, src: &str, dst: &str) -> zbus::Result<()>;
     async fn delete(&self, device: &str, path: &str) -> zbus::Result<()>;
     async fn connect_wireless(&self, address: &str) -> zbus::Result<String>;
     async fn mountpoint_for(&self, device: &str) -> zbus::Result<String>;
@@ -1152,9 +1153,6 @@ fn list_local_dir(path: &std::path::Path) -> Result<Vec<FsDirEntry>, String> {
 /// Sentinel "serial" for local-filesystem listings on the dir channel.
 const LOCAL_DEVICE: &str = "__local__";
 
-/// Ctrl+V: resolve the in-app copy snapshot into the existing transfer paths
-/// (local copy / device rename / push / pull). When the snapshot is empty,
-/// fall back to the GDK clipboard text (paths copied from another app).
 fn paste_clipboard(
     handles: &std::rc::Rc<UiHandles>,
     rt: &tokio::runtime::Handle,
@@ -1196,7 +1194,7 @@ fn paste_clipboard(
                         let _ = op_tx.try_send((None, Err(format!("paste: {err}"))));
                     }
                 }
-                refresh_after(&dir_tx, &rt2, snap.from_dir.clone());
+                refresh_after(&dir_tx, &rt2, target_dir);
             });
         }
         (false, false) => {
@@ -1226,15 +1224,15 @@ fn paste_clipboard(
                         continue;
                     }
                     if let Err(err) =
-                        rename(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
+                        copy_file(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
                     {
-                        let _ = op_tx.try_send((None, Err(format!("paste: {err}"))));
+                        let _ = op_tx.try_send((None, Err(format!("copy {}: {err}", e.name))));
                     }
                 }
-                let res = list_dir(&device, &from.to_string_lossy())
+                let res = list_dir(&device, &target_dir.to_string_lossy())
                     .await
                     .map_err(|e| e.to_string());
-                let _ = dir_tx.send((device, from, res)).await;
+                let _ = dir_tx.send((device, target_dir, res)).await;
             });
         }
         (true, false) => {
@@ -2350,6 +2348,45 @@ async fn mkdir(device: &str, path: &str) -> anyhow::Result<()> {
 async fn rename(device: &str, src: &str, dst: &str) -> anyhow::Result<()> {
     let proxy = get_manager().await?;
     Ok(proxy.rename(device, src, dst).await?)
+}
+
+async fn copy_file(device: &str, src: &str, dst: &str) -> anyhow::Result<()> {
+    let proxy = get_manager().await?;
+    Ok(proxy.copy_file(device, src, dst).await?)
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+
+    struct CopyManager;
+
+    #[zbus::interface(name = "org.adbshare.Manager")]
+    impl CopyManager {
+        async fn copy_file(&self, device: &str, src: &str, dst: &str) -> zbus::fdo::Result<()> {
+            assert_eq!((device, src, dst), ("test-phone", "/source", "/destination"));
+            Err(zbus::fdo::Error::Failed(
+                "completion unknown; destination may be incomplete or still copying".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session -- cargo test -p adb-gui --locked copy_wrapper_preserves_unknown_completion -- --ignored"]
+    async fn copy_wrapper_preserves_unknown_completion() {
+        let server = zbus::ConnectionBuilder::session().unwrap()
+            .serve_at("/org/adbshare/Manager", CopyManager).unwrap()
+            .build().await.unwrap();
+        let connection = zbus::Connection::session().await.unwrap();
+        let proxy = ManagerProxy::builder(&connection)
+            .destination(server.unique_name().unwrap().to_owned()).unwrap()
+            .build().await.unwrap();
+        assert!(MANAGER_PROXY.set(proxy).is_ok());
+        let error = copy_file("test-phone", "/source", "/destination").await.unwrap_err();
+        assert!(error.to_string().contains(
+            "completion unknown; destination may be incomplete or still copying"
+        ));
+    }
 }
 
 async fn delete(device: &str, path: &str) -> anyhow::Result<()> {

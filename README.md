@@ -201,8 +201,8 @@ Use **Install APK…** in the more-options menu, or the APK context action. Drop
 
 ## Current limitations
 
-- **Phone deletion is permanent.** The phone-side “Move to Trash” action also leads to permanent deletion; there is no phone trash/recovery feature.
-- **Same-phone paste currently moves files instead of copying them.** Do not use it to make a backup. Cross-phone paste is unsupported, and queued copy operations handle files rather than directory trees.
+- **Phone deletion is permanent.** Only local files offer “Move to Trash”; there is no phone trash/recovery feature.
+- Same-phone paste copies regular files without replacing existing destinations. It requires the updated phone helper and does not support copying symlinks or directories. If a copy loses its connection or times out, completion is unknown: the destination may be incomplete or still copying. Cross-phone paste is unsupported, and queued copy operations handle files rather than directory trees.
 - The transfer queue is in memory and is lost when the daemon exits. Reconnecting can retry work, but reliable byte-offset resumption is not guaranteed.
 - The GUI does not expose overwrite policies, checksum-verification settings, or automatic folder synchronization.
 - FUSE enables external file opening and dragging phone files out. Without it, use in-app browsing and queued transfers instead.

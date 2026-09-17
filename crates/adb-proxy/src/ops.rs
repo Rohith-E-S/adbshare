@@ -22,6 +22,7 @@ pub enum Op {
     Lstat = 0x0F,
     Utime = 0x10,
     DiskUsage = 0x11,
+    CopyFile = 0x12,
 }
 
 #[repr(u8)]
