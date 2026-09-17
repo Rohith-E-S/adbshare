@@ -435,6 +435,30 @@ impl ProxyClient {
         res
     }
 
+    pub async fn copy_file(&self, src: &str, dst: &str) -> Result<()> {
+        for path in [src, dst] {
+            if !path.starts_with('/') || path.contains('\0') || path.len() > 4096 {
+                return Err(ProxyError::Status(Status::InvalidArg, "copy paths must be absolute, non-NUL, and at most 4096 bytes".into()));
+            }
+        }
+        let (conn, _permit) = self.acquire().await?;
+        let mut args = Vec::new();
+        args.extend_from_slice(&(src.len() as u32).to_le_bytes());
+        args.extend_from_slice(src.as_bytes());
+        args.extend_from_slice(&(dst.len() as u32).to_le_bytes());
+        args.extend_from_slice(dst.as_bytes());
+        let res = conn.request(Op::CopyFile, &args).await.map(|_| ()).map_err(|error| {
+            match error {
+                ProxyError::Status(_, _) => error,
+                _ => ProxyError::Other(format!(
+                    "{error}; completion unknown; destination may be incomplete or still copying"
+                )),
+            }
+        });
+        self.release(conn);
+        res
+    }
+
     pub async fn truncate(&self, path: &str, size: u64) -> Result<()> {
         let (conn, _permit) = self.acquire().await?;
         let res = async {

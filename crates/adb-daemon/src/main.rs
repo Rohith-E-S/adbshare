@@ -109,6 +109,155 @@ fn parse_adb_server(spec: &str) -> (String, u16) {
 mod tests {
     use super::*;
 
+    struct TestHelper {
+        dir: PathBuf,
+        child: Option<std::process::Child>,
+    }
+
+    impl TestHelper {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "adbshare-dbus-copy-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self { dir, child: None }
+        }
+    }
+
+    impl Drop for TestHelper {
+        fn drop(&mut self) {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session -- env ADBSHARE_TEST_PROXY_BIN=/absolute/path/to/adbshare-proxy cargo test -p adb-daemon --locked copy_file_over_dbus_with_device_helper -- --ignored --exact tests::copy_file_over_dbus_with_device_helper"]
+    async fn copy_file_over_dbus_with_device_helper() {
+        use tokio::io::AsyncReadExt;
+
+        let binary = PathBuf::from(std::env::var_os("ADBSHARE_TEST_PROXY_BIN")
+            .expect("set ADBSHARE_TEST_PROXY_BIN to the host-built adbshare-proxy binary"));
+        assert!(binary.is_absolute() && binary.is_file(), "ADBSHARE_TEST_PROXY_BIN must be an absolute path to a host-built helper");
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").expect("run this test under dbus-run-session");
+        let mut helper = TestHelper::new();
+        let port = allocate_host_port().unwrap();
+        helper.child = Some(std::process::Command::new(binary)
+            .arg(port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn().expect("start host-built device helper"));
+        let client = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(helper.child.as_mut().unwrap().try_wait().unwrap().is_none(), "helper exited before becoming ready");
+                if let Ok(client) = ProxyClient::connect(format!("127.0.0.1:{port}"), 1).await {
+                    return client;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("helper did not start within 5 seconds");
+        assert_eq!(client.max_conns(), 1);
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let disconnected = ProxyClient::connect(listener.local_addr().unwrap().to_string(), 1).await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let state = Arc::new(Mutex::new(State::default()));
+            for (serial, client) in [("test-helper", client), ("test-disconnect", disconnected)] {
+                state.lock().devices.insert(DeviceId(serial.into()), DeviceSlot {
+                    mountpoint: None,
+                    client: Arc::new(client),
+                    host_port: port,
+                    setup_ok: true,
+                });
+            }
+            let (queue, _rx) = JobQueue::new(1);
+            let service = ConnectionBuilder::session().unwrap()
+                .serve_at("/org/adbshare/Manager", ManagerInterface { state, queue }).unwrap()
+                .build().await.unwrap();
+            let connection = zbus::Connection::session().await.unwrap();
+            let proxy = zbus::Proxy::new(
+                &connection,
+                service.unique_name().unwrap().as_str(),
+                "/org/adbshare/Manager",
+                "org.adbshare.Manager",
+            ).await.unwrap();
+            let source = helper.dir.join("source");
+            let destination = helper.dir.join("destination");
+            let existing = helper.dir.join("existing");
+            let second = helper.dir.join("second");
+            let data: Vec<u8> = (0..1024 * 1024 + 19).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&source, &data).unwrap();
+            std::fs::write(&existing, b"keep existing destination").unwrap();
+            let source_path = source.to_str().unwrap();
+            let result: zbus::Result<()> = proxy.call("CopyFile", &("test-helper", source_path, destination.to_str().unwrap())).await;
+            result.unwrap();
+            assert_eq!(std::fs::read(&source).unwrap(), data);
+            assert_eq!(std::fs::read(&destination).unwrap(), data);
+
+            let result: zbus::Result<()> = proxy.call("CopyFile", &("test-helper", source_path, existing.to_str().unwrap())).await;
+            match result.unwrap_err() {
+                zbus::Error::MethodError(name, Some(message), _) => {
+                    assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.Failed");
+                    assert!(message.contains("server error: Exists"), "{message}");
+                    assert!(!message.contains("completion unknown"), "{message}");
+                }
+                error => panic!("unexpected D-Bus error: {error}"),
+            }
+            assert_eq!(std::fs::read(&existing).unwrap(), b"keep existing destination");
+            assert_eq!(std::fs::read(&source).unwrap(), data);
+            let result: zbus::Result<()> = proxy.call("CopyFile", &("test-helper", source_path, second.to_str().unwrap())).await;
+            result.unwrap();
+            assert_eq!(std::fs::read(&source).unwrap(), data);
+            assert_eq!(std::fs::read(&second).unwrap(), data);
+            assert_eq!(std::fs::read(&destination).unwrap(), data);
+
+            let disconnect = async move {
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], adb_proxy::ops::Op::CopyFile as u8);
+                let mut args = vec![0; u32::from_le_bytes(header[1..].try_into().unwrap()) as usize];
+                stream.read_exact(&mut args).await.unwrap();
+                drop(stream);
+            };
+            let args = ("test-disconnect", source_path, existing.to_str().unwrap());
+            let call = proxy.call::<_, _, ()>("CopyFile", &args);
+            let (result, ()) = tokio::join!(call, disconnect);
+            match result.unwrap_err() {
+                zbus::Error::MethodError(name, Some(message), _) => {
+                    assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.Failed");
+                    assert_eq!(message, "copy_file: connection closed; completion unknown; destination may be incomplete or still copying");
+                }
+                error => panic!("unexpected D-Bus error: {error}"),
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err());
+            assert_eq!(std::fs::read(&source).unwrap(), data);
+            assert_eq!(std::fs::read(&existing).unwrap(), b"keep existing destination");
+        }).await.expect("D-Bus copy integration test timed out");
+    }
+
+    #[tokio::test]
+    async fn copy_file_validates_paths_and_requires_connected_device() {
+        let (queue, _rx) = JobQueue::new(1);
+        let manager = ManagerInterface {
+            state: Arc::new(Mutex::new(State::default())),
+            queue,
+        };
+        for path in ["", "relative", "/nul\0hidden", &"/".repeat(4097)] {
+            for (src, dst) in [(path, "/destination"), ("/source", path)] {
+                assert!(matches!(manager.copy_file("missing", src, dst).await,
+                    Err(zbus::fdo::Error::InvalidArgs(_))));
+            }
+        }
+        assert!(matches!(manager.copy_file("missing", "/source", "/destination").await,
+            Err(zbus::fdo::Error::ServiceUnknown(_))));
+    }
+
     #[test]
     fn adb_server_parses_ipv4_and_default() {
         assert_eq!(parse_adb_server("127.0.0.1:5037"), ("127.0.0.1".into(), 5037));
@@ -1071,6 +1220,19 @@ impl ManagerInterface {
         let client = client_for(&self.state, device)?;
         client.rename(src, dst).await
             .map_err(|e| zbus::fdo::Error::Failed(format!("rename: {e}")))
+    }
+
+    async fn copy_file(&self, device: &str, src: &str, dst: &str) -> zbus::fdo::Result<()> {
+        for path in [src, dst] {
+            if !path.starts_with('/') || path.contains('\0') || path.len() > 4096 {
+                return Err(zbus::fdo::Error::InvalidArgs(
+                    "copy paths must be absolute, non-NUL, and at most 4096 bytes".into(),
+                ));
+            }
+        }
+        let client = client_for(&self.state, device)?;
+        client.copy_file(src, dst).await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("copy_file: {e}")))
     }
 
     /// Delete a file or directory tree on the device.

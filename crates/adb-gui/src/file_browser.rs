@@ -2135,14 +2135,12 @@ impl FileBrowser {
                     let sel = browser.selected_entries();
                     if !sel.is_empty() {
                         if browser.is_local_mode() {
-                            let curr = browser.current_path();
-                            for e in &sel {
-                                let target = curr.join(&e.name);
-                                let _ = std::process::Command::new("gio")
-                                    .args(["trash", &target.to_string_lossy()])
-                                    .status();
-                            }
-                            browser.emit(BrowserEvent::Refresh);
+                            trash_local_entries(
+                                &browser.root,
+                                &browser.current_path(),
+                                &sel,
+                                &browser.on_event,
+                            );
                         } else {
                             let label = if sel.len() == 1 {
                                 sel[0].name.clone()
@@ -2761,47 +2759,34 @@ fn show_context_menu(
     menu_box.append(&rename_btn);
 
     // 8. Move to Trash / 9. Delete Permanently — the whole selection.
-    let (trash_btn, _) = create_menu_button(
-        "user-trash-symbolic",
-        "Move to Trash",
-        Some("Delete"),
-        false,
-        false,
-    );
-    {
+    if local {
+        let (trash_btn, _) = create_menu_button(
+            "user-trash-symbolic",
+            "Move to Trash",
+            Some("Delete"),
+            false,
+            false,
+        );
         let sel = selected.to_vec();
-        let label = selection_label.clone();
         let on_ev = on_event.clone();
         let p = popover.clone();
         let widget_for_trash = target_widget.clone().upcast::<gtk4::Widget>();
         let curr_for_trash = curr_path.clone();
         trash_btn.connect_clicked(move |_| {
             p.popdown();
-            if local {
-                // Real trash: recoverable via gio (goes to ~/.local/share/Trash).
-                for e in &sel {
-                    let target = curr_for_trash.join(&e.name);
-                    let _ = std::process::Command::new("gio")
-                        .args(["trash", &target.to_string_lossy()])
-                        .status();
-                }
-                emit(&on_ev, BrowserEvent::Refresh);
-            } else {
-                // The daemon delete is permanent; confirm first.
-                show_delete_dialog(&widget_for_trash, &label, sel.clone(), &on_ev);
-            }
+            trash_local_entries(&widget_for_trash, &curr_for_trash, &sel, &on_ev);
         });
+        menu_box.append(&trash_btn);
     }
-    menu_box.append(&trash_btn);
 
     let (del_btn, _) = create_menu_button(
         "edit-delete-symbolic",
         if local {
             "Delete permanently"
         } else {
-            "Delete from phone"
+            "Delete permanently from phone"
         },
-        Some("Shift+Del"),
+        Some(if local { "Shift+Del" } else { "Delete" }),
         false,
         true,
     );
@@ -2962,6 +2947,50 @@ fn show_rename_dialog(
     dialog.present();
 }
 
+fn trash_local_entries(
+    parent: &impl IsA<gtk4::Widget>,
+    curr_path: &std::path::Path,
+    entries: &[DirEntry],
+    on_event: &Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let window = parent
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let paths: Vec<_> = entries.iter().map(|e| curr_path.join(&e.name)).collect();
+    let on_event = on_event.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let mut errors = Vec::new();
+        for path in paths {
+            if let Err(error) = gtk4::gio::File::for_path(&path)
+                .trash_future(glib::Priority::DEFAULT)
+                .await
+            {
+                errors.push(format!("{}: {}", path.display(), error));
+            }
+        }
+        if let Some(cb) = on_event.borrow().as_ref() {
+            cb(BrowserEvent::Refresh);
+        }
+        if !errors.is_empty() {
+            let mut builder = adw::MessageDialog::builder()
+                .heading("Could not move items to Trash")
+                .body(errors.join("\n"))
+                .modal(true);
+            if let Some(ref w) = window {
+                builder = builder.transient_for(w);
+            }
+            let dialog = builder.build();
+            dialog.add_response("close", "Close");
+            dialog.set_default_response(Some("close"));
+            dialog.set_close_response("close");
+            dialog.present();
+        }
+    });
+}
+
 fn show_delete_dialog(
     parent: &impl IsA<gtk4::Widget>,
     label: &str,
@@ -3091,6 +3120,137 @@ fn show_properties_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletion_menu_and_trash_errors() {
+        if std::env::var_os("ADBSHARE_DELETION_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "file_browser::tests::deletion_menu_and_trash_errors",
+                    "--nocapture",
+                ])
+                .env("ADBSHARE_DELETION_TEST_CHILD", "1")
+                .status()
+                .expect("Failed to start isolated GTK regression test");
+            assert!(status.success(), "GTK regression test failed: {status}");
+            return;
+        }
+        adw::init().expect("GTK and libadwaita require an available display");
+        let parent = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let window = gtk4::Window::builder().child(&parent).build();
+        window.present();
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while parent.width() == 0 && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(parent.width() > 0);
+        let entries = vec![DirEntry {
+            name: "missing-trash-test-file".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            mtime: 0,
+        }];
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let on_event: Rc<RefCell<Option<Box<dyn Fn(BrowserEvent)>>>> =
+            Rc::new(RefCell::new(Some(Box::new(move |ev| {
+                recorded.borrow_mut().push(ev);
+            }))));
+        for local in [true, false] {
+            show_context_menu(
+                &parent,
+                0.0,
+                0.0,
+                &entries,
+                &entries[0],
+                &on_event,
+                &PathBuf::from("/dev/null"),
+                "test-phone",
+                local,
+            );
+            let popover = parent
+                .first_child()
+                .unwrap()
+                .downcast::<gtk4::Popover>()
+                .unwrap();
+            let menu = popover.child().unwrap();
+            let mut buttons = Vec::new();
+            let mut child = menu.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if let Ok(button) = widget.downcast::<gtk4::Button>() {
+                    let label = button
+                        .child()
+                        .unwrap()
+                        .first_child()
+                        .unwrap()
+                        .next_sibling()
+                        .unwrap()
+                        .downcast::<gtk4::Label>()
+                        .unwrap();
+                    buttons.push((label.text().to_string(), button));
+                }
+            }
+            assert_eq!(
+                buttons.iter().any(|(label, _)| label == "Move to Trash"),
+                local
+            );
+            let destructive: Vec<_> = buttons
+                .iter()
+                .filter(|(_, button)| button.has_css_class("destructive"))
+                .collect();
+            assert_eq!(destructive.len(), 1);
+            assert_eq!(
+                destructive[0].0,
+                if local {
+                    "Delete permanently"
+                } else {
+                    "Delete permanently from phone"
+                }
+            );
+            for response in [gtk4::ResponseType::Cancel, gtk4::ResponseType::Ok] {
+                destructive[0].1.emit_clicked();
+                assert!(events.borrow().is_empty());
+                let dialog = gtk4::Window::list_toplevels()
+                    .into_iter()
+                    .find_map(|w| w.downcast::<gtk4::Dialog>().ok())
+                    .unwrap();
+                dialog.response(response);
+                if response == gtk4::ResponseType::Ok {
+                    assert!(matches!(&events.borrow()[0], BrowserEvent::Delete(sel)
+                        if sel.len() == 1 && sel[0].name == entries[0].name));
+                    events.borrow_mut().clear();
+                }
+            }
+            popover.unparent();
+        }
+        trash_local_entries(&parent, std::path::Path::new("/dev/null"), &entries, &on_event);
+        assert!(events.borrow().is_empty());
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while events.borrow().is_empty() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(events.borrow().len(), 1);
+        assert!(matches!(events.borrow()[0], BrowserEvent::Refresh));
+        let dialog = gtk4::Window::list_toplevels()
+            .into_iter()
+            .find_map(|w| w.downcast::<adw::MessageDialog>().ok())
+            .unwrap();
+        assert_eq!(
+            dialog.heading().as_deref(),
+            Some("Could not move items to Trash")
+        );
+        assert!(dialog.body().contains("/dev/null/missing-trash-test-file"));
+        dialog.close();
+        window.close();
+    }
 
     #[test]
     fn toggle_show_hidden_rebuilds_both_views() {

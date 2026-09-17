@@ -47,7 +47,7 @@ async fn main() -> ExitCode {
     wlog(format!("listening on 127.0.0.1:{} (loopback only)", port));
 
     loop {
-        wlog(format!("[main] waiting for connection"));
+        wlog("[main] waiting for connection".to_string());
         match listener.accept().await {
             Ok((stream, addr)) => {
                 wlog(format!("accepted from {:?}", addr));
@@ -349,12 +349,110 @@ fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
             },
             None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
         },
+        0x12 => match read_two_paths(args) {
+            Some((src, dst)) => match do_copy_file(&src, &dst) {
+                Ok(()) => { out.push(0); }
+                Err((s, msg)) => { out.push(s); out.extend_from_slice(msg.as_bytes()); }
+            },
+            None => { out.push(0x08); out.extend_from_slice(b"bad path"); }
+        },
         _ => { out.push(0x0B); out.extend_from_slice(b"unknown op"); }
     }
     let mut framed = Vec::with_capacity(out.len() + 4);
     framed.extend_from_slice(&(out.len() as u32).to_le_bytes());
     framed.extend_from_slice(&out);
     framed
+}
+
+fn read_two_paths(args: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (src, rest) = read_path(args)?;
+    let (dst, rest) = read_path(rest)?;
+    if !rest.is_empty() || [&src, &dst].iter().any(|p| !p.starts_with(b"/") || p.contains(&0)) {
+        return None;
+    }
+    Some((src, dst))
+}
+
+fn copy_error(error: std::io::Error) -> (u8, String) {
+    let status = match error.raw_os_error() {
+        Some(libc::ENOENT) => 0x01,
+        Some(libc::EACCES | libc::EPERM) => 0x02,
+        Some(libc::EISDIR) => 0x03,
+        Some(libc::ENOTDIR) => 0x04,
+        Some(libc::EEXIST) => 0x05,
+        Some(libc::EINVAL | libc::ELOOP) => 0x08,
+        Some(libc::ENOSPC) => 0x09,
+        Some(libc::ENAMETOOLONG) => 0x0A,
+        _ => 0x07,
+    };
+    (status, error.to_string())
+}
+
+fn do_copy_file(src: &[u8], dst: &[u8]) -> Result<(), (u8, String)> {
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    use std::path::Path;
+
+    if [src, dst].iter().any(|p| !p.starts_with(b"/") || p.contains(&0) || p.len() > MAX_PATH) {
+        return Err((0x08, "bad path".into()));
+    }
+    let src = Path::new(std::ffi::OsStr::from_bytes(src));
+    let source = OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(src).map_err(copy_error)?;
+    let metadata = source.metadata().map_err(copy_error)?;
+    if !metadata.is_file() {
+        return Err((if metadata.is_dir() { 0x03 } else { 0x08 }, "source must be a regular file".into()));
+    }
+    if matches!(dst.rsplit(|b| *b == b'/').next(), Some(b"" | b"." | b"..")) {
+        return Err((0x08, "destination must name a file".into()));
+    }
+    let dst = Path::new(std::ffi::OsStr::from_bytes(dst));
+    let name = dst.file_name().ok_or_else(|| (0x08, "destination must name a file".into()))?;
+    let parent = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY)
+        .open(dst.parent().unwrap()).map_err(copy_error)?;
+    let name = CString::new(name.as_bytes()).unwrap();
+    let fd = unsafe {
+        libc::openat(parent.as_raw_fd(), name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o666)
+    };
+    if fd < 0 { return Err(copy_error(std::io::Error::last_os_error())); }
+    let mut destination = unsafe { File::from_raw_fd(fd) };
+    copy_into_owned(source, metadata.len(), &mut destination, &parent, &name).map_err(copy_error)
+}
+
+fn copy_into_owned(
+    source: impl std::io::Read,
+    size: u64,
+    destination: &mut std::fs::File,
+    parent: &std::fs::File,
+    name: &CString,
+) -> std::io::Result<()> {
+    let result = (|| {
+        let copied = std::io::copy(&mut source.take(size), destination)?;
+        if copied != size {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "source shortened during copy"));
+        }
+        destination.sync_all()
+    })();
+    if result.is_err() {
+        remove_owned_partial(parent, name, destination);
+    }
+    result
+}
+
+fn remove_owned_partial(parent: &std::fs::File, name: &CString, file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(owned) = file.metadata() else { return };
+    let mut current: libc::stat = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if result == 0 && current.st_dev == owned.dev() && current.st_ino == owned.ino() {
+        unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    }
 }
 
 fn read_path(args: &[u8]) -> Option<(Vec<u8>, &[u8])> {
@@ -474,6 +572,177 @@ fn do_listdir(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!("adbshare-copy-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> Vec<u8> {
+            use std::os::unix::ffi::OsStrExt;
+            self.0.join(name).as_os_str().as_bytes().to_vec()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn copy_args(src: &[u8], dst: &[u8]) -> Vec<u8> {
+        let mut args = Vec::new();
+        for path in [src, dst] {
+            args.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            args.extend_from_slice(path);
+        }
+        args
+    }
+
+    #[test]
+    fn copy_preserves_source_for_empty_small_and_large_files() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TestDir::new();
+        for size in [0, 17, 8 * 1024 * 1024 + 19] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let src = dir.0.join("source");
+            let dst = dir.0.join(format!("copy-{size}"));
+            std::fs::write(&src, &data).unwrap();
+            let before = std::fs::metadata(&src).unwrap();
+            let response = dispatch(0x12, &copy_args(&dir.path("source"), &dir.path(&format!("copy-{size}"))));
+            assert_eq!(response, [1, 0, 0, 0, 0]);
+            assert_eq!(std::fs::read(&src).unwrap(), data);
+            assert_eq!(std::fs::read(&dst).unwrap(), data);
+            let after = std::fs::metadata(&src).unwrap();
+            assert_eq!(before.ino(), after.ino());
+            assert_eq!(before.mtime(), after.mtime());
+            assert_eq!(before.mtime_nsec(), after.mtime_nsec());
+            assert_ne!(after.ino(), std::fs::metadata(&dst).unwrap().ino());
+        }
+    }
+
+    #[test]
+    fn copy_refuses_existing_destinations_and_source_aliases() {
+        use std::os::unix::fs::symlink;
+        let dir = TestDir::new();
+        std::fs::write(dir.0.join("source"), b"source").unwrap();
+        std::fs::write(dir.0.join("existing"), b"keep").unwrap();
+        std::fs::hard_link(dir.0.join("source"), dir.0.join("hardlink")).unwrap();
+        symlink("source", dir.0.join("symlink")).unwrap();
+        symlink("missing", dir.0.join("dangling")).unwrap();
+        std::fs::create_dir(dir.0.join("directory")).unwrap();
+        for dst in ["source", "existing", "hardlink", "symlink", "dangling", "directory"] {
+            let response = dispatch(0x12, &copy_args(&dir.path("source"), &dir.path(dst)));
+            assert_eq!(response[4], 0x05, "{dst}: {response:?}");
+            assert_eq!(std::fs::read(dir.0.join("source")).unwrap(), b"source");
+        }
+        assert_eq!(std::fs::read(dir.0.join("existing")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_link(dir.0.join("symlink")).unwrap(), std::path::Path::new("source"));
+        assert_eq!(std::fs::read_link(dir.0.join("dangling")).unwrap(), std::path::Path::new("missing"));
+        assert!(!dir.0.join("missing").exists());
+        assert!(dir.0.join("directory").is_dir());
+    }
+
+    #[test]
+    fn copy_refuses_nonregular_sources_without_creating_destination() {
+        use std::os::unix::fs::symlink;
+        let dir = TestDir::new();
+        std::fs::write(dir.0.join("source"), b"keep").unwrap();
+        symlink("source", dir.0.join("symlink")).unwrap();
+        symlink("missing", dir.0.join("dangling")).unwrap();
+        std::fs::create_dir(dir.0.join("directory")).unwrap();
+        let fifo = CString::new(dir.path("fifo")).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        for src in ["symlink", "dangling", "directory", "fifo", "missing"] {
+            assert!(do_copy_file(&dir.path(src), &dir.path("copy")).is_err(), "{src}");
+            assert!(!dir.0.join("copy").exists());
+        }
+        assert_eq!(std::fs::read(dir.0.join("source")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn copy_rejects_bad_paths_and_malformed_payloads() {
+        let dir = TestDir::new();
+        std::fs::write(dir.0.join("source"), b"keep").unwrap();
+        for path in [b"".as_slice(), b"relative", b"/nul\0hidden", &vec![b'/'; MAX_PATH + 1]] {
+            for args in [copy_args(path, &dir.path("copy")), copy_args(&dir.path("source"), path)] {
+                assert_eq!(dispatch(0x12, &args)[4], 0x08);
+            }
+        }
+        let args = copy_args(&dir.path("source"), &dir.path("copy"));
+        for len in 0..args.len() {
+            assert_eq!(dispatch(0x12, &args[..len])[4], 0x08);
+        }
+        let mut trailing = args;
+        trailing.push(0);
+        assert_eq!(dispatch(0x12, &trailing)[4], 0x08);
+        for dst in ["copy/", "copy/.", "copy/.."] {
+            assert!(do_copy_file(&dir.path("source"), &dir.path(dst)).is_err());
+        }
+        assert!(!dir.0.join("copy").exists());
+    }
+
+    #[test]
+    fn copy_bounds_input_and_cleans_partial_on_read_error() {
+        use std::io::{Cursor, Read};
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        let dir = TestDir::new();
+        let parent = std::fs::File::open(&dir.0).unwrap();
+        let name = CString::new("partial").unwrap();
+        for source in [
+            Box::new(Cursor::new(b"short")) as Box<dyn Read>,
+            Box::new(Read::chain(Cursor::new(b"partial"), FailingReader)),
+        ] {
+            let mut destination = std::fs::File::create(dir.0.join("partial")).unwrap();
+            assert!(copy_into_owned(source, 100, &mut destination, &parent, &name).is_err());
+            assert!(!dir.0.join("partial").exists());
+        }
+        let mut destination = std::fs::File::create(dir.0.join("partial")).unwrap();
+        copy_into_owned(Cursor::new(b"initial-appended"), 7, &mut destination, &parent, &name).unwrap();
+        assert_eq!(std::fs::read(dir.0.join("partial")).unwrap(), b"initial");
+    }
+
+    #[test]
+    fn partial_cleanup_is_anchored_and_preserves_replacements() {
+        use std::fs::File;
+        use std::os::unix::fs::symlink;
+        let dir = TestDir::new();
+        let parent = File::open(&dir.0).unwrap();
+        let name = CString::new("partial").unwrap();
+        let partial = File::create(dir.0.join("partial")).unwrap();
+        remove_owned_partial(&parent, &name, &partial);
+        assert!(!dir.0.join("partial").exists());
+        std::fs::write(dir.0.join("partial"), b"replacement").unwrap();
+        remove_owned_partial(&parent, &name, &partial);
+        assert_eq!(std::fs::read(dir.0.join("partial")).unwrap(), b"replacement");
+        std::fs::remove_file(dir.0.join("partial")).unwrap();
+        symlink("missing", dir.0.join("partial")).unwrap();
+        remove_owned_partial(&parent, &name, &partial);
+        assert!(std::fs::symlink_metadata(dir.0.join("partial")).unwrap().is_symlink());
+
+        std::fs::create_dir(dir.0.join("parent")).unwrap();
+        let parent = File::open(dir.0.join("parent")).unwrap();
+        let partial = File::create(dir.0.join("parent/partial")).unwrap();
+        std::fs::rename(dir.0.join("parent"), dir.0.join("moved")).unwrap();
+        std::fs::create_dir(dir.0.join("parent")).unwrap();
+        std::fs::write(dir.0.join("parent/partial"), b"keep").unwrap();
+        remove_owned_partial(&parent, &name, &partial);
+        assert!(!dir.0.join("moved/partial").exists());
+        assert_eq!(std::fs::read(dir.0.join("parent/partial")).unwrap(), b"keep");
+    }
 
     #[test]
     fn cstring_rejects_embedded_nul() {
