@@ -61,7 +61,11 @@ jobs:
         # Full scope (no --lib): bin-target unit tests (adb-daemon,
         # adb-gui, test-adbfs) and doc tests were silently skipped by
         # the old `--lib` invocation.
-        run: cargo test --workspace --locked
+        # Xvfb gives the GUI regression test (hidden-files toggle) a
+        # virtual display; GTK needs one to init.
+        run: |
+          dnf install -y --setopt=install_weak_deps=False xorg-x11-server-Xvfb
+          xvfb-run -a cargo test --workspace --locked
 
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
