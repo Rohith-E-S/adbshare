@@ -156,7 +156,7 @@ Run both as your normal desktop user, not with `sudo`. The GUI communicates with
 5. To copy a file back, select it on the phone and use **Save to computer** (`Ctrl+Shift+C`). One file opens a Save As dialog; multiple files open a destination-folder chooser.
 6. Press `F5` if the folder listing has not updated after the transfer finishes.
 
-Queued phone transfers currently **skip existing destination files**. Folder trees cannot be uploaded or downloaded through this queue yet. Use distinct destination names when testing.
+Queued phone transfers use the conflict policy selected in the Transfers popover (skip, replace, or keep both). Whole folders can be downloaded, pasted, dropped, or sent via “Send folder to phone…” in the overflow menu; folder trees skip symlinks and are capped at 10,000 files and 32 levels of nesting.
 
 ### Finding your way around
 
@@ -202,7 +202,7 @@ Use **Install APK…** in the more-options menu, or the APK context action. Drop
 ## Current limitations
 
 - **Phone deletion is permanent.** Only local files offer “Move to Trash”; there is no phone trash/recovery feature.
-- Same-phone paste copies regular files without replacing existing destinations. It requires the updated phone helper and does not support copying symlinks or directories. If a copy loses its connection or times out, completion is unknown: the destination may be incomplete or still copying. Cross-phone paste is unsupported, and queued copy operations handle files rather than directory trees.
+- Same-phone paste copies files and folders without replacing existing destinations (folders copy synchronously; symlinks are skipped). It requires the updated phone helper. If a copy loses its connection or times out, completion is unknown: the destination may be incomplete or still copying. Cross-phone paste is unsupported.
 - The transfer queue is in memory and is lost when the daemon exits. Reconnecting can retry work, but reliable byte-offset resumption is not guaranteed.
 - The Transfers popover offers a session-wide conflict policy (skip, replace, keep both) and optional SHA-256 verification for computer ↔ phone transfers. Automatic folder synchronization is not supported.
 - FUSE enables external file opening and dragging phone files out. Without it, use in-app browsing and queued transfers instead.
