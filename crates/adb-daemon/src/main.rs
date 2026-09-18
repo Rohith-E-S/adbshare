@@ -241,6 +241,19 @@ mod tests {
         }).await.expect("D-Bus copy integration test timed out");
     }
 
+    #[test]
+    fn job_options_parse_skip_replace_keep_both_and_verify() {
+        let skip = parse_job_options("skip", false).unwrap();
+        assert!(matches!(skip.overwrite, transfer_engine::job::OverwriteMode::SkipExisting));
+        assert!(matches!(skip.verify, transfer_engine::job::VerifyMode::Off));
+        let replace = parse_job_options("replace", true).unwrap();
+        assert!(matches!(replace.overwrite, transfer_engine::job::OverwriteMode::Always));
+        assert!(matches!(replace.verify, transfer_engine::job::VerifyMode::On));
+        let keep = parse_job_options("keep-both", false).unwrap();
+        assert!(matches!(keep.overwrite, transfer_engine::job::OverwriteMode::Rename));
+        assert!(parse_job_options("overwrite", false).is_err());
+    }
+
     #[tokio::test]
     async fn copy_file_validates_paths_and_requires_connected_device() {
         let (queue, _rx) = JobQueue::new(1);
@@ -1133,6 +1146,46 @@ impl ManagerInterface {
         Ok(self.queue.submit(job))
     }
 
+    async fn enqueue_push_with_options(
+        &self,
+        device: &str,
+        local_path: &str,
+        device_path: &str,
+        overwrite: &str,
+        verify: bool,
+    ) -> zbus::fdo::Result<u64> {
+        let options = parse_job_options(overwrite, verify)?;
+        let job = Job::with_device(
+            0,
+            Direction::Push,
+            PathBuf::from(local_path),
+            PathBuf::from(device_path),
+            options,
+            Some(device.to_string()),
+        );
+        Ok(self.queue.submit(job))
+    }
+
+    async fn enqueue_pull_with_options(
+        &self,
+        device: &str,
+        device_path: &str,
+        local_path: &str,
+        overwrite: &str,
+        verify: bool,
+    ) -> zbus::fdo::Result<u64> {
+        let options = parse_job_options(overwrite, verify)?;
+        let job = Job::with_device(
+            0,
+            Direction::Pull,
+            PathBuf::from(device_path),
+            PathBuf::from(local_path),
+            options,
+            Some(device.to_string()),
+        );
+        Ok(self.queue.submit(job))
+    }
+
     /// Photo import (backend only; no GUI button yet). Lists `src_dirs`
     /// (defaults to `/sdcard/DCIM/Camera` when empty), skips files already
     /// present under `dest_base/YYYY-MM-DD/<name>` with the same size, and
@@ -1206,6 +1259,10 @@ impl ManagerInterface {
     /// Returns the number of jobs requeued.
     async fn retry_failed(&self) -> zbus::fdo::Result<u64> {
         Ok(self.queue.retry_failed())
+    }
+
+    async fn retry_job(&self, id: u64) -> zbus::fdo::Result<bool> {
+        Ok(self.queue.retry_job(id))
     }
 
     // --- File operations on a device (via the on-device proxy) ---
@@ -1417,6 +1474,10 @@ struct JobDto {
     bytes_total: u64,
     speed_bps: u64,
     eta_secs: u64,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    device: Option<String>,
 }
 
 impl From<Job> for JobDto {
@@ -1431,6 +1492,30 @@ impl From<Job> for JobDto {
             bytes_total: j.bytes_total(),
             speed_bps: j.speed_bps(),
             eta_secs: j.eta_secs(),
+            error: j.error(),
+            device: j.device.clone(),
         }
     }
+}
+
+fn parse_job_options(overwrite: &str, verify: bool) -> zbus::fdo::Result<JobOptions> {
+    let overwrite = match overwrite {
+        "skip" => transfer_engine::job::OverwriteMode::SkipExisting,
+        "replace" => transfer_engine::job::OverwriteMode::Always,
+        "keep-both" => transfer_engine::job::OverwriteMode::Rename,
+        _ => {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "overwrite must be skip, replace, or keep-both".into(),
+            ));
+        }
+    };
+    Ok(JobOptions {
+        overwrite,
+        verify: if verify {
+            transfer_engine::job::VerifyMode::On
+        } else {
+            transfer_engine::job::VerifyMode::Off
+        },
+        ..JobOptions::default()
+    })
 }

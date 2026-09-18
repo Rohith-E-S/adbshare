@@ -204,7 +204,7 @@ Use **Install APK…** in the more-options menu, or the APK context action. Drop
 - **Phone deletion is permanent.** Only local files offer “Move to Trash”; there is no phone trash/recovery feature.
 - Same-phone paste copies regular files without replacing existing destinations. It requires the updated phone helper and does not support copying symlinks or directories. If a copy loses its connection or times out, completion is unknown: the destination may be incomplete or still copying. Cross-phone paste is unsupported, and queued copy operations handle files rather than directory trees.
 - The transfer queue is in memory and is lost when the daemon exits. Reconnecting can retry work, but reliable byte-offset resumption is not guaranteed.
-- The GUI does not expose overwrite policies, checksum-verification settings, or automatic folder synchronization.
+- The Transfers popover offers a session-wide conflict policy (skip, replace, keep both) and optional SHA-256 verification for computer ↔ phone transfers. Automatic folder synchronization is not supported.
 - FUSE enables external file opening and dragging phone files out. Without it, use in-app browsing and queued transfers instead.
 - Custom/remote ADB server support is incomplete: discovery and subprocess ADB commands do not consistently use the same server options.
 - AUR, Flatpak, and `.deb` packaging are experimental. Package layouts and dependencies are not yet consistently wired up; a phone-compatible proxy may need to be supplied separately. There is no working Flatpak USB-portal setup.

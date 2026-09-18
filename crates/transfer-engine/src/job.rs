@@ -118,6 +118,18 @@ impl Job {
     pub fn error(&self) -> Option<String> { self.error.lock().clone() }
     pub fn set_error(&self, e: impl ToString) { *self.error.lock() = Some(e.to_string()); }
 
+    pub fn reset_for_retry(&self) {
+        *self.state.lock() = JobState::Pending;
+        self.bytes_done.store(0, Ordering::Relaxed);
+        self.bytes_total.store(0, Ordering::Relaxed);
+        self.speed_bps.store(0, Ordering::Relaxed);
+        self.eta_secs.store(0, Ordering::Relaxed);
+        *self.started.lock() = None;
+        *self.error.lock() = None;
+        self.cancel.store(false, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
     /// Cooperative cancel: the worker checks this between chunks.
     pub fn cancel(&self) { self.cancel.store(true, Ordering::Relaxed); }
     pub fn is_cancelled(&self) -> bool { self.cancel.load(Ordering::Relaxed) }

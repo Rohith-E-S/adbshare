@@ -22,6 +22,8 @@ pub struct JobInfo {
     pub bytes_total: u64,
     pub speed_bps: u64,
     pub eta_secs: u64,
+    pub error: Option<String>,
+    pub device: Option<String>,
 }
 
 impl JobInfo {
@@ -42,13 +44,22 @@ impl JobInfo {
             "Running" => "Copying",
             "Pending" => "Waiting",
             "Paused" => "Paused",
-            "Done" => "Done",
+            "Completed" | "Done" => "Done",
+            "Skipped" => "Skipped",
             "Failed" => "Failed",
             "Cancelled" => "Cancelled",
             other => other,
         };
 
         let mut parts = vec![state.to_string(), format!("{}/{} ({}%)", done, total, pct)];
+        if self.state == "Failed" {
+            if let Some(error) = self.error.as_deref().filter(|e| !e.is_empty()) {
+                parts.push(error.to_string());
+            }
+        }
+        if let Some(device) = self.device.as_deref().filter(|d| !d.is_empty()) {
+            parts.push(device.to_string());
+        }
 
         if self.state == "Running" {
             if self.speed_bps > 0 {
@@ -272,7 +283,8 @@ fn state_pill(state: &str) -> (&'static str, &'static str) {
         "Running" => ("Copying", "pill-running"),
         "Pending" => ("Waiting", "pill-pending"),
         "Paused" => ("Paused", "pill-paused"),
-        "Done" => ("Done", "pill-done"),
+        "Completed" | "Done" => ("Done", "pill-done"),
+        "Skipped" => ("Skipped", "pill-done"),
         "Failed" => ("Failed", "pill-failed"),
         "Cancelled" => ("Cancelled", "pill-cancelled"),
         _ => ("Unknown", "pill-pending"),
