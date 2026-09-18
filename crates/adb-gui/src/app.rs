@@ -60,6 +60,7 @@ trait Manager {
         verify: bool,
     ) -> zbus::Result<String>;
     async fn copy_tree(&self, device: &str, src_dir: &str, dst_dir: &str) -> zbus::Result<String>;
+    async fn diagnostics(&self) -> zbus::Result<String>;
     async fn enqueue_push_with_options(
         &self,
         device: &str,
@@ -529,6 +530,43 @@ impl AdbshareApp {
                 });
             }
             kebab_menu.append(&terminal_item);
+            let diagnostics_item = menu_item("dialog-information-symbolic", "Connection diagnostics…");
+            {
+                let kp = kebab_pop.clone();
+                let rt_diag = rt_handle.clone();
+                diagnostics_item.connect_clicked(move |_| {
+                    kp.popdown();
+                    rt_diag.spawn(async move {
+                        let body = match diagnostics().await {
+                            Ok(report) => format_diagnostics(&report),
+                            Err(e) => format!("Could not reach the daemon: {e}\nStart adb-daemon in this desktop session and retry."),
+                        };
+                        glib::idle_add_once(move || {
+                            let dialog = adw::MessageDialog::builder()
+                                .heading("Connection diagnostics")
+                                .body(&body)
+                                .modal(true)
+                                .build();
+                            dialog.add_response("close", "Close");
+                            dialog.set_default_response(Some("close"));
+                            dialog.set_close_response("close");
+                            let copy_btn = gtk4::Button::with_label("Copy report");
+                            copy_btn.set_halign(gtk4::Align::Center);
+                            {
+                                let body = body.clone();
+                                copy_btn.connect_clicked(move |_| {
+                                    if let Some(display) = gdk4::Display::default() {
+                                        display.clipboard().set_text(&body);
+                                    }
+                                });
+                            }
+                            dialog.set_extra_child(Some(&copy_btn));
+                            dialog.present();
+                        });
+                    });
+                });
+            }
+            kebab_menu.append(&diagnostics_item);
             let hidden_check = gtk4::CheckButton::builder()
                 .label("Show hidden files")
                 .margin_start(6)
@@ -2621,6 +2659,29 @@ mod copy_tests {
     }
 
     #[test]
+    fn diagnostics_format_covers_missing_adb_and_unready_device() {
+        let report: DiagnosticReportDto = serde_json::from_str(
+            r#"{"adb_ok":false,"adb_server":"127.0.0.1:5037","mount_base":"/tmp/x",
+                "proxy_conns":4,"no_fuse":true,"helper_env_present":true,"helper_env_exists":false,
+                "devices":[{"serial":"abc","setup_ok":false,"mounted":false}]}"#,
+        )
+        .unwrap();
+        let text = format_diagnostics(&report);
+        assert!(text.contains("ADB: not found"));
+        assert!(text.contains("file is missing"));
+        assert!(text.contains("disabled"));
+        assert!(text.contains("setup incomplete"));
+        let ready: DiagnosticReportDto = serde_json::from_str(
+            r#"{"adb_ok":true,"adb_version":"Android Debug Bridge version 1.0.41",
+                "devices":[{"serial":"abc","setup_ok":true,"mounted":true}]}"#,
+        )
+        .unwrap();
+        let text = format_diagnostics(&ready);
+        assert!(text.contains("found"));
+        assert!(text.contains("ready, mounted"));
+    }
+
+    #[test]
     fn job_info_preserves_error_and_device() {
         let dto: JobDto = serde_json::from_str(
             r#"{"id":7,"direction":"Push","source":"/src/a","destination":"/dst/a",
@@ -2898,6 +2959,81 @@ async fn enqueue_pull(device: &str, device_path: &str, local: &str) -> anyhow::R
 async fn retry_failed() -> anyhow::Result<u64> {
     let proxy = get_manager().await?;
     Ok(proxy.retry_failed().await?)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DeviceDiagDto {
+    serial: String,
+    #[serde(default)]
+    setup_ok: bool,
+    #[serde(default)]
+    mounted: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DiagnosticReportDto {
+    #[serde(default)]
+    adb_ok: bool,
+    #[serde(default)]
+    adb_version: String,
+    #[serde(default)]
+    adb_server: String,
+    #[serde(default)]
+    mount_base: String,
+    #[serde(default)]
+    proxy_conns: usize,
+    #[serde(default)]
+    no_fuse: bool,
+    #[serde(default)]
+    helper_env_present: bool,
+    #[serde(default)]
+    helper_env_exists: bool,
+    #[serde(default)]
+    devices: Vec<DeviceDiagDto>,
+}
+
+async fn diagnostics() -> anyhow::Result<DiagnosticReportDto> {
+    let proxy = get_manager().await?;
+    Ok(serde_json::from_str(&proxy.diagnostics().await?)?)
+}
+
+fn format_diagnostics(report: &DiagnosticReportDto) -> String {
+    let mut lines = Vec::new();
+    if report.adb_ok {
+        lines.push(format!("ADB: found ({})", report.adb_version));
+    } else {
+        lines.push("ADB: not found on PATH — install android-tools and retry.".to_string());
+    }
+    lines.push(format!("ADB server: {}", report.adb_server));
+    if report.helper_env_present && report.helper_env_exists {
+        lines.push("Phone helper: ADBSHARE_PROXY_BIN points at a file.".to_string());
+    } else if report.helper_env_present {
+        lines.push("Phone helper: ADBSHARE_PROXY_BIN is set but the file is missing — rebuild the ARM64 helper.".to_string());
+    } else {
+        lines.push("Phone helper: ADBSHARE_PROXY_BIN is not set — the daemon falls back to source-tree builds.".to_string());
+    }
+    lines.push(format!(
+        "Mounts: {} (base {}, {} connections per device)",
+        if report.no_fuse { "disabled" } else { "enabled" },
+        report.mount_base,
+        report.proxy_conns,
+    ));
+    if report.devices.is_empty() {
+        lines.push("Devices: none ready — connect a phone, unlock it, and accept the USB debugging prompt.".to_string());
+    } else {
+        for device in &report.devices {
+            lines.push(format!(
+                "Device {}: {}",
+                device.serial,
+                if device.setup_ok {
+                    if device.mounted { "ready, mounted" } else { "ready, FUSE mount unavailable — use in-app browsing" }
+                } else {
+                    "setup incomplete — check the helper build and daemon log"
+                },
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]

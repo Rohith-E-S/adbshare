@@ -245,6 +245,8 @@ If you have installed the repository's systemd **user** service, inspect it with
 journalctl --user -u adbshare-daemon.service -b
 ```
 
+Choose **Connection diagnostics…** in the overflow menu for a checklist (ADB presence, helper setup, mounts, device readiness) with a Copy report button.
+
 For a bug report, include your Linux distribution, GTK version, phone model/Android version, reproduction steps, and relevant errors. Review logs for private filenames, device identifiers, and other sensitive information before sharing.
 
 ## For contributors

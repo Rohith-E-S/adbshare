@@ -69,6 +69,10 @@ struct DeviceSlot {
 struct State {
     /// serial -> slot
     devices: HashMap<DeviceId, DeviceSlot>,
+    adb_server: String,
+    mount_base: PathBuf,
+    proxy_conns: usize,
+    no_fuse: bool,
 }
 
 /// Mountpoint for a device under `mount_base`, or None if the serial can't be
@@ -399,6 +403,26 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn diagnostics_reports_host_facts_as_json() {
+        let (queue, _rx) = JobQueue::new(1);
+        let manager = ManagerInterface {
+            state: Arc::new(Mutex::new(State {
+                adb_server: "127.0.0.1:5037".into(),
+                mount_base: PathBuf::from("/tmp/adbshare-test"),
+                proxy_conns: 4,
+                ..State::default()
+            })),
+            queue,
+        };
+        let json = manager.diagnostics().await.unwrap();
+        let report: DiagnosticReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report.adb_server, "127.0.0.1:5037");
+        assert_eq!(report.mount_base, "/tmp/adbshare-test");
+        assert_eq!(report.proxy_conns, 4);
+        assert!(report.devices.is_empty());
+    }
+
     #[test]
     fn job_options_parse_skip_replace_keep_both_and_verify() {
         let skip = parse_job_options("skip", false).unwrap();
@@ -502,7 +526,13 @@ async fn main() -> anyhow::Result<()> {
     let _key = adb_device::load_or_create_key()?;
     info!("auth key ready");
 
-    let state = Arc::new(Mutex::new(State::default()));
+    let state = Arc::new(Mutex::new(State {
+        adb_server: cli.adb_server.clone(),
+        mount_base: mount_base.clone(),
+        proxy_conns: cli.proxy_conns,
+        no_fuse: cli.no_fuse,
+        ..State::default()
+    }));
     let (queue, mut queue_rx) = JobQueue::new(transfer_engine::DEFAULT_PARALLELISM);
     let (adb_host, adb_port) = parse_adb_server(&cli.adb_server);
     let watcher = DeviceWatcher::from_adb_server(&adb_host, adb_port);
@@ -1559,6 +1589,44 @@ impl ManagerInterface {
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
+    async fn diagnostics(&self) -> zbus::fdo::Result<String> {
+        let (devices, adb_server, mount_base, proxy_conns, no_fuse) = {
+            let state = self.state.lock();
+            let devices = state.devices.iter().map(|(id, slot)| DeviceDiag {
+                serial: id.0.clone(),
+                setup_ok: slot.setup_ok,
+                mounted: slot.mountpoint.is_some(),
+            }).collect();
+            (devices, state.adb_server.clone(), state.mount_base.clone(), state.proxy_conns, state.no_fuse)
+        };
+        let adb_output = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new("adb").arg("version").kill_on_drop(true).output(),
+        ).await;
+        let (adb_ok, adb_version) = match adb_output {
+            Ok(Ok(out)) if out.status.success() => {
+                let first_line = String::from_utf8_lossy(&out.stdout)
+                    .lines().next().unwrap_or("").to_string();
+                (true, first_line)
+            }
+            _ => (false, String::new()),
+        };
+        let helper_env = std::env::var_os("ADBSHARE_PROXY_BIN").map(PathBuf::from);
+        let report = DiagnosticReport {
+            adb_ok,
+            adb_version,
+            adb_server,
+            mount_base: mount_base.to_string_lossy().into_owned(),
+            proxy_conns,
+            no_fuse,
+            helper_env_present: helper_env.is_some(),
+            helper_env_exists: helper_env.as_ref().is_some_and(|p| p.is_file()),
+            devices,
+        };
+        serde_json::to_string(&report)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
     /// Snapshot of every job currently tracked by the queue (JSON).
     async fn list_jobs(&self) -> zbus::fdo::Result<String> {
         let dtos: Vec<JobDto> = self.queue.jobs_snapshot().into_iter().map(JobDto::from).collect();
@@ -1786,6 +1854,26 @@ struct DuResult {
     avail_bytes: u64,
     total_bytes: u64,
     entries: Vec<DuEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceDiag {
+    serial: String,
+    setup_ok: bool,
+    mounted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiagnosticReport {
+    adb_ok: bool,
+    adb_version: String,
+    adb_server: String,
+    mount_base: String,
+    proxy_conns: usize,
+    no_fuse: bool,
+    helper_env_present: bool,
+    helper_env_exists: bool,
+    devices: Vec<DeviceDiag>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
