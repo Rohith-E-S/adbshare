@@ -41,6 +41,24 @@ trait Manager {
     async fn pause_job(&self, id: u64) -> zbus::Result<bool>;
     async fn resume_job(&self, id: u64) -> zbus::Result<bool>;
     async fn cancel_job(&self, id: u64) -> zbus::Result<bool>;
+    async fn retry_job(&self, id: u64) -> zbus::Result<bool>;
+    async fn retry_failed(&self) -> zbus::Result<u64>;
+    async fn enqueue_push_with_options(
+        &self,
+        device: &str,
+        local_path: &str,
+        device_path: &str,
+        overwrite: &str,
+        verify: bool,
+    ) -> zbus::Result<u64>;
+    async fn enqueue_pull_with_options(
+        &self,
+        device: &str,
+        device_path: &str,
+        local_path: &str,
+        overwrite: &str,
+        verify: bool,
+    ) -> zbus::Result<u64>;
     async fn mkdir(&self, device: &str, path: &str) -> zbus::Result<()>;
     async fn rename(&self, device: &str, src: &str, dst: &str) -> zbus::Result<()>;
     async fn copy_file(&self, device: &str, src: &str, dst: &str) -> zbus::Result<()>;
@@ -231,6 +249,67 @@ impl AdbshareApp {
                 .build();
             trans_sub.add_css_class("dim-label");
             trans_box.append(&trans_sub);
+            let policy_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            policy_row.set_margin_start(14);
+            policy_row.set_margin_end(14);
+            policy_row.set_margin_bottom(4);
+            let policy_label = gtk4::Label::builder()
+                .label("If destination exists:")
+                .xalign(0.0)
+                .hexpand(true)
+                .build();
+            policy_label.add_css_class("dim-label");
+            policy_row.append(&policy_label);
+            let policy_combo = gtk4::ComboBoxText::new();
+            policy_combo.append_text("Skip");
+            policy_combo.append_text("Replace");
+            policy_combo.append_text("Keep both");
+            policy_combo.set_active(Some(0));
+            policy_row.append(&policy_combo);
+            trans_box.append(&policy_row);
+            let verify_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            verify_row.set_margin_start(14);
+            verify_row.set_margin_end(14);
+            verify_row.set_margin_bottom(4);
+            let verify_check = gtk4::CheckButton::with_label("Verify transfers (SHA-256)");
+            verify_row.append(&verify_check);
+            let retry_btn = gtk4::Button::with_label("Retry failed");
+            retry_btn.set_halign(gtk4::Align::End);
+            retry_btn.set_hexpand(true);
+            verify_row.append(&retry_btn);
+            trans_box.append(&verify_row);
+            {
+                let combo_changed = policy_combo.clone();
+                let check_changed = verify_check.clone();
+                policy_combo.connect_changed(move |_| {
+                    let policy = match combo_changed.active_text().as_deref() {
+                        Some("Replace") => "replace",
+                        Some("Keep both") => "keep-both",
+                        _ => "skip",
+                    };
+                    set_transfer_policy(policy, check_changed.is_active());
+                });
+                let combo_toggled = policy_combo.clone();
+                let check_toggled = verify_check.clone();
+                verify_check.connect_toggled(move |_| {
+                    let policy = match combo_toggled.active_text().as_deref() {
+                        Some("Replace") => "replace",
+                        Some("Keep both") => "keep-both",
+                        _ => "skip",
+                    };
+                    set_transfer_policy(policy, check_toggled.is_active());
+                });
+            }
+            {
+                let rt_retry = rt_handle.clone();
+                retry_btn.connect_clicked(move |_| {
+                    rt_retry.spawn(async move {
+                        if let Err(e) = retry_failed().await {
+                            tracing::warn!(error = %e, "retry_failed failed");
+                        }
+                    });
+                });
+            }
             transfer.attach(&trans_box);
             trans_pop.set_child(Some(&trans_box));
 
@@ -2371,6 +2450,27 @@ mod copy_tests {
         }
     }
 
+    #[test]
+    fn job_info_preserves_error_and_device() {
+        let dto: JobDto = serde_json::from_str(
+            r#"{"id":7,"direction":"Push","source":"/src/a","destination":"/dst/a",
+                "state":"Failed","bytes_done":1,"bytes_total":2,
+                "error":"boom","device":"phone"}"#,
+        )
+        .unwrap();
+        let info = JobInfo::from(dto);
+        assert_eq!(info.error.as_deref(), Some("boom"));
+        assert_eq!(info.device.as_deref(), Some("phone"));
+        let legacy: JobDto = serde_json::from_str(
+            r#"{"id":8,"direction":"Pull","source":"/a","destination":"/b",
+                "state":"Completed","bytes_done":2,"bytes_total":2}"#,
+        )
+        .unwrap();
+        let info = JobInfo::from(legacy);
+        assert!(info.error.is_none());
+        assert!(info.device.is_none());
+    }
+
     #[tokio::test]
     #[ignore = "requires dbus-run-session -- cargo test -p adb-gui --locked copy_wrapper_preserves_unknown_completion -- --ignored"]
     async fn copy_wrapper_preserves_unknown_completion() {
@@ -2582,14 +2682,52 @@ async fn list_dir(device: &str, path: &str) -> anyhow::Result<Vec<FsDirEntry>> {
     Ok(entries.into_iter().map(FsDirEntry::from).collect())
 }
 
+static TRANSFER_POLICY: std::sync::OnceLock<parking_lot::Mutex<String>> = std::sync::OnceLock::new();
+static TRANSFER_VERIFY: std::sync::OnceLock<parking_lot::Mutex<bool>> = std::sync::OnceLock::new();
+
+fn transfer_policy() -> (String, bool) {
+    let policy = TRANSFER_POLICY.get_or_init(|| parking_lot::Mutex::new("skip".to_string()));
+    let verify = TRANSFER_VERIFY.get_or_init(|| parking_lot::Mutex::new(false));
+    (policy.lock().clone(), *verify.lock())
+}
+
+fn set_transfer_policy(policy: &str, verify: bool) {
+    *TRANSFER_POLICY.get_or_init(|| parking_lot::Mutex::new("skip".to_string())).lock() =
+        policy.to_string();
+    *TRANSFER_VERIFY.get_or_init(|| parking_lot::Mutex::new(false)).lock() = verify;
+}
+
 async fn enqueue_push(device: &str, local: &str, device_path: &str) -> anyhow::Result<u64> {
     let proxy = get_manager().await?;
-    Ok(proxy.enqueue_push(device, local, device_path).await?)
+    let (policy, verify) = transfer_policy();
+    match proxy.enqueue_push_with_options(device, local, device_path, &policy, verify).await {
+        Ok(id) => Ok(id),
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+        {
+            Ok(proxy.enqueue_push(device, local, device_path).await?)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn enqueue_pull(device: &str, device_path: &str, local: &str) -> anyhow::Result<u64> {
     let proxy = get_manager().await?;
-    Ok(proxy.enqueue_pull(device, device_path, local).await?)
+    let (policy, verify) = transfer_policy();
+    match proxy.enqueue_pull_with_options(device, device_path, local, &policy, verify).await {
+        Ok(id) => Ok(id),
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+        {
+            Ok(proxy.enqueue_pull(device, device_path, local).await?)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn retry_failed() -> anyhow::Result<u64> {
+    let proxy = get_manager().await?;
+    Ok(proxy.retry_failed().await?)
 }
 
 async fn list_jobs() -> anyhow::Result<Vec<JobInfo>> {
@@ -2635,6 +2773,10 @@ struct JobDto {
     speed_bps: u64,
     #[serde(default)]
     eta_secs: u64,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    device: Option<String>,
 }
 
 impl From<JobDto> for JobInfo {
@@ -2653,6 +2795,8 @@ impl From<JobDto> for JobInfo {
             bytes_total: j.bytes_total,
             speed_bps: j.speed_bps,
             eta_secs: j.eta_secs,
+            error: j.error,
+            device: j.device,
         }
     }
 }

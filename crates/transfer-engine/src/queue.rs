@@ -167,6 +167,21 @@ impl JobQueue {
         self.find(id).map(|j| j.cancel()).is_some()
     }
 
+    pub fn retry_job(&self, id: JobId) -> bool {
+        let mut completed = self.completed.lock();
+        let pos = completed.iter().position(|j| {
+            j.id == id && matches!(j.state(), JobState::Failed | JobState::Cancelled | JobState::Skipped)
+        });
+        let Some(job) = pos.map(|p| completed.remove(p)) else {
+            return false;
+        };
+        drop(completed);
+        job.reset_for_retry();
+        self.pending.lock().push_back(job);
+        let _ = self.notify.send(());
+        true
+    }
+
     /// Requeue every `Failed` job as `Pending` so the dispatcher retries it.
     /// Returns the number of jobs requeued.
     pub fn retry_failed(&self) -> u64 {
@@ -175,7 +190,7 @@ impl JobQueue {
         let mut count: u64 = 0;
         completed.retain(|job| {
             if job.state() == JobState::Failed {
-                job.set_state(JobState::Pending);
+                job.reset_for_retry();
                 pending.push_back(job.clone());
                 count += 1;
                 false
@@ -206,7 +221,7 @@ impl JobQueue {
                 || job.source.to_string_lossy().contains(serial)
                 || job.destination.to_string_lossy().contains(serial);
             if mine && job.state() == JobState::Failed {
-                job.set_state(JobState::Pending);
+                job.reset_for_retry();
                 pending.push_back(job.clone());
                 count += 1;
                 false
@@ -243,6 +258,31 @@ mod tests {
             std::path::PathBuf::from(format!("/dst/{name}")),
             JobOptions::default(),
         )
+    }
+
+    #[test]
+    fn retry_job_resets_progress_error_and_flags() {
+        let (queue, _rx) = JobQueue::new(1);
+        let id = queue.submit(test_job("retry"));
+        let job = queue.try_dispatch().expect("dispatches");
+        assert_eq!(job.id, id);
+        job.add_bytes(50);
+        job.set_total(100);
+        job.set_error("boom");
+        job.pause();
+        job.cancel();
+        job.set_state(JobState::Failed);
+        queue.mark_done(job);
+        assert!(queue.retry_job(id));
+        let job = queue.try_dispatch().expect("redispatched");
+        assert_eq!(job.id, id);
+        assert_eq!(job.state(), JobState::Pending);
+        assert_eq!(job.bytes_done(), 0);
+        assert_eq!(job.bytes_total(), 0);
+        assert!(job.error().is_none());
+        assert!(!job.is_paused());
+        assert!(!job.is_cancelled());
+        assert!(!queue.retry_job(id), "only terminal completed jobs retry");
     }
 
     #[tokio::test]

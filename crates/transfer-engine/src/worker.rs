@@ -38,7 +38,15 @@ impl Worker {
         // Determine total size for progress reporting.
         let total = match job.direction {
             Direction::Push => {
-                let meta = tokio::fs::metadata(&job.source).await.map_err(|e| ProxyError::Other(e.to_string()))?;
+                let meta = match tokio::fs::metadata(&job.source).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let e = ProxyError::Other(e.to_string());
+                        job.set_error(e.to_string());
+                        job.set_state(JobState::Failed);
+                        return Err(e);
+                    }
+                };
                 meta.len()
             }
             Direction::Pull => {
@@ -181,7 +189,7 @@ impl Worker {
         // final chunks; report it instead of silently completing.
         dst.close().await.map_err(|e| ProxyError::Other(format!("close destination: {e}")))?;
         if matches!(job.options.verify, super::job::VerifyMode::On) {
-            self.verify_transfer(job).await?;
+            self.verify_paths(&job.source, &dest).await?;
         }
         Ok(())
     }
@@ -283,7 +291,8 @@ impl Worker {
         dst.flush().await.map_err(|e| ProxyError::Other(e.to_string()))?;
 
         if matches!(job.options.verify, super::job::VerifyMode::On) {
-            self.verify_transfer(job).await?;
+            let remote = job.source.to_string_lossy().into_owned();
+            self.verify_paths(&dest, &remote).await?;
         }
         Ok(())
     }
@@ -300,16 +309,10 @@ impl Worker {
     /// data deterministically (bad storage), both reads agree and the
     /// corruption is not detected. Job options carry no source checksum,
     /// so there is no independent reference hash.
-    async fn verify_transfer(&self, job: &Job) -> Result<(), ProxyError> {
-        // Local side: push reads/writes source -> remote destination;
-        // pull reads/writes remote source -> local destination.
-        let (local, remote) = match job.direction {
-            Direction::Push => (&job.source, job.destination.to_string_lossy().into_owned()),
-            Direction::Pull => (&job.destination, job.source.to_string_lossy().into_owned()),
-        };
+    async fn verify_paths(&self, local: &Path, remote: &str) -> Result<(), ProxyError> {
         let local_hash = verify::sha256_file(local).await
             .map_err(|e| ProxyError::Other(format!("verify: hashing local file failed: {e}")))?;
-        let remote_hash = self.hash_remote(&remote).await
+        let remote_hash = self.hash_remote(remote).await
             .map_err(|e| ProxyError::Other(format!("verify: hashing remote file failed: {e}")))?;
         if local_hash != remote_hash {
             return Err(ProxyError::Other(format!(
