@@ -241,6 +241,164 @@ mod tests {
         }).await.expect("D-Bus copy integration test timed out");
     }
 
+    fn tree_stat(mode: u32, size: u64) -> adb_proxy::Stat {
+        adb_proxy::Stat {
+            mode: adb_proxy::FileMode(mode),
+            size,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            blksize: 4096,
+            blocks: 0,
+        }
+    }
+
+    async fn mock_tree_server(entries: std::collections::HashMap<String, Vec<(String, adb_proxy::Stat)>>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            loop {
+                let mut header = [0u8; 5];
+                if stream.read_exact(&mut header).await.is_err() { return; }
+                let len = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+                let mut args = vec![0u8; len];
+                if stream.read_exact(&mut args).await.is_err() { return; }
+                let response = match header[0] {
+                    0x07 | 0x12 => vec![0u8],
+                    0x06 => {
+                        let path_len = u32::from_le_bytes(args[0..4].try_into().unwrap()) as usize;
+                        let path = String::from_utf8_lossy(&args[4..4 + path_len]).into_owned();
+                        let mut body = vec![0u8];
+                        if let Some(list) = entries.get(&path) {
+                            for (name, stat) in list {
+                                body.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                                body.extend_from_slice(name.as_bytes());
+                                body.extend_from_slice(&stat.encode());
+                            }
+                        }
+                        body
+                    }
+                    _ => {
+                        let mut body = vec![0x0Bu8];
+                        body.extend_from_slice(b"unsupported");
+                        let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+                        framed.extend_from_slice(&body);
+                        if stream.write_all(&framed).await.is_err() { return; }
+                        continue;
+                    }
+                };
+                let mut framed = (response.len() as u32).to_le_bytes().to_vec();
+                framed.extend_from_slice(&response);
+                if stream.write_all(&framed).await.is_err() { return; }
+            }
+        });
+        (addr, handle)
+    }
+
+    fn tree_test_manager(client: ProxyClient) -> ManagerInterface {
+        let (queue, _rx) = JobQueue::new(4);
+        let state = Arc::new(Mutex::new(State::default()));
+        state.lock().devices.insert(
+            DeviceId("mock".into()),
+            DeviceSlot { mountpoint: None, client: Arc::new(client), host_port: 0, setup_ok: true },
+        );
+        ManagerInterface { state, queue }
+    }
+
+    #[tokio::test]
+    async fn tree_pull_enqueues_files_skips_symlinks_and_creates_dirs() {
+        let mut entries = std::collections::HashMap::new();
+        entries.insert("/".to_string(), vec![
+            ("sub".to_string(), tree_stat(0o040755, 0)),
+            ("a.txt".to_string(), tree_stat(0o100644, 10)),
+            ("link".to_string(), tree_stat(0o120777, 0)),
+        ]);
+        entries.insert("/sub".to_string(), vec![
+            ("b.txt".to_string(), tree_stat(0o100644, 20)),
+            ("empty".to_string(), tree_stat(0o040755, 0)),
+        ]);
+        entries.insert("/sub/empty".to_string(), vec![]);
+        let (addr, server) = mock_tree_server(entries).await;
+        let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(addr, 1))
+            .await.expect("connect").unwrap();
+        let manager = tree_test_manager(client);
+        let base = std::env::temp_dir().join(format!(
+            "adbshare-tree-pull-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let json = tokio::time::timeout(Duration::from_secs(15), manager.enqueue_tree_pull(
+            "mock", "/", base.to_str().unwrap(), "skip", false)).await.expect("timeout").unwrap();
+        let result: TreeEnqueueResult = serde_json::from_str(&json).unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.enqueued.len(), 2);
+        assert!(base.join("sub").is_dir());
+        assert!(base.join("sub").join("empty").is_dir());
+        assert!(!base.join("link").exists());
+        let jobs = manager.queue.jobs_snapshot();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|j| j.device.as_deref() == Some("mock")));
+        let _ = std::fs::remove_dir_all(&base);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tree_push_walks_local_tree_and_enqueues_push_jobs() {
+        let (addr, server) = mock_tree_server(std::collections::HashMap::new()).await;
+        let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(addr, 1))
+            .await.expect("connect").unwrap();
+        let manager = tree_test_manager(client);
+        let base = std::env::temp_dir().join(format!(
+            "adbshare-tree-push-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("a.txt"), b"a").unwrap();
+        std::fs::write(base.join("sub").join("b.txt"), b"b").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", base.join("link")).unwrap();
+        let json = tokio::time::timeout(Duration::from_secs(15), manager.enqueue_tree_push(
+            "mock", base.to_str().unwrap(), "/dst", "keep-both", true)).await.expect("timeout").unwrap();
+        let result: TreeEnqueueResult = serde_json::from_str(&json).unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.enqueued.len(), 2);
+        let jobs = manager.queue.jobs_snapshot();
+        assert_eq!(jobs.len(), 2);
+        for job in &jobs {
+            assert!(matches!(job.options.overwrite, transfer_engine::job::OverwriteMode::Rename));
+            assert!(matches!(job.options.verify, transfer_engine::job::VerifyMode::On));
+            assert!(job.destination.to_string_lossy().starts_with("/dst"));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn copy_tree_recurses_and_skips_symlinks() {
+        let mut entries = std::collections::HashMap::new();
+        entries.insert("/src".to_string(), vec![
+            ("sub".to_string(), tree_stat(0o040755, 0)),
+            ("a.txt".to_string(), tree_stat(0o100644, 5)),
+            ("link".to_string(), tree_stat(0o120777, 0)),
+        ]);
+        entries.insert("/src/sub".to_string(), vec![
+            ("b.txt".to_string(), tree_stat(0o100644, 6)),
+        ]);
+        let (addr, server) = mock_tree_server(entries).await;
+        let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(addr, 1))
+            .await.expect("connect").unwrap();
+        let manager = tree_test_manager(client);
+        let json = tokio::time::timeout(Duration::from_secs(15),
+            manager.copy_tree("mock", "/src", "/dst")).await.expect("timeout").unwrap();
+        let result: TreeEnqueueResult = serde_json::from_str(&json).unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.enqueued.len(), 2);
+        assert!(manager.copy_tree("mock", "/src", "/src").await.is_err());
+        server.abort();
+    }
+
     #[test]
     fn job_options_parse_skip_replace_keep_both_and_verify() {
         let skip = parse_job_options("skip", false).unwrap();
@@ -1186,6 +1344,173 @@ impl ManagerInterface {
         Ok(self.queue.submit(job))
     }
 
+    async fn enqueue_tree_push(
+        &self,
+        device: &str,
+        local_dir: &str,
+        device_dir: &str,
+        overwrite: &str,
+        verify: bool,
+    ) -> zbus::fdo::Result<String> {
+        let options = parse_job_options(overwrite, verify)?;
+        if !local_dir.starts_with('/') || !device_dir.starts_with('/') {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "tree paths must be absolute".into(),
+            ));
+        }
+        let local_base = PathBuf::from(local_dir);
+        let device_base = PathBuf::from(device_dir);
+        let client = client_for(&self.state, device)?;
+        let mut out = TreeEnqueueResult::default();
+        let mut stack = vec![(local_base.clone(), device_base.clone(), 0u32)];
+        while let Some((local, remote, depth)) = stack.pop() {
+            if depth > 32 {
+                out.errors.push(format!("{}: directory nesting too deep", local.display()));
+                continue;
+            }
+            let read = std::fs::read_dir(&local)
+                .map_err(|e| zbus::fdo::Error::Failed(format!("read {}: {e}", local.display())))?;
+            for entry in read {
+                let entry = entry
+                    .map_err(|e| zbus::fdo::Error::Failed(format!("read {}: {e}", local.display())))?;
+                if out.enqueued.len() > 10_000 {
+                    out.errors.push("too many files (limit 10000)".into());
+                    return serde_json::to_string(&out)
+                        .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")));
+                }
+                let file_type = entry
+                    .file_type()
+                    .map_err(|e| zbus::fdo::Error::Failed(format!("stat {}: {e}", entry.path().display())))?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let remote_child = remote.join(entry.file_name());
+                let remote_str = remote_child.to_string_lossy().into_owned();
+                if file_type.is_dir() {
+                    let _ = client.mkdir(&remote_str, 0o755).await;
+                    stack.push((entry.path(), remote_child, depth + 1));
+                } else if file_type.is_file() {
+                    let job = Job::with_device(
+                        0,
+                        Direction::Push,
+                        entry.path(),
+                        PathBuf::from(remote_str),
+                        options.clone(),
+                        Some(device.to_string()),
+                    );
+                    out.enqueued.push(self.queue.submit(job));
+                }
+            }
+        }
+        serde_json::to_string(&out)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
+    async fn enqueue_tree_pull(
+        &self,
+        device: &str,
+        device_dir: &str,
+        local_dir: &str,
+        overwrite: &str,
+        verify: bool,
+    ) -> zbus::fdo::Result<String> {
+        let options = parse_job_options(overwrite, verify)?;
+        if !device_dir.starts_with('/') || !local_dir.starts_with('/') {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "tree paths must be absolute".into(),
+            ));
+        }
+        let local_base = PathBuf::from(local_dir);
+        std::fs::create_dir_all(&local_base)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("mkdir {}: {e}", local_base.display())))?;
+        let client = client_for(&self.state, device)?;
+        let mut out = TreeEnqueueResult::default();
+        let mut stack = vec![(device_dir.to_string(), local_base, 0u32)];
+        while let Some((remote, local, depth)) = stack.pop() {
+            if depth > 32 {
+                out.errors.push(format!("{remote}: directory nesting too deep"));
+                continue;
+            }
+            let entries = client.listdir(&remote).await
+                .map_err(|e| zbus::fdo::Error::Failed(format!("list {remote}: {e}")))?;
+            for entry in entries {
+                if out.enqueued.len() > 10_000 {
+                    out.errors.push("too many files (limit 10000)".into());
+                    return serde_json::to_string(&out)
+                        .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")));
+                }
+                if entry.stat.mode.is_symlink() {
+                    continue;
+                }
+                let remote_child = format!("{}/{}", remote.trim_end_matches('/'), entry.name);
+                let local_child = local.join(&entry.name);
+                if entry.stat.mode.is_dir() {
+                    std::fs::create_dir_all(&local_child)
+                        .map_err(|e| zbus::fdo::Error::Failed(format!("mkdir {}: {e}", local_child.display())))?;
+                    stack.push((remote_child, local_child, depth + 1));
+                } else {
+                    let job = Job::with_device(
+                        0,
+                        Direction::Pull,
+                        PathBuf::from(remote_child),
+                        local_child,
+                        options.clone(),
+                        Some(device.to_string()),
+                    );
+                    out.enqueued.push(self.queue.submit(job));
+                }
+            }
+        }
+        serde_json::to_string(&out)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
+    async fn copy_tree(&self, device: &str, src_dir: &str, dst_dir: &str) -> zbus::fdo::Result<String> {
+        for path in [src_dir, dst_dir] {
+            if !path.starts_with('/') || path.contains('\0') || path.len() > 4096 {
+                return Err(zbus::fdo::Error::InvalidArgs(
+                    "copy paths must be absolute, non-NUL, and at most 4096 bytes".into(),
+                ));
+            }
+        }
+        if src_dir == dst_dir {
+            return Err(zbus::fdo::Error::InvalidArgs("source and destination are the same".into()));
+        }
+        let client = client_for(&self.state, device)?;
+        let mut out = TreeEnqueueResult::default();
+        let mut stack = vec![(src_dir.to_string(), dst_dir.to_string(), 0u32)];
+        while let Some((src, dst, depth)) = stack.pop() {
+            if depth > 32 {
+                out.errors.push(format!("{src}: directory nesting too deep"));
+                continue;
+            }
+            if out.enqueued.len() > 10_000 {
+                out.errors.push("too many files (limit 10000)".into());
+                break;
+            }
+            let _ = client.mkdir(&dst, 0o755).await;
+            let entries = client.listdir(&src).await
+                .map_err(|e| zbus::fdo::Error::Failed(format!("list {src}: {e}")))?;
+            for entry in entries {
+                if entry.stat.mode.is_symlink() {
+                    continue;
+                }
+                let src_child = format!("{}/{}", src.trim_end_matches('/'), entry.name);
+                let dst_child = format!("{}/{}", dst.trim_end_matches('/'), entry.name);
+                if entry.stat.mode.is_dir() {
+                    stack.push((src_child, dst_child, depth + 1));
+                } else {
+                    match client.copy_file(&src_child, &dst_child).await {
+                        Ok(()) => out.enqueued.push(out.enqueued.len() as u64 + 1),
+                        Err(e) => out.errors.push(format!("copy {src_child}: {e}")),
+                    }
+                }
+            }
+        }
+        serde_json::to_string(&out)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
     /// Photo import (backend only; no GUI button yet). Lists `src_dirs`
     /// (defaults to `/sdcard/DCIM/Camera` when empty), skips files already
     /// present under `dest_base/YYYY-MM-DD/<name>` with the same size, and
@@ -1461,6 +1786,14 @@ struct DuResult {
     avail_bytes: u64,
     total_bytes: u64,
     entries: Vec<DuEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TreeEnqueueResult {
+    #[serde(default)]
+    enqueued: Vec<u64>,
+    #[serde(default)]
+    errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

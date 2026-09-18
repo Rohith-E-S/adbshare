@@ -387,6 +387,8 @@ pub enum BrowserEvent {
     /// Ctrl+C snapshot of the selection (app stores it + mirrors to the
     /// GDK clipboard as text for interop).
     CopyFiles(Vec<DirEntry>),
+    /// Pick a local folder and push its whole tree to the browsed phone dir.
+    UploadFolder,
     /// Ctrl+V into the directory being browsed (app resolves the snapshot
     /// via the existing push/pull/copy paths).
     Paste,
@@ -2302,11 +2304,7 @@ impl FileBrowser {
                     if focus_in_editable(&browser.root) {
                         return glib::Propagation::Proceed;
                     }
-                    let files: Vec<DirEntry> = browser
-                        .selected_entries()
-                        .into_iter()
-                        .filter(|e| !e.is_dir)
-                        .collect();
+                    let files: Vec<DirEntry> = browser.selected_entries();
                     if !files.is_empty() {
                         emit_ev(&on_ev, BrowserEvent::CopyFiles(files));
                     }
@@ -2718,9 +2716,8 @@ fn show_context_menu(
         let p = popover.clone();
         copy_btn.connect_clicked(move |_| {
             p.popdown();
-            let files: Vec<DirEntry> = sel.iter().filter(|e| !e.is_dir).cloned().collect();
-            if !files.is_empty() {
-                emit(&on_ev, BrowserEvent::CopyFiles(files));
+            if !sel.is_empty() {
+                emit(&on_ev, BrowserEvent::CopyFiles(sel.clone()));
             }
         });
     }

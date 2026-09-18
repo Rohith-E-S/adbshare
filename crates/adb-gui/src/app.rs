@@ -43,6 +43,23 @@ trait Manager {
     async fn cancel_job(&self, id: u64) -> zbus::Result<bool>;
     async fn retry_job(&self, id: u64) -> zbus::Result<bool>;
     async fn retry_failed(&self) -> zbus::Result<u64>;
+    async fn enqueue_tree_push(
+        &self,
+        device: &str,
+        local_dir: &str,
+        device_dir: &str,
+        overwrite: &str,
+        verify: bool,
+    ) -> zbus::Result<String>;
+    async fn enqueue_tree_pull(
+        &self,
+        device: &str,
+        device_dir: &str,
+        local_dir: &str,
+        overwrite: &str,
+        verify: bool,
+    ) -> zbus::Result<String>;
+    async fn copy_tree(&self, device: &str, src_dir: &str, dst_dir: &str) -> zbus::Result<String>;
     async fn enqueue_push_with_options(
         &self,
         device: &str,
@@ -83,7 +100,8 @@ struct UiHandles {
     /// Whether the banner pause button currently means "resume".
     transfers_paused: parking_lot::Mutex<bool>,
     /// Ctrl+C snapshot: (from-local?, source dir, entry names). Paste (Ctrl+V)
-    /// resolves it into push/pull/local-copy via the existing transfer paths.
+    /// resolves it into push/pull/local-copy via the existing transfer paths;
+    /// directories resolve into recursive tree operations.
     clipboard: parking_lot::Mutex<Option<ClipboardFiles>>,
 }
 
@@ -96,8 +114,7 @@ struct ClipboardFiles {
     device: Option<String>,
     /// Directory that was browsed when copied (local FS path or /sdcard/...).
     from_dir: PathBuf,
-    /// Copied entries (files only; dirs are skipped — daemon push/pull is
-    /// file-based).
+    /// Copied entries; directories paste via recursive tree operations.
     entries: Vec<FsDirEntry>,
 }
 
@@ -471,6 +488,16 @@ impl AdbshareApp {
                 });
             }
             kebab_menu.append(&select_all_item);
+            let upload_folder_item = menu_item("folder-copy-symbolic", "Send folder to phone…");
+            {
+                let browser_uf = browser.clone();
+                let kp = kebab_pop.clone();
+                upload_folder_item.connect_clicked(move |_| {
+                    kp.popdown();
+                    browser_uf.emit(crate::file_browser::BrowserEvent::UploadFolder);
+                });
+            }
+            kebab_menu.append(&upload_folder_item);
             let install_apk_item = menu_item("system-software-install-symbolic", "Install APK…");
             {
                 let browser_apk = browser.clone();
@@ -1269,8 +1296,13 @@ fn paste_clipboard(
                     if src == dst {
                         continue;
                     }
-                    if let Err(err) = std::fs::copy(&src, &dst) {
-                        let _ = op_tx.try_send((None, Err(format!("paste: {err}"))));
+                    let result = if e.is_dir {
+                        copy_tree_local(&src, &dst).map(|_| ())
+                    } else {
+                        std::fs::copy(&src, &dst).map(|_| ())
+                    };
+                    if let Err(err) = result {
+                        let _ = op_tx.try_send((None, Err(format!("paste {}: {err}", e.name))));
                     }
                 }
                 refresh_after(&dir_tx, &rt2, target_dir);
@@ -1302,9 +1334,15 @@ fn paste_clipboard(
                     if src == dst {
                         continue;
                     }
-                    if let Err(err) =
+                    let result = if e.is_dir {
+                        copy_tree(&device, &src.to_string_lossy(), &dst.to_string_lossy())
+                            .await
+                            .and_then(|r| tree_result_message("Copy", &r).map_err(|e| anyhow::anyhow!(e)))
+                            .map(|_| ())
+                    } else {
                         copy_file(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
-                    {
+                    };
+                    if let Err(err) = result {
                         let _ = op_tx.try_send((None, Err(format!("copy {}: {err}", e.name))));
                     }
                 }
@@ -1323,23 +1361,25 @@ fn paste_clipboard(
                 return;
             };
             let from = snap.from_dir.clone();
-            let files: Vec<PathBuf> = snap
-                .entries
-                .iter()
-                .map(|e| snap.from_dir.join(&e.name))
-                .collect();
+            let files = snap.entries.clone();
             let dir_tx = dir_tx.clone();
             let op_tx = op_tx.clone();
             rt.clone().spawn(async move {
-                for src in &files {
-                    let Some(name) = src.file_name().and_then(|n| n.to_str()) else {
-                        continue;
+                for e in &files {
+                    let src = from.join(&e.name);
+                    let dst = target_dir.join(&e.name);
+                    let result = if e.is_dir {
+                        enqueue_tree_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
+                            .await
+                            .and_then(|r| tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e)))
+                            .map(|_| ())
+                    } else {
+                        enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
+                            .await
+                            .map(|_| ())
                     };
-                    let dst = target_dir.join(name);
-                    if let Err(e) =
-                        enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
-                    {
-                        let _ = op_tx.try_send((None, Err(format!("push: {e}"))));
+                    if let Err(err) = result {
+                        let _ = op_tx.try_send((None, Err(format!("push {}: {err}", e.name))));
                     }
                 }
                 let res = list_dir(&device, &from.to_string_lossy())
@@ -1359,8 +1399,16 @@ fn paste_clipboard(
                 for e in &snap.entries {
                     let src = snap.from_dir.join(&e.name).to_string_lossy().to_string();
                     let local = target_dir.join(&e.name).to_string_lossy().to_string();
-                    if let Err(err) = enqueue_pull(&device, &src, &local).await {
-                        let _ = op_tx.try_send((None, Err(format!("pull: {err}"))));
+                    let result = if e.is_dir {
+                        enqueue_tree_pull(&device, &src, &local)
+                            .await
+                            .and_then(|r| tree_result_message("Pull", &r).map_err(|e| anyhow::anyhow!(e)))
+                            .map(|_| ())
+                    } else {
+                        enqueue_pull(&device, &src, &local).await.map(|_| ())
+                    };
+                    if let Err(err) = result {
+                        let _ = op_tx.try_send((None, Err(format!("pull {}: {err}", e.name))));
                     }
                 }
                 let res = list_dir(&device, &snap.from_dir.to_string_lossy())
@@ -1434,7 +1482,12 @@ fn paste_external_paths(
                 if src == &dst {
                     continue;
                 }
-                if let Err(e) = std::fs::copy(src, &dst) {
+                let result = if src.is_dir() {
+                    copy_tree_local(src, &dst).map(|_| ())
+                } else {
+                    std::fs::copy(src, &dst).map(|_| ())
+                };
+                if let Err(e) = result {
                     let _ = op_tx.try_send((None, Err(format!("paste: {e}"))));
                 }
             }
@@ -1461,9 +1514,17 @@ fn paste_external_paths(
                 continue;
             };
             let dst = target_dir.join(name);
-            if let Err(e) =
-                enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
-            {
+            let result = if src.is_dir() {
+                enqueue_tree_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
+                    .await
+                    .and_then(|r| tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e)))
+                    .map(|_| ())
+            } else {
+                enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
+                    .await
+                    .map(|_| ())
+            };
+            if let Err(e) = result {
                 let _ = op_tx.try_send((None, Err(format!("push: {e}"))));
             }
         }
@@ -1554,13 +1615,17 @@ fn handle_browser_event(
                         }
                     }
                     Err(_) => {
-                        if let Err(e) = enqueue_push(
-                            &device,
-                            &src.to_string_lossy(),
-                            &dst.to_string_lossy(),
-                        )
-                        .await
-                        {
+                        let result = if src.is_dir() {
+                            enqueue_tree_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
+                                .await
+                                .and_then(|r| tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e)))
+                                .map(|_| ())
+                        } else {
+                            enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
+                                .await
+                                .map(|_| ())
+                        };
+                        if let Err(e) = result {
                             let _ = op_tx.try_send((None, Err(format!("push: {e}"))));
                         }
                     }
@@ -1596,6 +1661,8 @@ fn handle_browser_event(
                         let internal = src.parent() == Some(from_dir_for_task.as_path());
                         let r = if internal {
                             std::fs::rename(&src, &dst)
+                        } else if src.is_dir() {
+                            copy_tree_local(&src, &dst).map(|_| ())
                         } else {
                             std::fs::copy(&src, &dst).map(|_| ())
                         };
@@ -1698,7 +1765,7 @@ fn handle_browser_event(
         BrowserEvent::CopyFiles(entries) => {
             let from_local = handles.browser.is_local_mode();
             let from_dir = handles.browser.current_path();
-            let files: Vec<FsDirEntry> = entries.into_iter().filter(|e| !e.is_dir).collect();
+            let files: Vec<FsDirEntry> = entries;
             if files.is_empty() {
                 return;
             }
@@ -1959,12 +2026,63 @@ fn handle_browser_event(
             });
             chooser.show();
         }
+        BrowserEvent::UploadFolder => {
+            if handles.browser.is_local_mode() {
+                let _ = op_tx.try_send((
+                    None,
+                    Err("Browse the phone first — folders upload into the browsed phone directory.".into()),
+                ));
+                return;
+            }
+            let device = match handles.selected_device.lock().clone() {
+                Some(d) => d,
+                None => return,
+            };
+            let device_dir = handles.browser.current_path();
+            let chooser = gtk4::FileChooserNative::builder()
+                .title("Pick a folder to send to the phone")
+                .modal(true)
+                .action(gtk4::FileChooserAction::SelectFolder)
+                .build();
+            chooser.set_transient_for(Some(&window));
+            let device_cb = device;
+            let op_tx_cb = op_tx.clone();
+            chooser.connect_response(move |chooser, resp| {
+                if resp == gtk4::ResponseType::Accept {
+                    if let Some(file) = chooser.file() {
+                        if let Some(path) = file.path() {
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("folder")
+                                .to_string();
+                            let local = path.to_string_lossy().to_string();
+                            let remote = device_dir.join(&name).to_string_lossy().to_string();
+                            let device = device_cb.clone();
+                            let op_tx = op_tx_cb.clone();
+                            rt.spawn(async move {
+                                let r = enqueue_tree_push(&device, &local, &remote)
+                                    .await
+                                    .and_then(|r| tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e)));
+                                let _ = op_tx.try_send((
+                                    Some("Folder upload".into()),
+                                    r.map_err(|e| e.to_string()),
+                                ));
+                            });
+                        }
+                    }
+                }
+                chooser.destroy();
+            });
+            chooser.show();
+        }
         BrowserEvent::Download(entries) => {
             if entries.is_empty() {
                 return;
             }
-            let files: Vec<FsDirEntry> = entries.into_iter().filter(|e| !e.is_dir).collect();
-            if files.is_empty() {
+            let (dirs, files): (Vec<FsDirEntry>, Vec<FsDirEntry>) =
+                entries.into_iter().partition(|e| e.is_dir);
+            if files.is_empty() && dirs.is_empty() {
                 return;
             }
 
@@ -2011,7 +2129,7 @@ fn handle_browser_event(
             };
             let curr = handles.browser.current_path();
 
-            if files.len() == 1 {
+            if files.len() == 1 && dirs.is_empty() {
                 // Single file: Save dialog with the name preset.
                 let entry = files.into_iter().next().unwrap();
                 let src = curr.join(&entry.name);
@@ -2045,7 +2163,8 @@ fn handle_browser_event(
                 });
                 chooser.show();
             } else {
-                // Multiple files: pick a destination folder, pull them all.
+                // Folders, or multiple files: pick a destination folder, pull
+                // files and enqueue folder trees beneath it.
                 let chooser = gtk4::FileChooserNative::builder()
                     .title("Choose destination folder")
                     .modal(true)
@@ -2068,6 +2187,20 @@ fn handle_browser_event(
                                         let _ = enqueue_pull(&device, &src, &local).await.map_err(
                                             |e| tracing::warn!(error=%e, "enqueue_pull failed"),
                                         );
+                                    });
+                                }
+                                for e in &dirs {
+                                    let src = curr.join(&e.name).to_string_lossy().to_string();
+                                    let local =
+                                        dest_dir.join(&e.name).to_string_lossy().to_string();
+                                    let device = device.clone();
+                                    rt.spawn(async move {
+                                        if let Err(e) = enqueue_tree_pull(&device, &src, &local)
+                                            .await
+                                            .and_then(|r| tree_result_message("Pull", &r).map_err(|e| anyhow::anyhow!(e)))
+                                        {
+                                            tracing::warn!(error=%e, "enqueue_tree_pull failed");
+                                        }
                                     });
                                 }
                             }
@@ -2451,6 +2584,43 @@ mod copy_tests {
     }
 
     #[test]
+    fn copy_tree_local_copies_hierarchy_and_skips_symlinks() {
+        let base = std::env::temp_dir().join(format!(
+            "adbshare-gui-treecopy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub").join("b.txt"), b"b").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+        let dst = base.join("dst");
+        let copied = copy_tree_local(&src, &dst).unwrap();
+        assert_eq!(copied, 2);
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dst.join("sub").join("b.txt")).unwrap(), b"b");
+        assert!(!dst.join("link").exists());
+        assert!(tree_result_message("Push", &TreeEnqueueResult {
+            enqueued: vec![1, 2],
+            errors: vec!["x".into()],
+        })
+        .unwrap()
+        .contains("queued 2 file(s)"));
+        assert!(tree_result_message("Pull", &TreeEnqueueResult::default()).is_ok());
+        assert!(tree_result_message("Pull", &TreeEnqueueResult {
+            enqueued: vec![],
+            errors: vec!["boom".into()],
+        })
+        .is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn job_info_preserves_error_and_device() {
         let dto: JobDto = serde_json::from_str(
             r#"{"id":7,"direction":"Push","source":"/src/a","destination":"/dst/a",
@@ -2728,6 +2898,75 @@ async fn enqueue_pull(device: &str, device_path: &str, local: &str) -> anyhow::R
 async fn retry_failed() -> anyhow::Result<u64> {
     let proxy = get_manager().await?;
     Ok(proxy.retry_failed().await?)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct TreeEnqueueResult {
+    #[serde(default)]
+    enqueued: Vec<u64>,
+    #[serde(default)]
+    errors: Vec<String>,
+}
+
+async fn enqueue_tree_push(device: &str, local_dir: &str, device_dir: &str) -> anyhow::Result<TreeEnqueueResult> {
+    let proxy = get_manager().await?;
+    let (policy, verify) = transfer_policy();
+    let json = proxy.enqueue_tree_push(device, local_dir, device_dir, &policy, verify).await?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+async fn enqueue_tree_pull(device: &str, device_dir: &str, local_dir: &str) -> anyhow::Result<TreeEnqueueResult> {
+    let proxy = get_manager().await?;
+    let (policy, verify) = transfer_policy();
+    let json = proxy.enqueue_tree_pull(device, device_dir, local_dir, &policy, verify).await?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+async fn copy_tree(device: &str, src_dir: &str, dst_dir: &str) -> anyhow::Result<TreeEnqueueResult> {
+    let proxy = get_manager().await?;
+    let json = proxy.copy_tree(device, src_dir, dst_dir).await?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+fn tree_result_message(action: &str, result: &TreeEnqueueResult) -> Result<String, String> {
+    if result.enqueued.is_empty() && !result.errors.is_empty() {
+        return Err(result.errors.join("\n"));
+    }
+    let mut message = format!("{} queued {} file(s)", action, result.enqueued.len());
+    if !result.errors.is_empty() {
+        message.push_str("\n\nSome entries failed:\n");
+        message.push_str(&result.errors.join("\n"));
+    }
+    Ok(message)
+}
+
+fn copy_tree_local(src: &Path, dst: &Path) -> std::io::Result<usize> {
+    let mut copied = 0;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf(), 0u32)];
+    while let Some((from, to, depth)) = stack.pop() {
+        if depth > 32 {
+            return Err(std::io::Error::other(format!("{}: nesting too deep", from.display())));
+        }
+        std::fs::create_dir_all(&to)?;
+        for entry in std::fs::read_dir(&from)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let target = to.join(entry.file_name());
+            if file_type.is_dir() {
+                stack.push((entry.path(), target, depth + 1));
+            } else if file_type.is_file() {
+                if copied > 10_000 {
+                    return Err(std::io::Error::other("too many files (limit 10000)"));
+                }
+                std::fs::copy(entry.path(), &target)?;
+                copied += 1;
+            }
+        }
+    }
+    Ok(copied)
 }
 
 async fn list_jobs() -> anyhow::Result<Vec<JobInfo>> {

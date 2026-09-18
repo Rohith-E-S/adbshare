@@ -43,8 +43,15 @@ impl Drop for TestDir {
 
 struct Helper(Child);
 
+static START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Helper {
     async fn start() -> (Self, ProxyClient) {
+        // Serialized: picking an ephemeral port then handing it to the
+        // helper is racy when tests start helpers in parallel — a sibling
+        // test's helper can bind the just-released port first, and its
+        // teardown then closes our connection mid-test.
+        let _startup = START_LOCK.lock().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
