@@ -61,6 +61,7 @@ trait Manager {
     ) -> zbus::Result<String>;
     async fn copy_tree(&self, device: &str, src_dir: &str, dst_dir: &str) -> zbus::Result<String>;
     async fn diagnostics(&self) -> zbus::Result<String>;
+    async fn pair_wireless(&self, address: &str, code: &str) -> zbus::Result<String>;
     async fn enqueue_push_with_options(
         &self,
         device: &str,
@@ -2659,6 +2660,21 @@ mod copy_tests {
     }
 
     #[test]
+    fn pair_input_validation_rejects_bad_address_and_code() {
+        assert!(validate_pair_input("192.168.1.20:37001", "123456").is_ok());
+        assert!(validate_pair_input("phone.local:37001", "123456").is_ok());
+        assert!(validate_pair_input("[fe80::1%25wlan0]:37001", "123456").is_ok());
+        assert!(validate_pair_input("192.168.1.20", "123456").is_err());
+        assert!(validate_pair_input(":37001", "123456").is_err());
+        assert!(validate_pair_input("192.168.1.20:0", "123456").is_err());
+        assert!(validate_pair_input("192.168.1.20:notaport", "123456").is_err());
+        assert!(validate_pair_input("192.168.1.20:37001\t", "123456").is_err());
+        assert!(validate_pair_input("192.168.1.20:37001; reboot", "123456").is_err());
+        assert!(validate_pair_input("192.168.1.20:37001", "12345").is_err());
+        assert!(validate_pair_input("192.168.1.20:37001", "12345a").is_err());
+    }
+
+    #[test]
     fn diagnostics_format_covers_missing_adb_and_unready_device() {
         let report: DiagnosticReportDto = serde_json::from_str(
             r#"{"adb_ok":false,"adb_server":"127.0.0.1:5037","mount_base":"/tmp/x",
@@ -2795,6 +2811,44 @@ fn show_error_dialog(window: &adw::ApplicationWindow, title: &str, msg: &str) {
     dialog.present();
 }
 
+fn validate_pair_input(address: &str, code: &str) -> Result<(), String> {
+    let address_ok = address.rsplit_once(':').is_some_and(|(host, port)| {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(port) = port.parse::<u16>() else {
+            return false;
+        };
+        if port == 0 {
+            return false;
+        }
+        let host = if let Some(host) = host.strip_prefix('[') {
+            host.strip_suffix(']').unwrap_or("")
+        } else if host.ends_with(']') {
+            ""
+        } else {
+            host
+        };
+        !host.is_empty()
+            && !host.contains(['[', ']'])
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%'))
+    });
+    if !address_ok {
+        return Err("Pairing address must look like 192.168.1.20:37001.".into());
+    }
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("Pairing code must be the six digits shown on the phone.".into());
+    }
+    Ok(())
+}
+
+async fn pair_wireless(address: &str, code: &str) -> anyhow::Result<String> {
+    let proxy = get_manager().await?;
+    Ok(proxy.pair_wireless(address, code).await?)
+}
+
 /// "Connect ADB via IP" dialog: pair first (adb pair), then connect to the
 /// device's adbd over TCP. The result is surfaced via `op_tx`.
 fn show_connect_dialog(
@@ -2815,74 +2869,111 @@ fn show_connect_dialog(
     content.set_margin_bottom(16);
     content.set_spacing(8);
 
-    let hint = gtk4::Label::builder()
-        .label("Pair first (adb pair <phone-ip>:<pair-port>), then connect:")
+    let step1 = gtk4::Label::builder()
+        .label("Step 1 — Pair (first time only): on the phone open Developer options → Wireless debugging → Pair device with pairing code, then enter the address and six-digit code here:")
         .xalign(0.0)
         .wrap(true)
         .build();
-    hint.add_css_class("dim-label");
-    content.append(&hint);
+    step1.add_css_class("dim-label");
+    content.append(&step1);
+
+    let pair_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let pair_entry = gtk4::Entry::new();
+    pair_entry.set_placeholder_text(Some("192.168.1.20:37001"));
+    pair_entry.set_hexpand(true);
+    pair_row.append(&pair_entry);
+    let code_entry = gtk4::Entry::new();
+    code_entry.set_placeholder_text(Some("123456"));
+    code_entry.set_input_purpose(gtk4::InputPurpose::Digits);
+    code_entry.set_visibility(false);
+    code_entry.set_max_length(6);
+    code_entry.set_width_chars(8);
+    pair_row.append(&code_entry);
+    let pair_btn = gtk4::Button::with_label("Pair");
+    pair_row.append(&pair_btn);
+    content.append(&pair_row);
+
+    let pair_status = gtk4::Label::builder()
+        .label("")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    pair_status.add_css_class("dim-label");
+    content.append(&pair_status);
+
+    content.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
+    let step2 = gtk4::Label::builder()
+        .label("Step 2 — Connect: enter the connection address (its port differs from the pairing port):")
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    step2.add_css_class("dim-label");
+    content.append(&step2);
 
     let entry = gtk4::Entry::new();
     entry.set_placeholder_text(Some("192.168.1.20:5555"));
     content.append(&entry);
 
-    // QR-pairing stub (no new deps): echo the typed host:port back as a
-    // large selectable label with a Copy button, so the user can copy it
-    // to the phone. Updates live as the entry changes.
-    let pairing_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    let pairing_label = gtk4::Label::builder()
-        .label("192.168.1.20:5555")
-        .halign(gtk4::Align::Center)
-        .hexpand(true)
-        .selectable(true)
-        .wrap(true)
-        .build();
-    pairing_label.add_css_class("title-2");
-    pairing_label.add_css_class("monospace");
-    pairing_label.add_css_class("dim-label");
-    let copy_btn = gtk4::Button::with_label("Copy");
-    copy_btn.set_tooltip_text(Some("Copy address to clipboard"));
-    pairing_row.append(&pairing_label);
-    pairing_row.append(&copy_btn);
-    content.append(&pairing_row);
-
-    let pairing_for_entry = pairing_label.clone();
-    entry.connect_changed(move |e| {
-        let addr = e.text().trim().to_string();
-        if addr.is_empty() {
-            pairing_for_entry.set_label("192.168.1.20:5555");
-            pairing_for_entry.add_css_class("dim-label");
-        } else {
-            pairing_for_entry.set_label(&addr);
-            pairing_for_entry.remove_css_class("dim-label");
-        }
-    });
-
-    let entry_for_copy = entry.clone();
-    copy_btn.connect_clicked(move |_| {
-        let addr = entry_for_copy.text().trim().to_string();
-        let text = if addr.is_empty() {
-            "192.168.1.20:5555".to_string()
-        } else {
-            addr
-        };
-        if let Some(display) = gtk4::gdk::Display::default() {
-            display.clipboard().set_text(&text);
-        }
-    });
-
-    let camera_hint = gtk4::Label::builder()
-        .label("Open your phone camera / Wi-Fi pairing screen and type this address, or tap Copy.")
-        .xalign(0.0)
-        .wrap(true)
-        .build();
-    camera_hint.add_css_class("dim-label");
-    content.append(&camera_hint);
-
     dialog.add_button("Cancel", gtk4::ResponseType::Cancel);
     let connect_btn = dialog.add_button("Connect", gtk4::ResponseType::Ok);
     connect_btn.add_css_class("suggested-action");
+
+    {
+        let pair_entry = pair_entry.clone();
+        let code_entry = code_entry.clone();
+        let pair_status = pair_status.clone();
+        let pair_button = pair_btn.clone();
+        let connect_button = connect_btn.clone();
+        let op_tx = op_tx.clone();
+        let rt_pair = rt.clone();
+        pair_button.clone().connect_clicked(move |_| {
+            let address = pair_entry.text().trim().to_string();
+            let code = code_entry.text().trim().to_string();
+            if let Err(e) = validate_pair_input(&address, &code) {
+                pair_status.set_label(&e);
+                return;
+            }
+            pair_button.set_sensitive(false);
+            connect_button.set_sensitive(false);
+            pair_status.set_label("Pairing — this can take up to a minute…");
+            let op_tx = op_tx.clone();
+            let pair_button = pair_button.clone();
+            let connect_button = connect_button.clone();
+            let pair_status = pair_status.clone();
+            let rt_pair = rt_pair.clone();
+            glib::spawn_future_local(async move {
+                let res = rt_pair
+                    .spawn(async move { pair_wireless(&address, &code).await })
+                    .await;
+                pair_button.set_sensitive(true);
+                connect_button.set_sensitive(true);
+                let res = match res {
+                    Ok(Ok(out)) => {
+                        let out = out.trim().to_string();
+                        let message = if out.is_empty() {
+                            "Paired.".to_string()
+                        } else {
+                            out
+                        };
+                        pair_status.set_label(&message);
+                        Ok(message)
+                    }
+                    Ok(Err(e)) => {
+                        let message = format!("adb pair: {e}");
+                        pair_status.set_label(&format!("Pairing failed: {message}"));
+                        Err(message)
+                    }
+                    Err(e) => {
+                        let message = format!("adb pair task failed: {e}");
+                        pair_status.set_label(&format!("Pairing failed: {message}"));
+                        Err(message)
+                    }
+                };
+                let _ = op_tx.send((Some("ADB wireless pair".into()), res)).await;
+            });
+        });
+    }
 
     let op_tx = op_tx.clone();
     dialog.connect_response(move |d, resp| {

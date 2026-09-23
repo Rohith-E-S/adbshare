@@ -12,7 +12,7 @@ Browse your Android phone and move files between it and your Linux computer over
 - Watch transfer progress, speed, and ETA; pause, resume, or cancel queued work.
 - Create folders, rename items, view properties, and delete items.
 - Install APKs from the computer or the phone.
-- Connect to an already paired phone over Wi-Fi.
+- Pair a phone and connect to it over Wi-Fi.
 - Open phone files in external applications through FUSE.
 
 No companion Android app is needed. The daemon automatically deploys a small executable helper to the phone. Access is limited to what Android's ADB shell can read or write; this does not unlock protected app data.
@@ -25,7 +25,7 @@ You need:
 - Rust and Cargo. The workspace declares Rust 1.85 or newer; current stable is recommended.
 - **GTK 4.18+**, **libadwaita 1.5+**, FUSE 3, a C build toolchain, and `pkg-config`.
 - Android platform tools: the `adb` command must be on your `PATH`.
-- An Android phone with USB debugging enabled and a data-capable USB cable.
+- An Android phone with USB debugging or Wireless debugging enabled. A USB cable is optional for Wi-Fi setup.
 - A helper binary built for your **phone's architecture**, as explained below.
 
 ### Install Linux dependencies
@@ -55,6 +55,8 @@ pkg-config --modversion gtk4 libadwaita-1 fuse3
 External file opening uses `xdg-open`; local Trash operations use `gio`. Terminal opening requires `gnome-terminal` or `x-terminal-emulator`.
 
 ### Prepare your phone
+
+For Wi-Fi-only setup, skip the USB steps below and use the pairing flow in [Connect over Wi-Fi](#connect-over-wi-fi). Wireless debugging requires Android 11 or newer.
 
 1. Enable **Developer options**, then **USB debugging** in Android settings. The location varies by manufacturer.
 2. Connect the phone to the computer and unlock it.
@@ -185,15 +187,7 @@ Queued phone transfers use the conflict policy selected in the Transfers popover
 
 ### Connect over Wi-Fi
 
-For Android's Wireless debugging feature, pair using the ADB CLI first:
-
-```sh
-adb pair PHONE_IP:PAIRING_PORT
-```
-
-Enter the pairing code shown on the phone. Then choose **Connect via Wi-Fi…** in adbshare and enter the phone's **connection address and port**. The connection port can differ from the pairing port. The computer and phone need network connectivity to each other.
-
-adbshare currently offers connection, not a QR-code or pairing wizard. USB remains the simplest first setup.
+For Android's Wireless debugging feature, choose **Connect via Wi-Fi…** in adbshare. If the phone is not paired yet, on the phone open Developer options → Wireless debugging → Pair device with pairing code, then enter the pairing address and six-digit code and press **Pair**. If the phone is already paired, skip this step. Then enter the phone's **connection address and port** and press **Connect**. The connection port differs from the pairing port. The computer and phone need network connectivity to each other. USB remains the simplest first setup.
 
 ### Install an APK
 
