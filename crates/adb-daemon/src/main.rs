@@ -404,6 +404,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pair_wireless_rejects_bad_input() {
+        let (queue, _rx) = JobQueue::new(1);
+        let manager = ManagerInterface {
+            state: Arc::new(Mutex::new(State::default())),
+            queue,
+        };
+        assert!(matches!(
+            manager
+                .pair_wireless("192.168.1.20:notaport", "123456")
+                .await,
+            Err(zbus::fdo::Error::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            manager.pair_wireless(":5555", "123456").await,
+            Err(zbus::fdo::Error::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            manager.pair_wireless("192.168.1.20:0", "123456").await,
+            Err(zbus::fdo::Error::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            manager
+                .pair_wireless("192.168.1.20:37001\t", "123456")
+                .await,
+            Err(zbus::fdo::Error::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            manager.pair_wireless("192.168.1.20:37001", "12345").await,
+            Err(zbus::fdo::Error::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            manager.pair_wireless("192.168.1.20:37001", "12345a").await,
+            Err(zbus::fdo::Error::InvalidArgs(_))
+        ));
+        assert!(matches!(
+            manager
+                .pair_wireless("192.168.1.20:37001; rm -rf /", "123456")
+                .await,
+            Err(zbus::fdo::Error::InvalidArgs(_))
+        ));
+    }
+
+    #[test]
+    fn host_port_validation_accepts_hostnames_and_ipv6() {
+        assert!(validate_host_port("192.168.1.20:37001").is_ok());
+        assert!(validate_host_port("phone.local:5555").is_ok());
+        assert!(validate_host_port("[fe80::1%25wlan0]:37001").is_ok());
+    }
+
+    #[tokio::test]
     async fn diagnostics_reports_host_facts_as_json() {
         let (queue, _rx) = JobQueue::new(1);
         let manager = ManagerInterface {
@@ -1704,14 +1754,9 @@ impl ManagerInterface {
     }
 
     /// `adb connect <address>` — returns the adb CLI output so the GUI can
-    /// surface it. The address must look like host[:port].
+    /// surface it. The address must look like host:port.
     async fn connect_wireless(&self, address: &str) -> zbus::fdo::Result<String> {
-        let ok = !address.is_empty()
-            && !address.contains([';', '&', '|', '$', '`', '\n', ' '])
-            && address.rsplit_once(':').map(|(_, p)| p.parse::<u16>().is_ok()).unwrap_or(false);
-        if !ok {
-            return Err(zbus::fdo::Error::InvalidArgs("address must be host:port".into()));
-        }
+        validate_host_port(address)?;
         let out = tokio::time::timeout(
             Duration::from_secs(10),
             Command::new("adb")
@@ -1729,6 +1774,41 @@ impl ManagerInterface {
         );
         if !out.status.success() {
             return Err(zbus::fdo::Error::Failed(text));
+        }
+        Ok(text)
+    }
+
+    /// `adb pair <address> <code>` with a 60s timeout. The address must look
+    /// like host:port and the code must be six digits.
+    async fn pair_wireless(&self, address: &str, code: &str) -> zbus::fdo::Result<String> {
+        validate_host_port(address)?;
+        if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "pairing code must be six digits".into(),
+            ));
+        }
+        let out = tokio::time::timeout(
+            Duration::from_secs(60),
+            Command::new("adb")
+                .args(["pair", address, code])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed(format!("adb pair {address} timed out")))?
+        .map_err(|e| zbus::fdo::Error::Failed(format!("adb pair: {e}")))?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        if !out.status.success() {
+            let message = if text.trim().is_empty() {
+                format!("adb pair failed with status {status}", status = out.status)
+            } else {
+                text
+            };
+            return Err(zbus::fdo::Error::Failed(message));
         }
         Ok(text)
     }
@@ -1916,6 +1996,39 @@ impl From<Job> for JobDto {
             error: j.error(),
             device: j.device.clone(),
         }
+    }
+}
+
+fn validate_host_port(address: &str) -> zbus::fdo::Result<()> {
+    let valid = address.rsplit_once(':').is_some_and(|(host, port)| {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let Ok(port) = port.parse::<u16>() else {
+            return false;
+        };
+        if port == 0 {
+            return false;
+        }
+        let host = if let Some(host) = host.strip_prefix('[') {
+            host.strip_suffix(']').unwrap_or("")
+        } else if host.ends_with(']') {
+            ""
+        } else {
+            host
+        };
+        !host.is_empty()
+            && !host.contains(['[', ']'])
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%'))
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(zbus::fdo::Error::InvalidArgs(
+            "address must be host:port".into(),
+        ))
     }
 }
 
