@@ -42,6 +42,10 @@ const GRID_TILE_PAD: f32 = 14.0;
 const GRID_GAP: f32 = 8.0;
 /// Height of one row in the list view.
 const LIST_ROW_H: f32 = 30.0;
+/// Height of the context strip above the file area: padding plus two text lines.
+pub const CONTEXT_BAR_H: f32 = 38.0;
+/// Height of the search strip, shown only while search is active.
+pub const SEARCH_ROW_H: f32 = 40.0;
 
 actions!(
     browser,
@@ -224,6 +228,7 @@ pub struct Browser {
     viewport_x: f32,
     viewport_y: f32,
     viewport_width: f32,
+    viewport_height: f32,
 
     // ── Rubber-band selection ──────────────────────────────────────────────
     drag_anchor: Option<Point<Pixels>>,
@@ -266,6 +271,7 @@ impl Browser {
             viewport_x: 0.0,
             viewport_y: 0.0,
             viewport_width: 0.0,
+            viewport_height: 0.0,
             drag_anchor: None,
             drag_current: None,
             drag_extend: false,
@@ -489,10 +495,18 @@ impl Browser {
 
     /// Report where the file area is laid out, so rubber-band hit-testing has
     /// exact geometry to work from.
-    pub fn set_viewport(&mut self, x: f32, y: f32, width: f32, _cx: &mut Context<Self>) {
+    pub fn set_viewport(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        _cx: &mut Context<Self>,
+    ) {
         self.viewport_x = x;
         self.viewport_y = y;
         self.viewport_width = width;
+        self.viewport_height = height;
     }
 
     /// Install a directory listing, clearing any selection.
@@ -851,6 +865,31 @@ impl Browser {
         }
         let _ = window;
         cx.notify();
+    }
+
+    /// Which grid rows to build this frame, and how many.
+    ///
+    /// Reads the scroll offset recorded by the last frame's layout, so the
+    /// window is at most one frame stale. A row of overscan on each side keeps
+    /// fast scrolling from showing gaps.
+    fn visible_row_range(&self, tile_h: f32) -> (usize, usize) {
+        const OVERSCAN: usize = 1;
+        let viewport_h: f32 = self.viewport_height;
+        if viewport_h <= 0.0 || tile_h <= 0.0 {
+            // Before the first layout there is no viewport to measure, so fall
+            // back to a modest window rather than building the whole folder.
+            return (0, 24);
+        }
+        let scroll_y: f32 = self.scroll.offset().y.into();
+        let visible = (viewport_h / tile_h).ceil() as usize + 1;
+        let first = ((scroll_y / tile_h).floor() as isize - OVERSCAN as isize).max(0) as usize;
+        (first, visible + OVERSCAN * 2 + 1)
+    }
+
+    /// Scroll the file area to a pixel offset. Used by the windowing tests and
+    /// the visual check; the real UI scrolls through the pointer.
+    pub fn scroll_to(&self, y: f32) {
+        self.scroll.set_offset(gpui::point(px(0.), px(y)));
     }
 
     /// Bring the focused row into view in the (virtualised) list view.
@@ -1551,15 +1590,50 @@ impl Render for Browser {
                 .into_any_element()
         } else {
             match self.view_mode {
-                ViewMode::Grid => div()
-                    .id("grid")
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(GRID_GAP))
-                    .w_full()
-                    .p(px(GRID_GAP))
-                    .children((0..count).filter_map(|slot| self.grid_tile(slot, cx)))
-                    .into_any_element(),
+                ViewMode::Grid => {
+                    let tile_w = self.zoom + GRID_TILE_PAD * 2.0;
+                    let tile_h = tile_w + 34.0 + GRID_GAP;
+                    let columns = self.grid_geometry.columns.max(1);
+                    let rows = count.div_ceil(columns);
+
+                    // Only build the rows that can be on screen. A phone's DCIM
+                    // runs to thousands of files, and building a tile for each
+                    // one every frame cost ~160ms at 5,000 entries; windowing
+                    // keeps this proportional to the viewport instead.
+                    let (first_row, visible_rows) = self.visible_row_range(tile_h);
+                    let total_height = rows as f32 * tile_h + GRID_TILE_PAD;
+
+                    let windowed: Vec<AnyElement> = (first_row..first_row + visible_rows)
+                        .map(|row| {
+                            let first = row * columns;
+                            let last = (first + columns).min(count);
+                            div()
+                                .flex()
+                                .gap(px(GRID_GAP))
+                                .px(px(GRID_GAP))
+                                .children((first..last).filter_map(|slot| self.grid_tile(slot, cx)))
+                                .into_any_element()
+                        })
+                        .collect();
+
+                    div()
+                        .id("grid")
+                        .relative()
+                        .w_full()
+                        .h(px(total_height))
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(GRID_TILE_PAD + first_row as f32 * tile_h))
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(GRID_GAP))
+                                .children(windowed),
+                        )
+                        .into_any_element()
+                }
                 ViewMode::List => {
                     // The processor already hands over `&mut Browser`. Reaching
                     // for the entity from inside it would re-enter an update
@@ -1669,6 +1743,117 @@ mod tests {
             "12345678",
             "a serial that is already eight characters passes through"
         );
+    }
+
+    #[gpui::test]
+    async fn the_grid_window_covers_the_viewport_and_no_more(cx: &mut TestAppContext) {
+        // Regression guard for the windowing that replaced building a tile for
+        // every entry: a folder of thousands of files must cost the same as a
+        // small one, and the window must still cover the whole viewport.
+        let handle = open(cx);
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| {
+                b.device = Some("bench".into());
+                b.install_entries(synthetic_listing(5_000));
+                // 8 columns of 76px tiles in a 768x560 file area.
+                b.set_viewport(232.0, 45.0, 768.0, 560.0, cx);
+            });
+        });
+
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            let b = browser.read(app);
+            let tile_h = b.zoom + GRID_TILE_PAD * 2.0 + 34.0 + GRID_GAP;
+            let (first, rows) = b.visible_row_range(tile_h);
+            let expected_rows = (560.0 / tile_h).ceil() as usize + 3;
+            assert_eq!(first, 0, "at rest the window starts at the first row");
+            assert!(
+                rows <= expected_rows + 1,
+                "built {rows} rows for a viewport needing about {expected_rows}"
+            );
+            assert!(rows >= 6, "the window must cover a 560px viewport");
+        });
+    }
+
+    #[gpui::test]
+    async fn the_grid_window_follows_the_scroll_offset(cx: &mut TestAppContext) {
+        let handle = open(cx);
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| {
+                b.device = Some("bench".into());
+                b.install_entries(synthetic_listing(5_000));
+                b.set_viewport(232.0, 45.0, 768.0, 560.0, cx);
+            });
+        });
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, _cx| b.scroll_to(4_000.0));
+        });
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            let b = browser.read(app);
+            let tile_h = b.zoom + GRID_TILE_PAD * 2.0 + 34.0 + GRID_GAP;
+            let (first, _) = b.visible_row_range(tile_h);
+            assert!(
+                first > 20,
+                "scrolling 4000px must move the window down, got row {first}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn the_grid_window_falls_back_when_there_is_no_layout_yet(cx: &mut TestAppContext) {
+        // Before the first frame there is no viewport, so the window must stay
+        // small rather than building the whole folder.
+        let handle = open(cx);
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| {
+                b.device = Some("bench".into());
+                b.install_entries(synthetic_listing(5_000));
+            });
+            let browser = handle.root(app).expect("root view");
+            let b = browser.read(app);
+            let (first, rows) = b.visible_row_range(130.0);
+            assert_eq!(first, 0);
+            assert!(rows <= 32, "fallback window was {rows} rows");
+        });
+    }
+
+    #[gpui::test]
+    async fn the_grid_content_height_covers_every_row(cx: &mut TestAppContext) {
+        // The window only builds some rows, so something has to keep the
+        // scrollable height honest or the scrollbar would collapse.
+        let handle = open(cx);
+        for count in [1usize, 8, 100, 5_000] {
+            cx.update(|app| {
+                let browser = handle.root(app).expect("root view");
+                browser.update(app, |b, cx| {
+                    b.install_entries(synthetic_listing(count));
+                    b.set_viewport(232.0, 45.0, 768.0, 560.0, cx);
+                });
+            });
+            cx.update(|app| {
+                let browser = handle.root(app).expect("root view");
+                let b = browser.read(app);
+                let columns = b.grid_geometry.columns.max(1);
+                let rows = b.visible.len().div_ceil(columns);
+                let tile_w = b.zoom + GRID_TILE_PAD * 2.0;
+                let height = rows as f32 * (tile_w + 34.0 + GRID_GAP) + GRID_TILE_PAD;
+                assert!(
+                    height > 0.0,
+                    "{count} items must have a positive content height"
+                );
+                if count > 100 {
+                    assert!(
+                        height > b.viewport_height,
+                        "{count} items must overflow the viewport, got {height}"
+                    );
+                }
+            });
+        }
     }
 
     #[test]
@@ -2394,5 +2579,88 @@ mod tests {
                 assert!(b.delete_is_recoverable(), "the disk has a trash");
             });
         });
+    }
+
+    // ── Benchmarks ───────────────────────────────────────────────────────────────
+    //
+    //   cargo test -p adb-gui --release -- --ignored --nocapture bench
+    //
+    // The GTK build had no way to measure this, which is part of why the grid ended
+    // up building an element for every entry: on a phone with a few thousand files
+    // in `DCIM` that is thousands of elements per frame. These give a number to
+    // optimise against.
+
+    /// A listing with a realistic mix of Android media and app files.
+    fn synthetic_listing(count: usize) -> Vec<DirEntry> {
+        const STEMS: &[&str] = &[
+            "IMG_20240101_120000",
+            "Screenshot_2024-01-03",
+            "video_20240104",
+            "document",
+            "archive",
+            "notes",
+            "podcast_episode",
+        ];
+        const EXTS: &[&str] = &["jpg", "png", "mp4", "pdf", "zip", "txt", "mp3"];
+
+        (0..count)
+            .map(|i| DirEntry {
+                name: format!("{}_{i:04}.{}", STEMS[i % STEMS.len()], EXTS[i % EXTS.len()]),
+                is_dir: i % 25 == 0,
+                is_symlink: false,
+                size: 1_000_000 + (i as u64 * 7919),
+                mode: 0o644,
+                mtime: 1_700_000_000 + i as i64,
+            })
+            .collect()
+    }
+
+    /// Best-of-N time for one layout pass, in milliseconds.
+    ///
+    /// The browser is drawn through `VisualTestContext::draw` rather than by
+    /// refreshing the window, because that is what actually forces layout: a
+    /// refresh alone never runs `render` in the test harness.
+    fn bench_layout(mode: ViewMode, count: usize) -> f64 {
+        let mut cx = TestAppContext::single();
+        cx.update(|app| crate::theme::install(app));
+        let handle = open(&mut cx);
+        let mut vctx = cx.add_empty_window();
+        let browser = vctx.update(|_w, cx| handle.root(cx).expect("root view"));
+
+        vctx.update(|_w, cx| {
+            browser.update(cx, |b, cx| {
+                b.device = Some("bench".into());
+                b.device_display = "Bench".into();
+                b.install_entries(synthetic_listing(count));
+                b.view_mode = mode;
+                // A realistic viewport, so the grid measures the windowing path it
+                // actually takes at runtime rather than the no-layout fallback.
+                b.set_viewport(232.0, 45.0, 768.0, 560.0, cx);
+                cx.notify();
+            });
+        });
+
+        let mut best = f64::MAX;
+        for _ in 0..12 {
+            let start = std::time::Instant::now();
+            let _ = vctx.draw(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(1000.), px(680.)),
+                |_w, _cx| browser.clone(),
+            );
+            best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn bench_layout_cost_by_listing_size() {
+        for count in [200usize, 1_000, 5_000] {
+            for (label, mode) in [("grid", ViewMode::Grid), ("list", ViewMode::List)] {
+                let ms = bench_layout(mode, count);
+                println!("bench {label:<5} n={count:<6} {ms:8.3} ms");
+            }
+        }
     }
 }
