@@ -172,8 +172,7 @@ impl AdbshareApp {
             window.add_css_class("background");
 
             // ═══════════════════════════════════════════════════════════
-            //  LAYOUT — rebuilt from scratch for a modern, sleek look.
-            //  Same structure: headerbar + sidebar/content body.
+            //  LAYOUT — top bar + sidebar/content body.
             // ═══════════════════════════════════════════════════════════
             let main_layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
@@ -181,14 +180,18 @@ impl AdbshareApp {
             browser.root.set_vexpand(true);
             browser.root.set_hexpand(true);
 
-            // ── Header bar ──────────────────────────────────────────
-            let header = adw::HeaderBar::new();
-            header.add_css_class("sleek-headerbar");
+            // ── Top bar ──────────────────────────────────────────────
+            let topbar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            topbar.add_css_class("topbar");
+            topbar.set_size_request(-1, 48);
+            topbar.set_hexpand(true);
 
             // 1. Left: Navigation Capsule  [≡ | ← | → | ↑]
             let nav_capsule = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
             nav_capsule.add_css_class("pill-capsule");
+            nav_capsule.add_css_class("navigation-capsule");
             nav_capsule.set_valign(gtk4::Align::Center);
+            nav_capsule.set_size_request(-1, 34);
 
             let sidebar_toggle = gtk4::ToggleButton::builder()
                 .tooltip_text("Toggle sidebar (F9)")
@@ -219,13 +222,13 @@ impl AdbshareApp {
                     nav_capsule.append(&s);
                 }
             }
-            header.pack_start(&nav_capsule);
 
             // 2. Center: Omnibar location pill
             let omnibar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
             omnibar.add_css_class("omnibar-pill");
             omnibar.set_valign(gtk4::Align::Center);
             omnibar.set_hexpand(true);
+            omnibar.set_size_request(584, 34);
 
             let path_icon = gtk4::Image::from_icon_name("folder-symbolic");
             path_icon.add_css_class("omnibar-leading-icon");
@@ -243,7 +246,22 @@ impl AdbshareApp {
             browser.path_edit_toggle.set_valign(gtk4::Align::Center);
             omnibar.append(&browser.path_edit_toggle);
 
-            header.set_title_widget(Some(&omnibar));
+            let empty_search = gtk4::ToggleButton::new();
+            let empty_search_icon = gtk4::Image::from_icon_name("edit-find-symbolic");
+            empty_search_icon.set_pixel_size(16);
+            empty_search.set_child(Some(&empty_search_icon));
+            empty_search.set_tooltip_text(Some("Search files (Ctrl+F)"));
+            empty_search.add_css_class("capsule-btn");
+            empty_search.add_css_class("flat");
+            empty_search.add_css_class("omnibar-sub-btn");
+            empty_search.set_valign(gtk4::Align::Center);
+            omnibar.append(&empty_search);
+            let search_binding = browser
+                .search_button
+                .bind_property("active", &empty_search, "active")
+                .bidirectional()
+                .sync_create()
+                .build();
 
             // Transfer popover (full queue)
             let transfer = TransferView::new();
@@ -333,7 +351,8 @@ impl AdbshareApp {
             trans_pop.set_child(Some(&trans_box));
 
             // 3. Right: Operations + View + Transfers + Kebab
-            let header_end = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            let header_end = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            header_end.set_margin_end(0);
             header_end.set_valign(gtk4::Align::Center);
 
             // Helper: creates an icon image at a uniform size for header buttons.
@@ -346,6 +365,7 @@ impl AdbshareApp {
             // Ops capsule: [new folder | upload | download]
             let ops_capsule = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
             ops_capsule.add_css_class("pill-capsule");
+            ops_capsule.set_size_request(-1, 34);
             ops_capsule.set_valign(gtk4::Align::Center);
 
             browser.new_folder_button.add_css_class("capsule-btn");
@@ -385,6 +405,7 @@ impl AdbshareApp {
             // View capsule: [grid/list | search]
             let view_capsule = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
             view_capsule.add_css_class("pill-capsule");
+            view_capsule.set_size_request(35, 34);
             view_capsule.set_valign(gtk4::Align::Center);
 
             let view_toggle = gtk4::Button::new();
@@ -425,17 +446,39 @@ impl AdbshareApp {
             browser.search_button.set_valign(gtk4::Align::Center);
             view_capsule.append(&browser.search_button);
 
+            let empty_mode_search = empty_search.clone();
+            let view_mode_search = browser.search_button.clone();
+            let view_mode_separator = sep_v.clone();
+            let mode_omnibar = omnibar.clone();
+            let mode_view_capsule = view_capsule.clone();
+            view_mode_search.set_visible(false);
+            view_mode_separator.set_visible(false);
+            browser.main_stack.connect_notify_local(
+                Some("visible-child-name"),
+                move |stack, _| {
+                    let _binding = &search_binding;
+                    let empty = stack.visible_child_name().as_deref() == Some("empty");
+                    empty_mode_search.set_visible(empty);
+                    view_mode_search.set_visible(!empty);
+                    view_mode_separator.set_visible(!empty);
+                    mode_omnibar.set_size_request(if empty { 584 } else { 550 }, 34);
+                    mode_view_capsule.set_size_request(if empty { 35 } else { 65 }, 34);
+                },
+            );
+
             header_end.append(&view_capsule);
 
             // Transfers pill badge — same 34px via CSS, uniform icon
             let transfers_btn = gtk4::MenuButton::new();
             transfers_btn.add_css_class("pill-capsule-btn");
             transfers_btn.add_css_class("flat");
+            transfers_btn.set_size_request(34, 34);
             let trans_box_inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 5);
             trans_box_inner.set_valign(gtk4::Align::Center);
             let trans_dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
             trans_dot.add_css_class("transfer-indicator-dot");
             trans_dot.set_valign(gtk4::Align::Center);
+            trans_dot.set_visible(false);
             trans_box_inner.append(&trans_dot);
             trans_box_inner.append(&hdr_icon("emblem-synchronizing-symbolic"));
             transfers_btn.set_child(Some(&trans_box_inner));
@@ -450,6 +493,7 @@ impl AdbshareApp {
             kebab.set_child(Some(&hdr_icon("view-more-symbolic")));
             kebab.add_css_class("pill-capsule-btn");
             kebab.add_css_class("flat");
+            kebab.set_size_request(34, 34);
             kebab.set_tooltip_text(Some("More options"));
             kebab.set_valign(gtk4::Align::Center);
             let kebab_menu = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
@@ -619,9 +663,24 @@ impl AdbshareApp {
             kebab.set_popover(Some(&kebab_pop));
             header_end.append(&kebab);
 
-            header.pack_end(&header_end);
+            let close_button = gtk4::Button::new();
+            close_button.add_css_class("custom-close");
+            close_button.add_css_class("flat");
+            close_button.set_size_request(20, 34);
+            close_button.set_has_frame(false);
+            close_button.set_tooltip_text(Some("Close window"));
+            close_button.set_child(Some(&hdr_icon("window-close-symbolic")));
+            {
+                let close_window = window.clone();
+                close_button.connect_clicked(move |_| close_window.close());
+            }
+            header_end.append(&close_button);
 
-            main_layout.append(&header);
+            topbar.append(&nav_capsule);
+            topbar.append(&omnibar);
+            topbar.append(&header_end);
+
+            main_layout.append(&topbar);
 
             // Search row: hidden until search toggle is on
             browser.search_entry.set_placeholder_text(Some("Search this folder…"));
@@ -634,18 +693,18 @@ impl AdbshareApp {
             search_row.append(&browser.search_entry);
             browser.search_bar.set_child(Some(&search_row));
 
-            // ── Body: responsive overlay split view ─────────────────
-            let split_view = adw::OverlaySplitView::new();
+            // ── Body: responsive split view ───────────────────────────
+            let split_view = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+            split_view.add_css_class("sidebar-paned");
             split_view.set_vexpand(true);
             split_view.set_hexpand(true);
-            split_view.set_min_sidebar_width(200.0);
-            split_view.set_max_sidebar_width(300.0);
-            split_view.set_sidebar_width_fraction(0.22);
-            split_view.set_enable_show_gesture(true);
-            split_view.set_enable_hide_gesture(true);
+            split_view.set_position(220);
+            split_view.set_resize_start_child(true);
+            split_view.set_shrink_start_child(false);
 
             let sidebar_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             sidebar_box.add_css_class("navigation-sidebar");
+            sidebar_box.set_size_request(200, -1);
 
             let device_list = std::rc::Rc::new(DeviceList::new());
             device_list.populate_defaults();
@@ -657,18 +716,61 @@ impl AdbshareApp {
             content_box.append(&browser.search_bar);
             content_box.append(&browser.root);
 
-            split_view.set_sidebar(Some(&sidebar_box));
-            split_view.set_content(Some(&content_box));
+            split_view.set_start_child(Some(&sidebar_box));
+            split_view.set_end_child(Some(&content_box));
             main_layout.append(&split_view);
 
-            let sv_toggle = split_view.clone();
-            sidebar_toggle.connect_toggled(move |btn| {
-                sv_toggle.set_show_sidebar(btn.is_active());
+            {
+                let split_view = split_view.clone();
+                split_view.connect_notify_local(Some("position"), move |paned, _| {
+                    if paned.position() > 300 {
+                        paned.set_position(300);
+                    }
+                });
+            }
+
+            let sidebar_visible = std::rc::Rc::new(std::cell::Cell::new(true));
+            let saved_sidebar_position = std::rc::Rc::new(std::cell::Cell::new(220));
+            let narrow_layout = std::rc::Rc::new(std::cell::Cell::new(false));
+            let toggle_sidebar: std::rc::Rc<dyn Fn(bool)> = std::rc::Rc::new({
+                let split_view = split_view.clone();
+                let sidebar_box = sidebar_box.clone();
+                let sidebar_visible = sidebar_visible.clone();
+                let saved_sidebar_position = saved_sidebar_position.clone();
+                let narrow_layout = narrow_layout.clone();
+                move |visible| {
+                    if narrow_layout.get() {
+                        return;
+                    }
+                    if visible {
+                        split_view.set_start_child(Some(&sidebar_box));
+                        split_view.set_position(saved_sidebar_position.get().clamp(200, 300));
+                        sidebar_visible.set(true);
+                    } else {
+                        let position = split_view.position();
+                        if position > 0 {
+                            saved_sidebar_position.set(position.clamp(200, 300));
+                        }
+                        split_view.set_start_child(None::<&gtk4::Box>);
+                        split_view.set_position(0);
+                        sidebar_visible.set(false);
+                    }
+                }
             });
-            let btn_toggle = sidebar_toggle.clone();
-            split_view.connect_show_sidebar_notify(move |sv| {
-                btn_toggle.set_active(sv.shows_sidebar());
-            });
+
+            {
+                let toggle = toggle_sidebar.clone();
+                sidebar_toggle.connect_toggled(move |button| toggle(button.is_active()));
+            }
+            {
+                let saved = saved_sidebar_position.clone();
+                let visible = sidebar_visible.clone();
+                split_view.connect_notify_local(Some("position"), move |paned, _| {
+                    if visible.get() && paned.position() > 0 {
+                        saved.set(paned.position().clamp(200, 300));
+                    }
+                });
+            }
 
             // Breakpoint: collapse sidebar on narrow viewports
             let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
@@ -676,15 +778,60 @@ impl AdbshareApp {
                 760.0,
                 adw::LengthUnit::Sp,
             ));
-            breakpoint.add_setter(&split_view, "collapsed", Some(&true.into()));
+            let narrow_layout_apply = narrow_layout.clone();
+            let sidebar_visible_apply = sidebar_visible.clone();
+            let saved_position_apply = saved_sidebar_position.clone();
+            let previous_visible = std::rc::Rc::new(std::cell::Cell::new(true));
+            let previous_position = std::rc::Rc::new(std::cell::Cell::new(220));
+            let previous_visible_apply = previous_visible.clone();
+            let previous_position_apply = previous_position.clone();
+            let split_apply = split_view.clone();
+            let toggle_apply = sidebar_toggle.clone();
+            breakpoint.connect_apply(move |_| {
+                previous_visible_apply.set(sidebar_visible_apply.get());
+                previous_position_apply.set(if split_apply.position() > 0 {
+                    split_apply.position().clamp(200, 300)
+                } else {
+                    saved_position_apply.get()
+                });
+                narrow_layout_apply.set(true);
+                sidebar_visible_apply.set(false);
+                toggle_apply.set_active(false);
+                split_apply.set_start_child(None::<&gtk4::Box>);
+                split_apply.set_position(0);
+            });
+            let narrow_layout_unapply = narrow_layout.clone();
+            let sidebar_visible_unapply = sidebar_visible.clone();
+            let saved_position_unapply = saved_sidebar_position.clone();
+            let previous_visible_unapply = previous_visible.clone();
+            let previous_position_unapply = previous_position.clone();
+            let split_unapply = split_view.clone();
+            let sidebar_unapply = sidebar_box.clone();
+            let toggle_unapply = sidebar_toggle.clone();
+            breakpoint.connect_unapply(move |_| {
+                narrow_layout_unapply.set(false);
+                let visible = previous_visible_unapply.get();
+                toggle_unapply.set_active(visible);
+                if visible {
+                    split_unapply.set_start_child(Some(&sidebar_unapply));
+                    split_unapply.set_position(previous_position_unapply.get().clamp(200, 300));
+                    saved_position_unapply.set(previous_position_unapply.get().clamp(200, 300));
+                    sidebar_visible_unapply.set(true);
+                } else {
+                    split_unapply.set_start_child(None::<&gtk4::Box>);
+                    split_unapply.set_position(0);
+                    sidebar_visible_unapply.set(false);
+                }
+            });
             window.add_breakpoint(breakpoint);
 
             // F9 shortcut toggles the sidebar
             let key_ctrl = gtk4::EventControllerKey::new();
-            let sv_key = split_view.clone();
+            let toggle_f9 = toggle_sidebar.clone();
+            let visible_f9 = sidebar_visible.clone();
             key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
                 if keyval == gdk4::Key::F9 {
-                    sv_key.set_show_sidebar(!sv_key.shows_sidebar());
+                    toggle_f9(!visible_f9.get());
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -1055,9 +1202,11 @@ impl AdbshareApp {
                             *handles_jobs.active_jobs.lock() = active.iter().map(|j| j.id).collect();
                             if active.is_empty() {
                                 dot_drain.remove_css_class("active");
+                                dot_drain.set_visible(false);
                                 btn_drain.set_tooltip_text(Some("Transfers (idle)"));
                             } else {
                                 dot_drain.add_css_class("active");
+                                dot_drain.set_visible(true);
                                 if active.len() == 1 {
                                     btn_drain.set_tooltip_text(Some("1 active transfer"));
                                 } else {
@@ -1376,7 +1525,9 @@ fn paste_clipboard(
                     let result = if e.is_dir {
                         copy_tree(&device, &src.to_string_lossy(), &dst.to_string_lossy())
                             .await
-                            .and_then(|r| tree_result_message("Copy", &r).map_err(|e| anyhow::anyhow!(e)))
+                            .and_then(|r| {
+                                tree_result_message("Copy", &r).map_err(|e| anyhow::anyhow!(e))
+                            })
                             .map(|_| ())
                     } else {
                         copy_file(&device, &src.to_string_lossy(), &dst.to_string_lossy()).await
@@ -1410,7 +1561,9 @@ fn paste_clipboard(
                     let result = if e.is_dir {
                         enqueue_tree_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
                             .await
-                            .and_then(|r| tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e)))
+                            .and_then(|r| {
+                                tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e))
+                            })
                             .map(|_| ())
                     } else {
                         enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
@@ -1441,7 +1594,9 @@ fn paste_clipboard(
                     let result = if e.is_dir {
                         enqueue_tree_pull(&device, &src, &local)
                             .await
-                            .and_then(|r| tree_result_message("Pull", &r).map_err(|e| anyhow::anyhow!(e)))
+                            .and_then(|r| {
+                                tree_result_message("Pull", &r).map_err(|e| anyhow::anyhow!(e))
+                            })
                             .map(|_| ())
                     } else {
                         enqueue_pull(&device, &src, &local).await.map(|_| ())
@@ -1647,18 +1802,22 @@ fn handle_browser_event(
                             continue;
                         }
                         let device_src = format!("/{}", rel.to_string_lossy());
-                        if let Err(e) =
-                            rename(&device, &device_src, &dst.to_string_lossy()).await
-                        {
+                        if let Err(e) = rename(&device, &device_src, &dst.to_string_lossy()).await {
                             let _ = op_tx.try_send((None, Err(format!("move: {e}"))));
                         }
                     }
                     Err(_) => {
                         let result = if src.is_dir() {
-                            enqueue_tree_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
-                                .await
-                                .and_then(|r| tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e)))
-                                .map(|_| ())
+                            enqueue_tree_push(
+                                &device,
+                                &src.to_string_lossy(),
+                                &dst.to_string_lossy(),
+                            )
+                            .await
+                            .and_then(|r| {
+                                tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e))
+                            })
+                            .map(|_| ())
                         } else {
                             enqueue_push(&device, &src.to_string_lossy(), &dst.to_string_lossy())
                                 .await
@@ -1772,7 +1931,14 @@ fn handle_browser_event(
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("app.apk")
                                 .to_string();
-                            run_apk_install(dev_d.clone(), path_str, name, &handles_d, &op_tx_d, &rt_d);
+                            run_apk_install(
+                                dev_d.clone(),
+                                path_str,
+                                name,
+                                &handles_d,
+                                &op_tx_d,
+                                &rt_d,
+                            );
                         }
                     } else if resp == "copy" {
                         push_dropped_files_to_device(
@@ -2069,7 +2235,10 @@ fn handle_browser_event(
             if handles.browser.is_local_mode() {
                 let _ = op_tx.try_send((
                     None,
-                    Err("Browse the phone first — folders upload into the browsed phone directory.".into()),
+                    Err(
+                        "Browse the phone first — folders upload into the browsed phone directory."
+                            .into(),
+                    ),
                 ));
                 return;
             }
@@ -2100,9 +2269,12 @@ fn handle_browser_event(
                             let device = device_cb.clone();
                             let op_tx = op_tx_cb.clone();
                             rt.spawn(async move {
-                                let r = enqueue_tree_push(&device, &local, &remote)
-                                    .await
-                                    .and_then(|r| tree_result_message("Push", &r).map_err(|e| anyhow::anyhow!(e)));
+                                let r = enqueue_tree_push(&device, &local, &remote).await.and_then(
+                                    |r| {
+                                        tree_result_message("Push", &r)
+                                            .map_err(|e| anyhow::anyhow!(e))
+                                    },
+                                );
                                 let _ = op_tx.try_send((
                                     Some("Folder upload".into()),
                                     r.map_err(|e| e.to_string()),
@@ -2236,7 +2408,10 @@ fn handle_browser_event(
                                     rt.spawn(async move {
                                         if let Err(e) = enqueue_tree_pull(&device, &src, &local)
                                             .await
-                                            .and_then(|r| tree_result_message("Pull", &r).map_err(|e| anyhow::anyhow!(e)))
+                                            .and_then(|r| {
+                                                tree_result_message("Pull", &r)
+                                                    .map_err(|e| anyhow::anyhow!(e))
+                                            })
                                         {
                                             tracing::warn!(error=%e, "enqueue_tree_pull failed");
                                         }
@@ -2463,7 +2638,14 @@ fn handle_browser_event(
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("app.apk")
                                 .to_string();
-                            run_apk_install(device.clone(), path_str, name, &handles_cb, &op_tx_cb, &rt_cb);
+                            run_apk_install(
+                                device.clone(),
+                                path_str,
+                                name,
+                                &handles_cb,
+                                &op_tx_cb,
+                                &rt_cb,
+                            );
                         }
                     }
                 }
@@ -2615,7 +2797,10 @@ mod copy_tests {
     #[zbus::interface(name = "org.adbshare.Manager")]
     impl CopyManager {
         async fn copy_file(&self, device: &str, src: &str, dst: &str) -> zbus::fdo::Result<()> {
-            assert_eq!((device, src, dst), ("test-phone", "/source", "/destination"));
+            assert_eq!(
+                (device, src, dst),
+                ("test-phone", "/source", "/destination")
+            );
             Err(zbus::fdo::Error::Failed(
                 "completion unknown; destination may be incomplete or still copying".into(),
             ))
@@ -2644,18 +2829,28 @@ mod copy_tests {
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
         assert_eq!(std::fs::read(dst.join("sub").join("b.txt")).unwrap(), b"b");
         assert!(!dst.join("link").exists());
-        assert!(tree_result_message("Push", &TreeEnqueueResult {
-            enqueued: vec![1, 2],
-            errors: vec!["x".into()],
-        })
-        .unwrap()
-        .contains("queued 2 file(s)"));
+        assert!(
+            tree_result_message(
+                "Push",
+                &TreeEnqueueResult {
+                    enqueued: vec![1, 2],
+                    errors: vec!["x".into()],
+                }
+            )
+            .unwrap()
+            .contains("queued 2 file(s)")
+        );
         assert!(tree_result_message("Pull", &TreeEnqueueResult::default()).is_ok());
-        assert!(tree_result_message("Pull", &TreeEnqueueResult {
-            enqueued: vec![],
-            errors: vec!["boom".into()],
-        })
-        .is_err());
+        assert!(
+            tree_result_message(
+                "Pull",
+                &TreeEnqueueResult {
+                    enqueued: vec![],
+                    errors: vec!["boom".into()],
+                }
+            )
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2721,18 +2916,29 @@ mod copy_tests {
     #[tokio::test]
     #[ignore = "requires dbus-run-session -- cargo test -p adb-gui --locked copy_wrapper_preserves_unknown_completion -- --ignored"]
     async fn copy_wrapper_preserves_unknown_completion() {
-        let server = zbus::ConnectionBuilder::session().unwrap()
-            .serve_at("/org/adbshare/Manager", CopyManager).unwrap()
-            .build().await.unwrap();
+        let server = zbus::ConnectionBuilder::session()
+            .unwrap()
+            .serve_at("/org/adbshare/Manager", CopyManager)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         let connection = zbus::Connection::session().await.unwrap();
         let proxy = ManagerProxy::builder(&connection)
-            .destination(server.unique_name().unwrap().to_owned()).unwrap()
-            .build().await.unwrap();
+            .destination(server.unique_name().unwrap().to_owned())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         assert!(MANAGER_PROXY.set(proxy).is_ok());
-        let error = copy_file("test-phone", "/source", "/destination").await.unwrap_err();
-        assert!(error.to_string().contains(
-            "completion unknown; destination may be incomplete or still copying"
-        ));
+        let error = copy_file("test-phone", "/source", "/destination")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("completion unknown; destination may be incomplete or still copying")
+        );
     }
 }
 
@@ -3004,7 +3210,8 @@ async fn list_dir(device: &str, path: &str) -> anyhow::Result<Vec<FsDirEntry>> {
     Ok(entries.into_iter().map(FsDirEntry::from).collect())
 }
 
-static TRANSFER_POLICY: std::sync::OnceLock<parking_lot::Mutex<String>> = std::sync::OnceLock::new();
+static TRANSFER_POLICY: std::sync::OnceLock<parking_lot::Mutex<String>> =
+    std::sync::OnceLock::new();
 static TRANSFER_VERIFY: std::sync::OnceLock<parking_lot::Mutex<bool>> = std::sync::OnceLock::new();
 
 fn transfer_policy() -> (String, bool) {
@@ -3014,15 +3221,21 @@ fn transfer_policy() -> (String, bool) {
 }
 
 fn set_transfer_policy(policy: &str, verify: bool) {
-    *TRANSFER_POLICY.get_or_init(|| parking_lot::Mutex::new("skip".to_string())).lock() =
-        policy.to_string();
-    *TRANSFER_VERIFY.get_or_init(|| parking_lot::Mutex::new(false)).lock() = verify;
+    *TRANSFER_POLICY
+        .get_or_init(|| parking_lot::Mutex::new("skip".to_string()))
+        .lock() = policy.to_string();
+    *TRANSFER_VERIFY
+        .get_or_init(|| parking_lot::Mutex::new(false))
+        .lock() = verify;
 }
 
 async fn enqueue_push(device: &str, local: &str, device_path: &str) -> anyhow::Result<u64> {
     let proxy = get_manager().await?;
     let (policy, verify) = transfer_policy();
-    match proxy.enqueue_push_with_options(device, local, device_path, &policy, verify).await {
+    match proxy
+        .enqueue_push_with_options(device, local, device_path, &policy, verify)
+        .await
+    {
         Ok(id) => Ok(id),
         Err(zbus::Error::MethodError(name, _, _))
             if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
@@ -3036,7 +3249,10 @@ async fn enqueue_push(device: &str, local: &str, device_path: &str) -> anyhow::R
 async fn enqueue_pull(device: &str, device_path: &str, local: &str) -> anyhow::Result<u64> {
     let proxy = get_manager().await?;
     let (policy, verify) = transfer_policy();
-    match proxy.enqueue_pull_with_options(device, device_path, local, &policy, verify).await {
+    match proxy
+        .enqueue_pull_with_options(device, device_path, local, &policy, verify)
+        .await
+    {
         Ok(id) => Ok(id),
         Err(zbus::Error::MethodError(name, _, _))
             if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
@@ -3105,7 +3321,11 @@ fn format_diagnostics(report: &DiagnosticReportDto) -> String {
     }
     lines.push(format!(
         "Mounts: {} (base {}, {} connections per device)",
-        if report.no_fuse { "disabled" } else { "enabled" },
+        if report.no_fuse {
+            "disabled"
+        } else {
+            "enabled"
+        },
         report.mount_base,
         report.proxy_conns,
     ));
@@ -3117,7 +3337,11 @@ fn format_diagnostics(report: &DiagnosticReportDto) -> String {
                 "Device {}: {}",
                 device.serial,
                 if device.setup_ok {
-                    if device.mounted { "ready, mounted" } else { "ready, FUSE mount unavailable — use in-app browsing" }
+                    if device.mounted {
+                        "ready, mounted"
+                    } else {
+                        "ready, FUSE mount unavailable — use in-app browsing"
+                    }
                 } else {
                     "setup incomplete — check the helper build and daemon log"
                 },
@@ -3135,21 +3359,37 @@ struct TreeEnqueueResult {
     errors: Vec<String>,
 }
 
-async fn enqueue_tree_push(device: &str, local_dir: &str, device_dir: &str) -> anyhow::Result<TreeEnqueueResult> {
+async fn enqueue_tree_push(
+    device: &str,
+    local_dir: &str,
+    device_dir: &str,
+) -> anyhow::Result<TreeEnqueueResult> {
     let proxy = get_manager().await?;
     let (policy, verify) = transfer_policy();
-    let json = proxy.enqueue_tree_push(device, local_dir, device_dir, &policy, verify).await?;
+    let json = proxy
+        .enqueue_tree_push(device, local_dir, device_dir, &policy, verify)
+        .await?;
     Ok(serde_json::from_str(&json)?)
 }
 
-async fn enqueue_tree_pull(device: &str, device_dir: &str, local_dir: &str) -> anyhow::Result<TreeEnqueueResult> {
+async fn enqueue_tree_pull(
+    device: &str,
+    device_dir: &str,
+    local_dir: &str,
+) -> anyhow::Result<TreeEnqueueResult> {
     let proxy = get_manager().await?;
     let (policy, verify) = transfer_policy();
-    let json = proxy.enqueue_tree_pull(device, device_dir, local_dir, &policy, verify).await?;
+    let json = proxy
+        .enqueue_tree_pull(device, device_dir, local_dir, &policy, verify)
+        .await?;
     Ok(serde_json::from_str(&json)?)
 }
 
-async fn copy_tree(device: &str, src_dir: &str, dst_dir: &str) -> anyhow::Result<TreeEnqueueResult> {
+async fn copy_tree(
+    device: &str,
+    src_dir: &str,
+    dst_dir: &str,
+) -> anyhow::Result<TreeEnqueueResult> {
     let proxy = get_manager().await?;
     let json = proxy.copy_tree(device, src_dir, dst_dir).await?;
     Ok(serde_json::from_str(&json)?)
@@ -3172,7 +3412,10 @@ fn copy_tree_local(src: &Path, dst: &Path) -> std::io::Result<usize> {
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf(), 0u32)];
     while let Some((from, to, depth)) = stack.pop() {
         if depth > 32 {
-            return Err(std::io::Error::other(format!("{}: nesting too deep", from.display())));
+            return Err(std::io::Error::other(format!(
+                "{}: nesting too deep",
+                from.display()
+            )));
         }
         std::fs::create_dir_all(&to)?;
         for entry in std::fs::read_dir(&from)? {

@@ -73,6 +73,8 @@ fn format_capacity((used, total): (u64, u64)) -> String {
 fn heading(text: &str) -> gtk4::Label {
     let lbl = gtk4::Label::builder().label(text).xalign(0.0).build();
     lbl.add_css_class("sidebar-heading");
+    lbl.set_size_request(-1, 24);
+    lbl.set_valign(gtk4::Align::End);
     lbl
 }
 
@@ -96,26 +98,10 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
     }
 
     let card = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    card.set_margin_start(2);
-    card.set_margin_end(2);
-    card.set_margin_top(2);
-    card.set_margin_bottom(2);
 
     // ── Top row: LED dot + phone icon + name … transport badge ──
-    let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 7);
     top.set_valign(gtk4::Align::Center);
-
-    // Status LED with glow
-    let dot = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-    dot.add_css_class("led");
-    dot.add_css_class(if entry.transport == "wifi" {
-        "led-wifi"
-    } else {
-        "led-on"
-    });
-    dot.set_valign(gtk4::Align::Center);
-    dot.set_size_request(8, 8);
-    top.append(&dot);
 
     // Phone icon
     let icon = gtk4::Image::from_icon_name("phone-symbolic");
@@ -146,21 +132,6 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
     });
     chip.set_valign(gtk4::Align::Center);
     top.append(&chip);
-    card.append(&top);
-
-    // ── Middle row: serial + battery pill ──
-    let mid = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    mid.set_margin_start(24);
-
-    let serial_lbl = gtk4::Label::builder()
-        .label(&entry.serial)
-        .xalign(0.0)
-        .hexpand(true)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .build();
-    serial_lbl.add_css_class("device-subline");
-    mid.append(&serial_lbl);
-
     if let Some(pct) = entry.battery_pct {
         let batt = gtk4::Label::new(Some(&format!("{}%", pct)));
         batt.add_css_class("battery-pill");
@@ -168,9 +139,9 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
             batt.add_css_class("low");
         }
         batt.set_valign(gtk4::Align::Center);
-        mid.append(&batt);
+        top.append(&batt);
     }
-    card.append(&mid);
+    card.append(&top);
 
     // ── Bottom row: storage bar + caption (only when known) ──
     if let Some((used, total)) = entry.storage.filter(|(_, t)| *t > 0) {
@@ -180,7 +151,6 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
         bar.set_show_text(false);
         bar.set_fraction(frac);
         bar.add_css_class("device-storage-bar");
-        bar.set_margin_start(24);
         bar.set_margin_top(4);
         card.append(&bar);
 
@@ -189,7 +159,6 @@ fn device_row(entry: &DeviceEntry, selected: bool) -> gtk4::ListBoxRow {
             .xalign(0.0)
             .build();
         cap.add_css_class("device-subline");
-        cap.set_margin_start(24);
         cap.set_margin_top(1);
         card.append(&cap);
     }
@@ -236,10 +205,6 @@ fn onboarding_row() -> gtk4::ListBoxRow {
     row.add_css_class("onboarding-card");
 
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    vbox.set_margin_start(6);
-    vbox.set_margin_end(6);
-    vbox.set_margin_top(8);
-    vbox.set_margin_bottom(8);
 
     let title = gtk4::Label::builder()
         .label("No phone connected")
@@ -311,7 +276,7 @@ impl DeviceList {
             hbox.append(&gtk4::Label::new(Some("Connect via Wi-Fi\u{2026}")));
             connect_btn.set_child(Some(&hbox));
             connect_btn.add_css_class("connect-button");
-            connect_btn.set_margin_top(6);
+            connect_btn.set_margin_top(4);
             connect_btn.set_margin_bottom(4);
             connect_btn
                 .set_tooltip_text(Some("Pair once on the phone, then connect by IP address"));
@@ -531,7 +496,7 @@ impl DeviceList {
     pub fn set_phone_folders_enabled(&self, enabled: bool) {
         self.phone_folders_box.set_sensitive(enabled);
         self.phone_folders_box
-            .set_opacity(if enabled { 1.0 } else { 0.45 });
+            .set_opacity(if enabled { 1.0 } else { 0.42 });
         self.phone_hint.set_visible(!enabled);
     }
 
