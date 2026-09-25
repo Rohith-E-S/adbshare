@@ -886,8 +886,12 @@ impl Browser {
         (first, visible + OVERSCAN * 2 + 1)
     }
 
-    /// Scroll the file area to a pixel offset. Used by the windowing tests and
-    /// the visual check; the real UI scrolls through the pointer.
+    /// Scroll the file area to a pixel offset.
+    ///
+    /// Only the windowing tests need this: the real UI scrolls through the
+    /// pointer, and arrow-key navigation goes through the browser's own
+    /// actions.
+    #[cfg(test)]
     pub fn scroll_to(&self, y: f32) {
         self.scroll.set_offset(gpui::point(px(0.), px(y)));
     }
@@ -1810,7 +1814,7 @@ mod tests {
         let handle = open(cx);
         cx.update(|app| {
             let browser = handle.root(app).expect("root view");
-            browser.update(app, |b, cx| {
+            browser.update(app, |b, _cx| {
                 b.device = Some("bench".into());
                 b.install_entries(synthetic_listing(5_000));
             });
@@ -2622,9 +2626,9 @@ mod tests {
     /// refresh alone never runs `render` in the test harness.
     fn bench_layout(mode: ViewMode, count: usize) -> f64 {
         let mut cx = TestAppContext::single();
-        cx.update(|app| crate::theme::install(app));
+        cx.update(crate::theme::install);
         let handle = open(&mut cx);
-        let mut vctx = cx.add_empty_window();
+        let vctx = cx.add_empty_window();
         let browser = vctx.update(|_w, cx| handle.root(cx).expect("root view"));
 
         vctx.update(|_w, cx| {
