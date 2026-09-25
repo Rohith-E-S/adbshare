@@ -6,7 +6,7 @@ pkgdesc="Fast, reliable Linux file manager for Android devices over ADB"
 arch=('x86_64' 'aarch64')
 url="https://github.com/yourusername/adbshare"
 license=('GPL3')
-depends=('gtk4' 'libadwaita' 'fuse3' 'libusb')
+depends=('vulkan-icd-loader' 'libxkbcommon' 'wayland' 'libx11' 'libxext' 'fontconfig' 'fuse3' 'libusb')
 makedepends=('cargo' 'rust' 'pkgconf')
 optdepends=('android-tools: fallback adb binary')
 

@@ -30,11 +30,11 @@ jobs:
   # ---------------------------------------------------------------
   build-linux:
     runs-on: ubuntu-latest
-    # Same reasoning as CI: the workspace needs GTK >= 4.17 /
-    # libadwaita >= 1.7, which ubuntu-latest's apt cannot provide.
-    # Pinned Fedora major version so distro upgrades are deliberate.
+    # The GUI is GPUI: it needs a Vulkan loader plus the xkbcommon and
+    # Wayland/X11 client libraries. Pinned Fedora major version so distro
+    # upgrades are deliberate.
     container: fedora:44
-    timeout-minutes: 30
+    timeout-minutes: 45
     outputs:
       base-version: ${{ steps.version.outputs.base-version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -46,7 +46,9 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc pkgconf-pkg-config file \
-            gtk4-devel libadwaita-devel \
+            vulkan-loader-devel libxkbcommon-devel \
+            wayland-devel libX11-devel libXext-devel \
+            fontconfig-devel freetype-devel \
             fuse3-devel libusbx-devel
 
       - name: Install Rust
@@ -212,10 +214,10 @@ jobs:
           Priority: optional
           Architecture: amd64
           Maintainer: adbshare contributors <noreply@example.com>
-          Depends: libgtk-4-1, libadwaita-1-0, libfuse3-3, libusb-1.0-0
+          Depends: libvulkan1, libxkbcommon0, libwayland-client0, libx11-6, libxext6, libfontconfig1, libfuse3-3, libusb-1.0-0
           Description: Fast, reliable Linux file manager for Android over ADB
            Uses ADB over USB (or wireless) and exposes the device as a real
-           filesystem via FUSE, with a GTK4 frontend on top.
+           filesystem via FUSE, with a GPU-rendered frontend on top.
           EOF
           find "$PKGDIR" -type d -exec chmod 755 {} +
           find "$PKGDIR" -type f -exec chmod 644 {} +

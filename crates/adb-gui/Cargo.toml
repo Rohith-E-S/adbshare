@@ -3,15 +3,14 @@ name = "adb-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "GTK4 + libadwaita frontend for adbshare"
+description = "GPUI frontend for adbshare"
 
 [[bin]]
 name = "adb-gui"
 path = "src/main.rs"
 
 [dependencies]
-adb-device = { path = "../adb-device" }
-transfer-engine = { path = "../transfer-engine" }
+gpui = "0.2.2"
 tokio.workspace = true
 zbus.workspace = true
 anyhow.workspace = true
@@ -23,10 +22,11 @@ serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
 futures.workspace = true
-gtk4.workspace = true
-libadwaita.workspace = true
-gdk4.workspace = true
-glib.workspace = true
-gio.workspace = true
 async-channel = "2.3"
 dirs.workspace = true
+chrono.workspace = true
+ashpd = { version = "0.13", features = ["file_chooser"] }
+unicode-segmentation = "1.12"
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }

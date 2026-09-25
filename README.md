@@ -1,6 +1,6 @@
 # adbshare
 
-Browse your Android phone and move files between it and your Linux computer over USB or Wi-Fi using ADB. adbshare has a GTK4 + libadwaita interface, a transfer queue, and optional FUSE mounts for opening phone files in other desktop applications.
+Browse your Android phone and move files between it and your Linux computer over USB or Wi-Fi using ADB. adbshare has a GPU-rendered interface built on GPUI (the framework behind Zed), a transfer queue, and optional FUSE mounts for opening phone files in other desktop applications.
 
 **Status: pre-alpha.** Keep backups of important files. Some operations are incomplete; read [Current limitations](#current-limitations) before moving or deleting data.
 
@@ -23,7 +23,7 @@ You need:
 
 - A Linux desktop with a graphical session and user/session D-Bus.
 - Rust and Cargo. The workspace declares Rust 1.85 or newer; current stable is recommended.
-- **GTK 4.18+**, **libadwaita 1.5+**, FUSE 3, a C build toolchain, and `pkg-config`.
+- A **Vulkan** capable GPU and driver, **xkbcommon**, the **Wayland** (or X11) client libraries, FUSE 3, a C build toolchain, and `pkg-config`.
 - Android platform tools: the `adb` command must be on your `PATH`.
 - An Android phone with USB debugging or Wireless debugging enabled. A USB cable is optional for Wi-Fi setup.
 - A helper binary built for your **phone's architecture**, as explained below.
@@ -33,23 +33,23 @@ You need:
 On Arch Linux:
 
 ```sh
-sudo pacman -S --needed base-devel pkgconf gtk4 libadwaita fuse3 libusb android-tools
+sudo pacman -S --needed base-devel pkgconf vulkan-icd-loader libxkbcommon wayland libx11 libxext fontconfig fuse3 libusb android-tools
 ```
 
 On Fedora (CI currently builds on Fedora 44):
 
 ```sh
-sudo dnf install gcc pkgconf-pkg-config gtk4-devel libadwaita-devel fuse3-devel libusbx-devel android-tools
+sudo dnf install gcc pkgconf-pkg-config vulkan-loader-devel libxkbcommon-devel wayland-devel libX11-devel libXext-devel fontconfig-devel freetype-devel fuse3-devel libusbx-devel android-tools
 ```
 
-On Debian/Ubuntu, development packages are named `build-essential`, `pkg-config`, `libgtk-4-dev`, `libadwaita-1-dev`, `libfuse3-dev`, and `libusb-1.0-0-dev`; also install `adb` and `fuse3`. **Check native library versions first:** older distribution releases do not provide GTK 4.18.
+On Debian/Ubuntu, development packages are named `build-essential`, `pkg-config`, `libvulkan-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libxext-dev`, `libfontconfig1-dev`, `libfuse3-dev`, and `libusb-1.0-0-dev`; also install `adb` and `fuse3`.
 
 These packages do not install the Rust toolchain. Check your environment before building:
 
 ```sh
 cargo --version
 adb version
-pkg-config --modversion gtk4 libadwaita-1 fuse3
+pkg-config --modversion vulkan xkbcommon wayland-client fontconfig freetype2 fuse3
 ```
 
 External file opening uses `xdg-open`; local Trash operations use `gio`. Terminal opening requires `gnome-terminal` or `x-terminal-emulator`.
@@ -209,7 +209,7 @@ Use **Install APK…** in the more-options menu, or the APK context action. Drop
 | --- | --- |
 | Phone does not appear | Run `adb devices -l`, unlock/authorize the phone, and check USB permissions. Then inspect the daemon log: a device appears only after helper setup succeeds. |
 | Helper missing or fails to start | Check the phone ABI and `ADBSHARE_PROXY_BIN`. An x86-64 host executable will not run on an ARM64 phone. |
-| GTK build fails | Check `pkg-config --modversion gtk4 libadwaita-1 fuse3`; installing headers alone does not ensure a new enough GTK version. |
+| Build fails on a native library | Check `pkg-config --modversion vulkan xkbcommon wayland-client fontconfig freetype2 fuse3`; installing headers alone does not ensure the versions GPUI needs. |
 | Transfer says skipped | The destination already exists. Save under another name or handle the existing file yourself. |
 | File not visible after upload | Wait for completion and press `F5`. |
 | External opening or drag-out fails | Check FUSE, `fusermount3`, `/dev/fuse`, and `xdg-open`. In-app browsing may work even when mounting fails. |
@@ -241,11 +241,11 @@ journalctl --user -u adbshare-daemon.service -b
 
 Choose **Connection diagnostics…** in the overflow menu for a checklist (ADB presence, helper setup, mounts, device readiness) with a Copy report button.
 
-For a bug report, include your Linux distribution, GTK version, phone model/Android version, reproduction steps, and relevant errors. Review logs for private filenames, device identifiers, and other sensitive information before sharing.
+For a bug report, include your Linux distribution, GPU and driver version, phone model/Android version, reproduction steps, and relevant errors. Review logs for private filenames, device identifiers, and other sensitive information before sharing.
 
 ## For contributors
 
-The Rust workspace separates the GTK GUI (`adb-gui`), session D-Bus daemon (`adb-daemon`), ADB discovery/transport (`adb-device`), proxy client (`adb-proxy`), phone helper (`adbshare-proxy-device`), FUSE filesystem (`adbfs`), and transfer queue (`transfer-engine`).
+The Rust workspace separates the GPUI GUI (`adb-gui`), session D-Bus daemon (`adb-daemon`), ADB discovery/transport (`adb-device`), proxy client (`adb-proxy`), phone helper (`adbshare-proxy-device`), FUSE filesystem (`adbfs`), and transfer queue (`transfer-engine`).
 
 See [development notes](docs/DEVELOPMENT.md) and [architecture notes](docs/ARCHITECTURE.md) for background. Some details there are historical; current source and CI configuration are authoritative.
 

@@ -27,14 +27,13 @@ env:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    # The workspace pins gdk4 0.9.x / libadwaita 0.7.x, which require
-    # GTK >= 4.17 / libadwaita >= 1.7. ubuntu-latest's apt ships only
-    # GTK 4.14, so build in a Fedora container instead. Pinned to the
-    # major version (44, ships gtk4 4.22 / libadwaita 1.9) rather than
-    # :latest so a Fedora release bump can never silently change what
-    # CI validates — bump the tag deliberately when gdk4 demands it.
+    # The GUI is GPUI, which needs a Vulkan loader and the xkbcommon and
+    # Wayland/X11 client libraries at build time. Everything here is a plain
+    # C library with stable packages, so a stock Fedora image works; it is
+    # pinned to the major version so a release bump cannot silently change
+    # what CI validates.
     container: fedora:44
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +41,9 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc pkgconf-pkg-config \
-            gtk4-devel libadwaita-devel \
+            vulkan-loader-devel libxkbcommon-devel \
+            wayland-devel libX11-devel libXext-devel \
+            fontconfig-devel freetype-devel \
             fuse3-devel libusbx-devel
 
       - name: Install Rust
@@ -58,14 +59,25 @@ jobs:
         run: cargo build --release --workspace --locked
 
       - name: Test
-        # Full scope (no --lib): bin-target unit tests (adb-daemon,
-        # adb-gui, test-adbfs) and doc tests were silently skipped by
-        # the old `--lib` invocation.
-        # Xvfb gives the GUI regression test (hidden-files toggle) a
-        # virtual display; GTK needs one to init.
+        # Full scope (no --lib): bin-target unit tests (adb-daemon, adb-gui,
+        # test-adbfs) and doc tests were silently skipped by the old `--lib`
+        # invocation.
+        #
+        # The GUI's headless tests use gpui's TestAppContext, which supplies a
+        # fake platform window and drives layout in software, so no display
+        # server and no GPU are needed — the Xvfb + GTK_CAIRO dance the GTK
+        # build required is gone. A session bus is still needed for the
+        # adb-daemon tests that serve a mock interface.
         run: |
-          dnf install -y --setopt=install_weak_deps=False xorg-x11-server-Xvfb dbus-daemon
-          dbus-run-session -- xvfb-run -a env GSK_RENDERER=cairo cargo test --workspace --locked
+          dnf install -y --setopt=install_weak_deps=False dbus-daemon
+          dbus-run-session -- cargo test --workspace --locked
+
+      - name: Smoke test the GUI binary
+        # Launch the real app briefly and let it tear itself down, so a panic
+        # during startup (a Vulkan or asset problem, say) fails the build
+        # rather than shipping. No display is needed for the binary to be
+        # linked, but it does need a Vulkan loader present to get that far.
+        run: ADB_GUI_AUTOCLOSE_MS=1500 ./target/release/adb-gui --version
 
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
@@ -81,7 +93,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     container: fedora:44
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -89,7 +101,9 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc pkgconf-pkg-config \
-            gtk4-devel libadwaita-devel \
+            vulkan-loader-devel libxkbcommon-devel \
+            wayland-devel libX11-devel libXext-devel \
+            fontconfig-devel freetype-devel \
             fuse3-devel libusbx-devel
 
       - name: Install Rust
@@ -103,11 +117,10 @@ jobs:
           shared-key: clippy
           cache-on-failure: true
 
-      # Advisory for now: the codebase predates lint enforcement (~85
-      # clippy warnings on main at the time of writing). Making this
-      # blocking is a follow-up after the in-flight fix PRs merge and a
-      # one-shot warning cleanup lands; until then it reports but does
-      # not gate merges.
+      # Advisory: the pre-GPUI crates (transfer-engine,
+      # adbshare-proxy-device, test-adbfs) predate lint enforcement and still
+      # carry warnings. `adb-gui` itself is clean under `-D warnings`; a
+      # workspace-wide cleanup is a separate change.
       - name: Lint (advisory)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
         continue-on-error: true
@@ -124,9 +137,8 @@ jobs:
         with:
           components: rustfmt
 
-      # Advisory for the same reason as clippy (~350 rustfmt hunks on
-      # main); a one-shot `cargo fmt --all` lands with the follow-up
-      # cleanup PR, then this flips to blocking.
+      # Advisory for the same reason as clippy: the other crates have never
+      # been run through rustfmt.
       - name: Format check (advisory)
         run: cargo fmt --all -- --check
         continue-on-error: true

@@ -53,9 +53,23 @@ sets up `adb forward`, mounts the FUSE FS, and exposes a D-Bus interface
 (`org.adbshare.Manager`) for the GUI.
 
 ### `adb-gui`
-GTK4 + libadwaita. NavigationSplitView with devices on the left and
-transfers on the right. Pairing wizard for first-run. Talks to the
-daemon over D-Bus.
+GPUI (the framework behind Zed), rendering with Vulkan. A top bar over a
+resizable sidebar/content split: devices and place shortcuts on the left,
+a file browser on the right, transfers in a popover. A two-step dialog
+handles wireless pairing. Talks to the daemon over D-Bus.
+
+The GUI owns no ADB logic. The file browser is a separate entity that
+emits events; the app root turns those into D-Bus calls or local
+filesystem work, and polls the daemon for the device list and the
+transfer queue. Because zbus needs a tokio reactor and GPUI runs on its
+own executor, a single-threaded tokio runtime is pinned to a dedicated
+thread and every daemon call is dispatched onto it.
+
+The old GTK build needed a 975-line stylesheet. GPUI has no CSS cascade
+and no theme type of its own, so that stylesheet's palette and geometry
+now live in `theme.rs` as tokens, its repeated components as small
+builders in `ui.rs`, and its 48 Adwaita symbolic icons as an embedded
+SVG set in `icons.rs`.
 
 ## Wire protocol summary
 

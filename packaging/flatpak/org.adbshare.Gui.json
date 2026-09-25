@@ -12,7 +12,8 @@
     "--filesystem=xdg-run/adbshare:create",
     "--filesystem=home",
     "--filesystem=xdg-cache:create",
-    "--device=all"
+    "--device=all",
+    "--talk-name=org.freedesktop.portal.FileChooser"
   ],
   "modules": [
     {

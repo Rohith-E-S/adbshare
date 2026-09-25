@@ -45,14 +45,6 @@ zbus_macros = "4.4"
 # FUSE
 fuser = "0.15"
 
-# GTK (only used by adb-gui)
-gtk4 = { version = "0.9", features = ["v4_18"] }
-libadwaita = { version = "0.7", features = ["v1_5"] }
-gdk4 = "0.9"
-glib = "0.20"
-gio = "0.20"
-relm4 = { version = "0.9", features = ["libadwaita", "tokio"] }
-
 [profile.release]
 opt-level = 3
 lto = "thin"
