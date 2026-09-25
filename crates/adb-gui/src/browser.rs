@@ -885,6 +885,27 @@ impl Browser {
         cx.notify();
     }
 
+    /// How far the item area starts below the top of the browser's own box.
+    ///
+    /// The context strip and, while it is showing, the search row are the
+    /// browser's first children; the grid then adds its own padding. Anything
+    /// that positions or hit-tests items has to start here, or drag-selection
+    /// lands on the wrong row.
+    pub fn item_area_top(&self) -> f32 {
+        CONTEXT_BAR_H
+            + if self.search_active {
+                SEARCH_ROW_H
+            } else {
+                0.0
+            }
+            + GRID_TILE_PAD
+    }
+
+    /// How tall the item area is inside the browser's own box.
+    pub fn item_area_height(&self) -> f32 {
+        (self.viewport_height - self.item_area_top()).max(0.0)
+    }
+
     /// Which grid rows to build this frame, and how many.
     ///
     /// Reads the scroll offset recorded by the last frame's layout, so the
@@ -892,7 +913,7 @@ impl Browser {
     /// fast scrolling from showing gaps.
     fn visible_row_range(&self, tile_h: f32) -> (usize, usize) {
         const OVERSCAN: usize = 1;
-        let viewport_h: f32 = self.viewport_height;
+        let viewport_h: f32 = self.item_area_height();
         if viewport_h <= 0.0 || tile_h <= 0.0 {
             // Before the first layout there is no viewport to measure, so fall
             // back to a modest window rather than building the whole folder.
@@ -1574,11 +1595,14 @@ impl Render for Browser {
                 .into_any_element();
         }
 
-        // Work out the item geometry now, from the metrics the app root reports,
-        // so a drag can hit-test without asking the compositor for bounds.
+        // Work out the item geometry now, so a drag can hit-test without asking
+        // the compositor for bounds. The app root reports where the browser's own
+        // box sits; the browser owns the chrome it stacks above the items, so
+        // that offset is added here rather than guessed at across the two.
         let tile_w = self.zoom + GRID_TILE_PAD * 2.0;
+        let item_top = self.viewport_y + self.item_area_top();
         self.grid_geometry = GridGeometry {
-            origin: gpui::point(px(self.viewport_x), px(self.viewport_y)),
+            origin: gpui::point(px(self.viewport_x + GRID_GAP), px(item_top)),
             tile: Size {
                 width: px(tile_w),
                 height: px(tile_w + 34.0),
@@ -1586,7 +1610,7 @@ impl Render for Browser {
             columns: grid_columns(self.viewport_width, tile_w, GRID_GAP),
         };
         self.list_geometry = ListGeometry {
-            origin_y: px(self.viewport_y),
+            origin_y: px(item_top),
             row_h: LIST_ROW_H,
         };
 
@@ -1762,6 +1786,37 @@ mod tests {
             "12345678",
             "a serial that is already eight characters passes through"
         );
+    }
+
+    #[gpui::test]
+    async fn the_item_area_starts_below_the_browsers_own_chrome(cx: &mut TestAppContext) {
+        // Regression: the rubber-band hit-test origin used to be the browser's
+        // own top edge, which sits above the context strip, so a drag selected
+        // rows ~50px higher than the pointer was over. The offset belongs to the
+        // browser because the context strip and search row are its children.
+        let handle = open(cx);
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| {
+                b.device = Some("s".into());
+                b.set_viewport(232.0, 45.0, 768.0, 600.0, cx);
+
+                // Context strip plus the grid's own padding, and no search row.
+                assert_eq!(b.item_area_top(), CONTEXT_BAR_H + GRID_TILE_PAD);
+
+                // Turning search on pushes the items down by the strip's height.
+                b.search_active = true;
+                assert_eq!(
+                    b.item_area_top(),
+                    CONTEXT_BAR_H + SEARCH_ROW_H + GRID_TILE_PAD,
+                    "the search row has to be accounted for too"
+                );
+
+                // The item area is what is left of the box.
+                let top = b.item_area_top();
+                assert_eq!(b.item_area_height(), 600.0 - top);
+            });
+        });
     }
 
     #[gpui::test]

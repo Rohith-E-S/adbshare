@@ -18,7 +18,7 @@ use gpui::{
     div, px, rgba,
 };
 
-use crate::browser::{Browser, BrowserEvent, CONTEXT_BAR_H, SEARCH_ROW_H, ViewMode};
+use crate::browser::{Browser, BrowserEvent, CONTEXT_BAR_H, ViewMode};
 use crate::clipboard;
 use crate::daemon;
 use crate::dialogs::{
@@ -3073,18 +3073,11 @@ impl Render for AdbShareApp {
         let content_y = theme::TOPBAR_H;
         let viewport = window.viewport_size();
         let content_w: f32 = f32::from(viewport.width) - sidebar_width;
-        // Less the top bar, the context bar, and the status bar, plus the search
-        // strip when it is showing. The grid uses this to build only the rows
-        // that can be on screen.
-        let chrome = theme::TOPBAR_H
-            + theme::STATUSBAR_H
-            + CONTEXT_BAR_H
-            + if self.browser.read(cx).search_active() {
-                SEARCH_ROW_H
-            } else {
-                0.0
-            };
-        let content_h = f32::from(viewport.height) - chrome;
+        // The browser gets the box it was given, not the item area inside it:
+        // the context strip, search row and grid padding are the browser's own
+        // children, and only it knows how tall they are.
+        let content_h =
+            f32::from(viewport.height) - theme::TOPBAR_H - theme::STATUSBAR_H - CONTEXT_BAR_H;
         self.browser.update(cx, |b, cx| {
             b.set_viewport(content_x, content_y, content_w, content_h, cx)
         });
