@@ -229,6 +229,7 @@ impl AdbshareApp {
             omnibar.set_valign(gtk4::Align::Center);
             omnibar.set_hexpand(true);
             omnibar.set_size_request(584, 34);
+            let topbar_narrow = std::rc::Rc::new(std::cell::Cell::new(false));
 
             let path_icon = gtk4::Image::from_icon_name("folder-symbolic");
             path_icon.add_css_class("omnibar-leading-icon");
@@ -451,6 +452,7 @@ impl AdbshareApp {
             let view_mode_separator = sep_v.clone();
             let mode_omnibar = omnibar.clone();
             let mode_view_capsule = view_capsule.clone();
+            let mode_topbar_narrow = topbar_narrow.clone();
             view_mode_search.set_visible(false);
             view_mode_separator.set_visible(false);
             browser.main_stack.connect_notify_local(
@@ -461,7 +463,16 @@ impl AdbshareApp {
                     empty_mode_search.set_visible(empty);
                     view_mode_search.set_visible(!empty);
                     view_mode_separator.set_visible(!empty);
-                    mode_omnibar.set_size_request(if empty { 584 } else { 550 }, 34);
+                    mode_omnibar.set_size_request(
+                        if mode_topbar_narrow.get() {
+                            220
+                        } else if empty {
+                            584
+                        } else {
+                            550
+                        },
+                        34,
+                    );
                     mode_view_capsule.set_size_request(if empty { 35 } else { 65 }, 34);
                 },
             );
@@ -824,6 +835,65 @@ impl AdbshareApp {
                 }
             });
             window.add_breakpoint(breakpoint);
+
+            let topbar_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+                adw::BreakpointConditionLengthType::MaxWidth,
+                1000.0,
+                adw::LengthUnit::Sp,
+            ));
+            let topbar_narrow_apply = topbar_narrow.clone();
+            let topbar_omnibar_apply = omnibar.clone();
+            let topbar_ops_apply = ops_capsule.clone();
+            let topbar_view_apply = view_capsule.clone();
+            let topbar_transfers_apply = transfers_btn.clone();
+            topbar_breakpoint.connect_apply(move |_| {
+                topbar_narrow_apply.set(true);
+                topbar_omnibar_apply.set_size_request(220, 34);
+                topbar_ops_apply.set_visible(false);
+                topbar_view_apply.set_visible(false);
+                topbar_transfers_apply.set_visible(false);
+            });
+            let topbar_narrow_unapply = topbar_narrow.clone();
+            let topbar_omnibar_unapply = omnibar.clone();
+            let topbar_ops_unapply = ops_capsule.clone();
+            let topbar_view_unapply = view_capsule.clone();
+            let topbar_transfers_unapply = transfers_btn.clone();
+            let browser_topbar_state = browser.main_stack.clone();
+            topbar_breakpoint.connect_unapply(move |_| {
+                topbar_narrow_unapply.set(false);
+                topbar_ops_unapply.set_visible(true);
+                topbar_view_unapply.set_visible(true);
+                topbar_transfers_unapply.set_visible(true);
+                let empty = browser_topbar_state.visible_child_name().as_deref() == Some("empty");
+                topbar_omnibar_unapply.set_size_request(if empty { 584 } else { 550 }, 34);
+            });
+            window.add_breakpoint(topbar_breakpoint);
+
+            let compact_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+                adw::BreakpointConditionLengthType::MaxWidth,
+                520.0,
+                adw::LengthUnit::Sp,
+            ));
+            let compact_nav_apply = nav_capsule.clone();
+            let compact_omnibar_apply = omnibar.clone();
+            compact_breakpoint.connect_apply(move |_| {
+                compact_nav_apply.set_visible(false);
+                compact_omnibar_apply.set_size_request(80, 34);
+            });
+            let compact_nav_unapply = nav_capsule.clone();
+            let compact_omnibar_unapply = omnibar.clone();
+            let compact_topbar_narrow = topbar_narrow.clone();
+            let compact_browser_state = browser.main_stack.clone();
+            compact_breakpoint.connect_unapply(move |_| {
+                compact_nav_unapply.set_visible(true);
+                if compact_topbar_narrow.get() {
+                    compact_omnibar_unapply.set_size_request(220, 34);
+                } else {
+                    let empty = compact_browser_state.visible_child_name().as_deref() == Some("empty");
+                    compact_omnibar_unapply.set_size_request(if empty { 584 } else { 550 }, 34);
+                }
+            });
+            window.add_breakpoint(compact_breakpoint);
 
             // F9 shortcut toggles the sidebar
             let key_ctrl = gtk4::EventControllerKey::new();
