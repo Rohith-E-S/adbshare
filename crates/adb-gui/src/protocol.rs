@@ -698,3 +698,184 @@ mod tests {
         );
     }
 }
+
+/// Case-insensitive substring test that does not allocate for ASCII input.
+///
+/// The search box runs this over every entry on every keystroke, so
+/// `name.to_lowercase().contains(..)` cost one String allocation per entry per
+/// keystroke — 5,000 allocations in a large folder.
+///
+/// ASCII, which is the overwhelming majority of Android filenames, is compared
+/// byte-wise with no allocation. Anything else falls back to allocating, because
+/// doing Unicode case folding without a table is not worth the complexity for the
+/// minority of names that need it.
+///
+/// `needle` must already be lowercase; the search field lowercases it once.
+pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle.is_ascii() {
+        let hay = haystack.as_bytes();
+        let ned = needle.as_bytes();
+        if ned.len() > hay.len() {
+            return false;
+        }
+        return hay
+            .windows(ned.len())
+            .any(|window| window.eq_ignore_ascii_case(ned));
+    }
+    haystack.to_lowercase().contains(needle)
+}
+
+/// Sort directory entries: folders first, then by a case-folded name.
+///
+/// Built as decorate-sort-undecorate rather than a custom comparator, because a
+/// comparator that lowercases both names allocates twice per comparison: for
+/// 5,000 entries that is well over a hundred thousand allocations for one sort.
+/// Folding each name once turns that into 5,000.
+pub fn sort_by_folder_then_name(entries: &mut Vec<DirEntry>) {
+    // Folders first, then the folded name. `is_dir` descending puts folders
+    // ahead of files, which is what both the daemon and the local listing have
+    // always shown.
+    let mut keyed: Vec<(bool, String, usize)> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.is_dir, entry.name.to_lowercase(), index))
+        .collect();
+    // Stable, so entries whose names fold to the same string keep their
+    // original relative order.
+    keyed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    apply_permutation(entries, keyed.into_iter().map(|(_, _, index)| index));
+}
+
+/// Reorder `entries` into the given sequence of original indices.
+///
+/// Implemented by draining into slots and refilling, which is correct for any
+/// permutation and does not need a placeholder value.
+fn apply_permutation(entries: &mut Vec<DirEntry>, order: impl Iterator<Item = usize>) {
+    let mut slots: Vec<Option<DirEntry>> = entries.drain(..).map(Some).collect();
+    entries.extend(order.map(|index| {
+        slots[index]
+            .take()
+            .expect("a permutation visits every index once")
+    }));
+}
+
+#[cfg(test)]
+mod case_tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> DirEntry {
+        DirEntry {
+            name: name.into(),
+            is_dir,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            mtime: 0,
+        }
+    }
+
+    #[test]
+    fn case_insensitive_search_matches_ascii() {
+        for (haystack, needle) in [
+            ("Holiday.png", "holi"),
+            ("Holiday.png", "HOLI"),
+            ("IMG_2024", "img_2024"),
+            ("a.txt", "a"),
+            ("a.txt", ""),
+        ] {
+            assert!(
+                contains_ignore_case(haystack, needle),
+                "{haystack:?} ~ {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_insensitive_search_rejects_non_matches() {
+        for (haystack, needle) in [("Holiday.png", "zzz"), ("a", "abc"), ("ab", "ba")] {
+            assert!(
+                !contains_ignore_case(haystack, needle),
+                "{haystack:?} should not contain {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_insensitive_search_handles_non_ascii() {
+        // The allocating fallback still has to be right, even though it costs.
+        assert!(contains_ignore_case("Café.txt", "café"));
+        assert!(contains_ignore_case("Café.txt", "caf"));
+        assert!(!contains_ignore_case("Cafe.txt", "café"));
+        assert!(contains_ignore_case("日本語.txt", "日本"));
+        assert!(contains_ignore_case("Ünicode", "üni"));
+    }
+
+    #[test]
+    fn sorting_folds_case_and_keeps_folders_first() {
+        let mut entries = vec![
+            entry("banana", false),
+            entry("Zebra", false),
+            entry("apple", false),
+            entry("Zoo", true),
+            entry("avocado", true),
+        ];
+        sort_by_folder_then_name(&mut entries);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["avocado", "Zoo", "apple", "banana", "Zebra"]);
+    }
+
+    #[test]
+    fn sorting_is_stable_for_names_that_fold_together() {
+        let mut entries = vec![
+            entry("README", false),
+            entry("readme", false),
+            entry("ReadMe", false),
+        ];
+        sort_by_folder_then_name(&mut entries);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["README", "readme", "ReadMe"],
+            "equal keys keep their original order"
+        );
+    }
+
+    #[test]
+    fn sorting_preserves_every_entry() {
+        let mut entries: Vec<DirEntry> = (0..500)
+            .map(|i| entry(&format!("file-{i:04}"), i % 7 == 0))
+            .collect();
+        let before: std::collections::HashSet<String> =
+            entries.iter().map(|e| e.name.clone()).collect();
+        sort_by_folder_then_name(&mut entries);
+        assert_eq!(entries.len(), 500);
+        let after: std::collections::HashSet<String> =
+            entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(before, after, "sorting must not lose or duplicate entries");
+        // And the order is actually right: once a file appears, no folder may
+        // follow it.
+        let dirs: Vec<bool> = entries.iter().map(|e| e.is_dir).collect();
+        assert!(
+            dirs.windows(2).all(|w| w[0] || !w[1]),
+            "folders come first, but the run of files is broken: {dirs:?}"
+        );
+        assert_eq!(
+            dirs.iter().filter(|d| **d).count(),
+            (0..500).filter(|i| i % 7 == 0).count()
+        );
+    }
+
+    #[test]
+    fn sorting_an_empty_or_single_list_is_a_no_op() {
+        let mut none: Vec<DirEntry> = Vec::new();
+        sort_by_folder_then_name(&mut none);
+        assert!(none.is_empty());
+
+        let mut one = vec![entry("only", true)];
+        sort_by_folder_then_name(&mut one);
+        assert_eq!(one[0].name, "only");
+    }
+}

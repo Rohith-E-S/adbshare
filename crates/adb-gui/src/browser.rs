@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::icons::{self, names};
 use crate::prefs;
-use crate::protocol::{DirEntry, human_size};
+use crate::protocol::{DirEntry, contains_ignore_case, human_size};
 use crate::theme::{self, Themed};
 use crate::ui;
 
@@ -667,13 +667,18 @@ impl Browser {
             .iter()
             .enumerate()
             .filter(|(_, entry)| self.show_hidden || !entry.name.starts_with('.'))
-            .filter(|(_, entry)| needle.is_empty() || entry.name.to_lowercase().contains(&needle))
+            .filter(|(_, entry)| contains_ignore_case(&entry.name, &needle))
             .map(|(ix, _)| ix)
             .collect();
+
         // Drop selections the filter just hid, so Copy and Delete cannot act on
-        // something the user can no longer see.
-        self.selection.retain(|ix| self.visible.contains(ix));
-        if self.focused.is_some_and(|ix| !self.visible.contains(&ix)) {
+        // something the user can no longer see. Membership goes through a set
+        // rather than `visible.contains`: `visible` is sorted, but a linear
+        // scan per selected row made this quadratic, which showed up as a
+        // multi-second freeze on select-all followed by a search.
+        let visible: std::collections::HashSet<usize> = self.visible.iter().copied().collect();
+        self.selection.retain(|ix| visible.contains(ix));
+        if self.focused.is_some_and(|ix| !visible.contains(&ix)) {
             self.focused = None;
         }
     }
@@ -1789,6 +1794,38 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn filtering_drops_a_large_selection_without_going_quadratic(cx: &mut TestAppContext) {
+        // Regression: pruning the selection scanned `visible` linearly for every
+        // selected row, so select-all followed by a keystroke was O(n^2). At
+        // 5,000 entries that is 25 million comparisons, which is a multi-second
+        // freeze on a slow machine.
+        let handle = open(cx);
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| {
+                b.device = Some("bench".into());
+                b.install_entries(synthetic_listing(5_000));
+                b.select_all_entries();
+                let _ = cx;
+                assert_eq!(b.selected().len(), 5_000, "precondition: all selected");
+
+                let start = std::time::Instant::now();
+                b.set_search_query_raw("zzz-no-such-file".into());
+                let elapsed = start.elapsed();
+
+                assert!(
+                    b.selected().is_empty(),
+                    "everything is filtered out, so nothing may stay selected"
+                );
+                assert!(
+                    elapsed.as_millis() < 200,
+                    "pruning took {elapsed:?}, which suggests the quadratic path is back"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
     async fn the_item_area_starts_below_the_browsers_own_chrome(cx: &mut TestAppContext) {
         // Regression: the rubber-band hit-test origin used to be the browser's
         // own top edge, which sits above the context strip, so a drag selected
@@ -2727,6 +2764,87 @@ mod tests {
         best
     }
 
+    /// The search filter and the local sort, both of which used to allocate per
+    /// comparison and are on the path of every keystroke and every navigation.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_filter_and_sort_cost() {
+        for count in [1_000usize, 5_000] {
+            let entries = synthetic_listing(count);
+
+            let mut best = f64::MAX;
+            for _ in 0..8 {
+                let start = std::time::Instant::now();
+                for needle in ["i", "im", "img", "img_", "IMG_2"] {
+                    let lower = needle.to_lowercase();
+                    let hits = entries
+                        .iter()
+                        .filter(|e| contains_ignore_case(&e.name, &lower))
+                        .count();
+                    std::hint::black_box(hits);
+                }
+                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!("bench filter n={count:<6} 5 queries {best:8.3} ms");
+
+            let mut best = f64::MAX;
+            for _ in 0..8 {
+                let mut copy = entries.clone();
+                let start = std::time::Instant::now();
+                crate::protocol::sort_by_folder_then_name(&mut copy);
+                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(&copy);
+            }
+            println!("bench sort   n={count:<6} {best:8.3} ms");
+        }
+    }
+
+    /// How much of the grid's cost is per-tile rather than fixed overhead.
+    ///
+    /// The window means the visible tile count is driven by the tile size, so
+    /// sweeping the zoom sweeps the number of tiles actually built.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_grid_cost_by_visible_tile_count() {
+        for zoom in [24.0_f32, 48.0, 96.0, 128.0] {
+            let mut cx = TestAppContext::single();
+            cx.update(crate::theme::install);
+            let handle = open(&mut cx);
+            let vctx = cx.add_empty_window();
+            let browser = vctx.update(|_w, cx| handle.root(cx).expect("root view"));
+            vctx.update(|_w, cx| {
+                browser.update(cx, |b, cx| {
+                    b.device = Some("bench".into());
+                    b.install_entries(synthetic_listing(5_000));
+                    b.zoom = zoom;
+                    b.set_viewport(232.0, 45.0, 768.0, 560.0, cx);
+                    cx.notify();
+                });
+            });
+
+            let tile_w = zoom + GRID_TILE_PAD * 2.0;
+            let columns = grid_columns(768.0, tile_w, GRID_GAP);
+            let tile_h = tile_w + 34.0 + GRID_GAP;
+            let rows = (560.0 / tile_h).ceil() as usize + 3;
+            let tiles = (rows * columns).min(5_000);
+
+            let mut best = f64::MAX;
+            for _ in 0..12 {
+                let start = std::time::Instant::now();
+                let _ = vctx.draw(
+                    gpui::point(px(0.), px(0.)),
+                    gpui::size(px(1000.), px(680.)),
+                    |_w, _cx| browser.clone(),
+                );
+                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!(
+                "bench grid zoom={zoom:<6} ~{tiles:>3} tiles  {best:8.3} ms  ({:.3} ms/tile)",
+                best / tiles as f64
+            );
+        }
+    }
+
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
     fn bench_layout_cost_by_listing_size() {
@@ -2735,42 +2853,6 @@ mod tests {
                 let ms = bench_layout(mode, count);
                 println!("bench {label:<5} n={count:<6} {ms:8.3} ms");
             }
-        }
-    }
-    #[test]
-    #[ignore = "benchmark"]
-    fn bench_filter_cost() {
-        for count in [1_000usize, 5_000] {
-            let entries = synthetic_listing(count);
-            let mut best = f64::MAX;
-            for _ in 0..8 {
-                let start = std::time::Instant::now();
-                for needle in ["i", "im", "img", "img_", "IMG_2"] {
-                    let lower = needle.to_lowercase();
-                    let hits = entries
-                        .iter()
-                        .filter(|e| e.name.to_lowercase().contains(&lower))
-                        .count();
-                    std::hint::black_box(hits);
-                }
-                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
-            }
-            println!("bench filter n={count:<6} 5 queries {best:8.3} ms");
-        }
-    }
-
-    #[test]
-    #[ignore = "benchmark"]
-    fn bench_sort_cost() {
-        for count in [1_000usize, 5_000] {
-            let mut best = f64::MAX;
-            for _ in 0..8 {
-                let mut entries = synthetic_listing(count);
-                let start = std::time::Instant::now();
-                crate::localfs::sort_entries(&mut entries);
-                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
-            }
-            println!("bench sort   n={count:<6} {best:8.3} ms");
         }
     }
 }

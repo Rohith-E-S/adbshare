@@ -57,14 +57,12 @@ pub fn list_dir(path: &Path) -> Result<Vec<DirEntry>, String> {
     Ok(out)
 }
 
-/// Folders first, then case-insensitive by name. Shared by local and device
-/// listings so both views order identically.
-pub fn sort_entries(entries: &mut [DirEntry]) {
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+/// Folders first, then case-insensitive by name.
+///
+/// The daemon already returns its listings in that order; local ones are sorted
+/// here so both views order identically.
+pub fn sort_entries(entries: &mut Vec<DirEntry>) {
+    crate::protocol::sort_by_folder_then_name(entries);
 }
 
 /// Create one directory, including parents.
