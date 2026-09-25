@@ -17,6 +17,7 @@ mod filechooser;
 mod icons;
 mod localfs;
 mod menu;
+mod prefs;
 mod protocol;
 mod textinput;
 mod theme;

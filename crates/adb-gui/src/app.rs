@@ -28,6 +28,7 @@ use crate::filechooser::{self, Pick};
 use crate::icons::{self, names};
 use crate::localfs;
 use crate::menu::{self, MenuItem};
+use crate::prefs::{Preferences, SIDEBAR_RANGE};
 use crate::protocol::{
     ClipboardFiles, DeviceEntry, DirEntry, JobInfo, LOCAL_DEVICE, format_capacity,
     tree_result_message,
@@ -42,10 +43,8 @@ const DEVICE_POLL: Duration = Duration::from_secs(3);
 /// How often the transfer queue is refreshed. Much faster than the device poll
 /// because progress has to look live.
 const JOB_POLL: Duration = Duration::from_millis(600);
-/// Sidebar width bounds, matching the GTK build's draggable pane.
-const SIDEBAR_MIN: f32 = 200.0;
-const SIDEBAR_MAX: f32 = 300.0;
-const SIDEBAR_DEFAULT: f32 = 232.0;
+const SIDEBAR_MIN: f32 = SIDEBAR_RANGE.0;
+const SIDEBAR_MAX: f32 = SIDEBAR_RANGE.1;
 /// Window widths at which the chrome sheds parts, matching the old breakpoints.
 const COMPACT_BELOW: f32 = 1000.0;
 const NARROW_BELOW: f32 = 760.0;
@@ -157,20 +156,24 @@ pub struct AdbShareApp {
 
     toasts: ToastStack,
     focus: FocusHandle,
+    /// The last preferences written out, so a save only happens on a real
+    /// change.
+    saved: Preferences,
     subscriptions: Vec<Subscription>,
 }
 
 impl AdbShareApp {
     /// Build the root view. Passed straight to `Application::open_window`.
     pub fn build(_window: &mut Window, cx: &mut App) -> Entity<Self> {
+        let saved = Preferences::load();
         let view = cx.new(|cx| Self {
             browser: cx.new(Browser::new),
             selection: None,
             devices: Vec::new(),
             jobs: Vec::new(),
             layout: Layout::Full,
-            sidebar_visible: true,
-            sidebar_width: SIDEBAR_DEFAULT,
+            sidebar_visible: saved.sidebar_visible,
+            sidebar_width: saved.sidebar_width,
             resizing_sidebar: false,
             transfers_open: false,
             overflow_open: false,
@@ -184,10 +187,45 @@ impl AdbShareApp {
             clipboard: None,
             toasts: ToastStack::default(),
             focus: cx.focus_handle(),
+            saved: saved.clone(),
             subscriptions: Vec::new(),
+        });
+        // The browser's own view preferences live with the rest of them.
+        view.update(cx, |this, cx| {
+            let browser = this.browser.clone();
+            browser.update(cx, |b, cx| {
+                b.apply_preferences(saved.zoom, saved.view_mode(), saved.show_hidden, cx);
+            });
         });
         Self::wire_up(&view, cx);
         view
+    }
+
+    /// The preferences that describe the current view.
+    fn current_preferences(&self, cx: &gpui::App) -> Preferences {
+        let browser = self.browser.read(cx);
+        Preferences {
+            sidebar_width: self.sidebar_width,
+            sidebar_visible: self.sidebar_visible,
+            zoom: browser.zoom(),
+            list_view: browser.view_mode() == ViewMode::List,
+            show_hidden: browser.show_hidden(),
+        }
+    }
+
+    /// Write the preferences out if they changed since the last write.
+    ///
+    /// This rides the existing poll tick rather than a shutdown hook, which
+    /// does not fire when the app quits, and it covers every path that can
+    /// change a preference — menu item, keybinding or drag — without any event
+    /// plumbing between the views.
+    fn persist_if_changed(&mut self, cx: &mut Context<Self>) {
+        let current = self.current_preferences(cx);
+        if current == self.saved {
+            return;
+        }
+        current.save();
+        self.saved = current;
     }
 
     /// Subscribe to child entities and start the poll loops.
@@ -371,16 +409,22 @@ impl AdbShareApp {
             }
         }
 
+        // Fan out concurrently. The daemon answers `device_info` per serial, so
+        // awaiting them in sequence delayed the sidebar by one round trip per
+        // connected device.
         let me = cx.entity();
         cx.spawn(async move |_this, cx| {
-            let mut entries = Vec::with_capacity(serials.len());
-            for serial in serials {
-                let entry = match daemon::device_info(&serial).await {
-                    Ok(info) => info.into_entry(),
-                    Err(_) => DeviceEntry::fallback(&serial),
-                };
-                entries.push(entry);
-            }
+            let entries: Vec<DeviceEntry> =
+                futures::future::join_all(serials.iter().map(|serial| {
+                    let serial = serial.clone();
+                    async move {
+                        match daemon::device_info(&serial).await {
+                            Ok(info) => info.into_entry(),
+                            Err(_) => DeviceEntry::fallback(&serial),
+                        }
+                    }
+                }))
+                .await;
             me.update(cx, |this, cx| this.set_devices(entries, cx)).ok();
         })
         .detach();
@@ -408,7 +452,20 @@ impl AdbShareApp {
             return;
         };
         // Toasts expire on the same tick, so no extra timer is needed.
-        self.toasts.prune();
+        let expired = self.toasts.prune();
+        self.persist_if_changed(cx);
+
+        // The queue only changes while something is moving. Re-rendering the
+        // whole window on every 600ms tick regardless made the UI repaint
+        // roughly twice a second for nothing, which shows up as churn in hover
+        // state and scroll position.
+        if jobs == self.jobs {
+            if expired {
+                cx.notify();
+            }
+            return;
+        }
+
         self.jobs = jobs;
         let active: Vec<&JobInfo> = self.jobs.iter().filter(|job| job.is_active()).collect();
         let active_count = active.len();
@@ -1640,6 +1697,7 @@ impl AdbShareApp {
     fn on_menu_select(&mut self, id: &str, cx: &mut Context<Self>) {
         self.context_menu = None;
         self.overflow_open = false;
+        // Everything below can change a persisted preference.
         match id {
             "refresh" => self.refresh_current(cx),
             "new-folder" => {
@@ -1777,6 +1835,9 @@ impl AdbShareApp {
                 self.sidebar_visible = !self.sidebar_visible;
             }
             _ => {}
+        }
+        if matches!(id, "show-hidden" | "toggle-sidebar") {
+            self.persist_if_changed(cx);
         }
         cx.notify();
     }

@@ -20,6 +20,7 @@ use gpui::{
 };
 
 use crate::icons::{self, names};
+use crate::prefs;
 use crate::protocol::{DirEntry, human_size};
 use crate::theme::{self, Themed};
 use crate::ui;
@@ -31,11 +32,8 @@ pub enum ViewMode {
     List,
 }
 
-/// Grid icon sizes, in logical pixels, for Ctrl+= / Ctrl+-.
-const ZOOM_MIN: f32 = 24.0;
-const ZOOM_MAX: f32 = 128.0;
+/// How much one Ctrl+= / Ctrl+- press changes the icon size.
 const ZOOM_STEP: f32 = 12.0;
-const ZOOM_DEFAULT: f32 = 48.0;
 /// Padding around a grid tile, on top of the icon.
 const GRID_TILE_PAD: f32 = 14.0;
 /// Gap between grid tiles.
@@ -261,7 +259,7 @@ impl Browser {
             navigating_history: false,
             view_mode: ViewMode::Grid,
             show_hidden: false,
-            zoom: ZOOM_DEFAULT,
+            zoom: prefs::ZOOM_DEFAULT,
             search_query: String::new(),
             search_active: false,
             path_entry_active: false,
@@ -372,6 +370,21 @@ impl Browser {
     /// The entry with this name, if the listing has it.
     pub fn entry_named(&self, name: &str) -> Option<&DirEntry> {
         self.entries.iter().find(|entry| entry.name == name)
+    }
+
+    /// Apply the persisted view preferences.
+    pub fn apply_preferences(
+        &mut self,
+        zoom: f32,
+        view_mode: ViewMode,
+        show_hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom = step_zoom(zoom, 0.0);
+        self.view_mode = view_mode;
+        self.show_hidden = show_hidden;
+        self.recompute_visible();
+        cx.notify();
     }
 
     /// Switch between the grid and list layouts.
@@ -495,6 +508,11 @@ impl Browser {
 
     /// Report where the file area is laid out, so rubber-band hit-testing has
     /// exact geometry to work from.
+    /// The current grid icon size.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
     pub fn set_viewport(
         &mut self,
         x: f32,
@@ -1001,8 +1019,11 @@ impl Focusable for Browser {
 // ── Hit testing ──────────────────────────────────────────────────────────────
 
 /// Clamp a zoom change to the supported range.
+///
+/// The bounds live in [`crate::prefs`] so the persisted value and the live
+/// clamp can never disagree.
 pub fn step_zoom(current: f32, delta: f32) -> f32 {
-    (current + delta).clamp(ZOOM_MIN, ZOOM_MAX)
+    (current + delta).clamp(prefs::ZOOM_RANGE.0, prefs::ZOOM_RANGE.1)
 }
 
 /// Number of grid tiles that fit across `container_w`.
@@ -1420,15 +1441,9 @@ impl Browser {
             .truncate()
             .child(entry.name.clone());
 
-        let sub = ui::mono(
-            if entry.is_dir {
-                "—".to_string()
-            } else {
-                human_size(entry.size)
-            },
-            &t,
-        )
-        .text_size(px(9.5));
+        // A folder has no meaningful size, and an em dash under every folder
+        // was just noise. Only files get the second line.
+        let sub = (!entry.is_dir).then(|| ui::mono(human_size(entry.size), &t).text_size(px(9.5)));
 
         Some(
             div()
@@ -1456,7 +1471,7 @@ impl Browser {
                         .child(icon_el),
                 )
                 .child(div().mt(px(6.0)).w_full().px(px(2.0)).child(label))
-                .child(div().mt(px(1.0)).child(sub))
+                .when_some(sub, |d, sub| d.child(div().mt(px(1.0)).child(sub)))
                 .on_click(
                     cx.listener(move |this, event, w, cx| this.on_item_click(index, event, w, cx)),
                 )
@@ -1862,18 +1877,18 @@ mod tests {
 
     #[test]
     fn zoom_is_clamped_to_its_range() {
-        let mut zoom = ZOOM_DEFAULT;
+        let mut zoom = prefs::ZOOM_DEFAULT;
         for _ in 0..40 {
             zoom = step_zoom(zoom, ZOOM_STEP);
         }
-        assert_eq!(zoom, ZOOM_MAX, "zoom in stops at the maximum");
+        assert_eq!(zoom, prefs::ZOOM_RANGE.1, "zoom in stops at the maximum");
         for _ in 0..60 {
             zoom = step_zoom(zoom, -ZOOM_STEP);
         }
-        assert_eq!(zoom, ZOOM_MIN, "zoom out stops at the minimum");
+        assert_eq!(zoom, prefs::ZOOM_RANGE.0, "zoom out stops at the minimum");
         assert_eq!(
             step_zoom(zoom, ZOOM_STEP),
-            ZOOM_MIN + ZOOM_STEP,
+            prefs::ZOOM_RANGE.0 + ZOOM_STEP,
             "and it can come back"
         );
     }
@@ -2665,6 +2680,42 @@ mod tests {
                 let ms = bench_layout(mode, count);
                 println!("bench {label:<5} n={count:<6} {ms:8.3} ms");
             }
+        }
+    }
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_filter_cost() {
+        for count in [1_000usize, 5_000] {
+            let entries = synthetic_listing(count);
+            let mut best = f64::MAX;
+            for _ in 0..8 {
+                let start = std::time::Instant::now();
+                for needle in ["i", "im", "img", "img_", "IMG_2"] {
+                    let lower = needle.to_lowercase();
+                    let hits = entries
+                        .iter()
+                        .filter(|e| e.name.to_lowercase().contains(&lower))
+                        .count();
+                    std::hint::black_box(hits);
+                }
+                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!("bench filter n={count:<6} 5 queries {best:8.3} ms");
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_sort_cost() {
+        for count in [1_000usize, 5_000] {
+            let mut best = f64::MAX;
+            for _ in 0..8 {
+                let mut entries = synthetic_listing(count);
+                let start = std::time::Instant::now();
+                crate::localfs::sort_entries(&mut entries);
+                best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!("bench sort   n={count:<6} {best:8.3} ms");
         }
     }
 }
