@@ -14,18 +14,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    Request, FUSE_ROOT_ID,
+    FUSE_ROOT_ID, FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
 
 use adb_proxy::{FileMode, OpenFlags, ProxyClient, ProxyError, ProxyFile, Stat, Status};
 
-use crate::cache::StatCache;
+use crate::cache::{DirCache, StatCache};
 
 const TTL: Duration = Duration::from_secs(2);
+
+/// How long a directory listing is reused across `readdir` calls.
+///
+/// Shorter than a stat's worth of staleness would be surprising to a user
+/// watching a file appear on the phone, and a listing is only consulted for
+/// entries that already exist.
+const DIR_TTL: Duration = Duration::from_secs(2);
+/// How many directories to remember. A file manager or an open dialog walks one
+/// tree at a time, so a handful covers the working set without letting a long
+/// session accumulate listings.
+const DIR_CACHE_CAPACITY: usize = 8;
 const BLOCK_SIZE: u32 = 4096;
 const ADB_UID: u32 = 2000;
 const ADB_GID: u32 = 2000;
@@ -45,6 +55,9 @@ pub enum FsError {
 pub struct Adbfs {
     proxy: SyncProxy,
     cache: StatCache,
+    /// Recent directory listings, so a continued `readdir` does not re-list
+    /// the whole directory over ADB.
+    dir_cache: DirCache,
     ino_to_path: Mutex<HashMap<u64, PathBuf>>,
     path_to_ino: Mutex<HashMap<PathBuf, u64>>,
     next_ino: AtomicU64,
@@ -209,16 +222,34 @@ impl SyncProxy {
     fn stat(&self, path: &str) -> std::result::Result<Stat, ProxyError> {
         self.call(|tx| ProxyRequest::Stat(path.to_string(), tx))
     }
-    fn listdir(&self, path: &str) -> std::result::Result<Vec<adb_proxy::ops::DirEntry>, ProxyError> {
+    fn listdir(
+        &self,
+        path: &str,
+    ) -> std::result::Result<Vec<adb_proxy::ops::DirEntry>, ProxyError> {
         self.call(|tx| ProxyRequest::ListDir(path.to_string(), tx))
     }
-    fn open(&self, path: &str, flags: OpenFlags, mode: u32) -> std::result::Result<ProxyFile, ProxyError> {
+    fn open(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        mode: u32,
+    ) -> std::result::Result<ProxyFile, ProxyError> {
         self.call(|tx| ProxyRequest::Open(path.to_string(), flags, mode, tx))
     }
-    fn read_at(&self, file: ProxyFile, off: u64, len: u32) -> std::result::Result<bytes::Bytes, ProxyError> {
+    fn read_at(
+        &self,
+        file: ProxyFile,
+        off: u64,
+        len: u32,
+    ) -> std::result::Result<bytes::Bytes, ProxyError> {
         self.call(|tx| ProxyRequest::ReadAt(file, off, len, tx))
     }
-    fn write_at(&self, file: ProxyFile, off: u64, data: Vec<u8>) -> std::result::Result<(), ProxyError> {
+    fn write_at(
+        &self,
+        file: ProxyFile,
+        off: u64,
+        data: Vec<u8>,
+    ) -> std::result::Result<(), ProxyError> {
         self.call(|tx| ProxyRequest::WriteAt(file, off, data, tx))
     }
     fn close(&self, file: ProxyFile) -> std::result::Result<(), ProxyError> {
@@ -254,6 +285,7 @@ impl Adbfs {
         Self {
             proxy,
             cache: StatCache::new(TTL),
+            dir_cache: DirCache::new(DIR_TTL, DIR_CACHE_CAPACITY),
             ino_to_path: Mutex::new(ino_to_path),
             path_to_ino: Mutex::new(path_to_ino),
             next_ino: AtomicU64::new(100),
@@ -262,9 +294,21 @@ impl Adbfs {
         }
     }
 
+    /// Drop the cached listing of whatever directory contains `path`.
+    ///
+    /// A mutation changes the *parent's* entries, not the mutated path's, so
+    /// every create, delete, rename and truncate has to invalidate the parent.
+    fn invalidate_parent_listing(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.dir_cache.invalidate(parent);
+        }
+    }
+
     fn ino_for(&self, path: PathBuf) -> u64 {
         let mut p2i = self.path_to_ino.lock();
-        if let Some(&ino) = p2i.get(&path) { return ino; }
+        if let Some(&ino) = p2i.get(&path) {
+            return ino;
+        }
         let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
         p2i.insert(path.clone(), ino);
         self.ino_to_path.lock().insert(ino, path);
@@ -332,7 +376,10 @@ impl Filesystem for Adbfs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
@@ -355,7 +402,10 @@ impl Filesystem for Adbfs {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         if let Some(stat) = self.cache.get(&path) {
             let attr = self.attr_from_stat(ino, stat);
@@ -377,28 +427,56 @@ impl Filesystem for Adbfs {
         }
     }
 
-    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
             return;
         };
-        let entries = self.proxy.listdir(&path_str);
-        let entries = match entries {
-            Ok(e) => e,
-            Err(e) => { reply.error(Self::proxy_to_errno(e)); return; }
+        // FUSE walks a directory in as many `readdir` calls as the consumer
+        // needs, each with a continuation offset. Listing the whole thing over
+        // ADB every time made a large directory quadratic in round trips, so a
+        // recent listing is reused.
+        let entries = match self.dir_cache.get(&path) {
+            Some(cached) => cached,
+            None => match self.proxy.listdir(&path_str) {
+                Ok(fresh) => {
+                    self.dir_cache.put(path.clone(), fresh.clone());
+                    fresh
+                }
+                Err(e) => {
+                    reply.error(Self::proxy_to_errno(e));
+                    return;
+                }
+            },
         };
         let mut cur = offset.max(0) as usize;
-        if cur == 0 { let _ = reply.add(ino, 1, FileType::Directory, "."); cur = 1; }
+        if cur == 0 {
+            let _ = reply.add(ino, 1, FileType::Directory, ".");
+            cur = 1;
+        }
         // NOTE: `..` is advertised with FUSE_ROOT_ID, not the real parent
         // inode. The kernel resolves parents through its own dentry cache,
         // so this works in practice; reworking parent inode tracking is a
         // separate change.
-        if cur == 1 { let _ = reply.add(FUSE_ROOT_ID, 2, FileType::Directory, ".."); cur = 2; }
+        if cur == 1 {
+            let _ = reply.add(FUSE_ROOT_ID, 2, FileType::Directory, "..");
+            cur = 2;
+        }
         for (n, entry) in entries.into_iter().enumerate().skip(cur.saturating_sub(2)) {
             let child_path = {
                 let mut p = path.clone();
@@ -417,18 +495,31 @@ impl Filesystem for Adbfs {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
             return;
         };
         let mut oflags = OpenFlags::READ;
-        if flags & libc::O_WRONLY != 0 { oflags = OpenFlags::WRITE; }
-        if flags & libc::O_RDWR != 0 { oflags = OpenFlags::READ | OpenFlags::WRITE; }
-        if flags & libc::O_CREAT != 0 { oflags |= OpenFlags::CREATE; }
-        if flags & libc::O_TRUNC != 0 { oflags |= OpenFlags::TRUNC; }
-        if flags & libc::O_APPEND != 0 { oflags |= OpenFlags::APPEND; }
+        if flags & libc::O_WRONLY != 0 {
+            oflags = OpenFlags::WRITE;
+        }
+        if flags & libc::O_RDWR != 0 {
+            oflags = OpenFlags::READ | OpenFlags::WRITE;
+        }
+        if flags & libc::O_CREAT != 0 {
+            oflags |= OpenFlags::CREATE;
+        }
+        if flags & libc::O_TRUNC != 0 {
+            oflags |= OpenFlags::TRUNC;
+        }
+        if flags & libc::O_APPEND != 0 {
+            oflags |= OpenFlags::APPEND;
+        }
         let mode = 0o644;
         let res = self.proxy.open(&path_str, oflags, mode);
         match res {
@@ -441,11 +532,24 @@ impl Filesystem for Adbfs {
         }
     }
 
-    fn read(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyData) {
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
         let file = { self.open_files.lock().get(&fh).map(|f| f.proxy.clone()) };
         let file = match file {
             Some(f) => f,
-            None => { reply.error(libc::EBADF); return; }
+            None => {
+                reply.error(libc::EBADF);
+                return;
+            }
         };
         let res = self.proxy.read_at(file, offset as u64, size);
         match res {
@@ -454,13 +558,34 @@ impl Filesystem for Adbfs {
         }
     }
 
-    fn write(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
         let file = { self.open_files.lock().get(&fh).map(|f| f.proxy.clone()) };
         let file = match file {
             Some(f) => f,
-            None => { reply.error(libc::EBADF); return; }
+            None => {
+                reply.error(libc::EBADF);
+                return;
+            }
         };
         let res = self.proxy.write_at(file, offset as u64, data.to_vec());
+        // A write changes the mtime the parent listing shows, so the cached
+        // listing is stale even though the set of entries is not.
+        if res.is_ok()
+            && let Some(path) = self.ino_to_path.lock().get(&ino).cloned()
+        {
+            self.invalidate_parent_listing(&path);
+        }
         match res {
             Ok(()) => {
                 if let Some(path) = self.ino_to_path.lock().get(&ino) {
@@ -472,7 +597,16 @@ impl Filesystem for Adbfs {
         }
     }
 
-    fn release(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
         if let Some(file) = self.open_files.lock().remove(&fh) {
             let _ = self.proxy.close(file.proxy);
         }
@@ -494,15 +628,22 @@ impl Filesystem for Adbfs {
     ) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
             return;
         };
         let mut oflags = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
-        if flags & libc::O_TRUNC != 0 { oflags |= OpenFlags::TRUNC; }
-        if flags & libc::O_EXCL != 0 { oflags |= OpenFlags::EXCL; }
+        if flags & libc::O_TRUNC != 0 {
+            oflags |= OpenFlags::TRUNC;
+        }
+        if flags & libc::O_EXCL != 0 {
+            oflags |= OpenFlags::EXCL;
+        }
         let res = self.proxy.open(&path_str, oflags, mode);
         match res {
             Ok(file) => {
@@ -521,6 +662,7 @@ impl Filesystem for Adbfs {
                     blksize: 4096,
                     blocks: 0,
                 });
+                self.invalidate_parent_listing(&path);
                 self.cache.put(path, stat);
                 let attr = self.attr_from_stat(ino, stat);
                 reply.created(&TTL, &attr, 0, fh, 0);
@@ -540,7 +682,10 @@ impl Filesystem for Adbfs {
     ) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
@@ -561,6 +706,7 @@ impl Filesystem for Adbfs {
                     blksize: 4096,
                     blocks: 8,
                 });
+                self.invalidate_parent_listing(&path);
                 self.cache.put(path, stat);
                 let attr = self.attr_from_stat(ino, stat);
                 reply.entry(&TTL, &attr, 0);
@@ -572,7 +718,10 @@ impl Filesystem for Adbfs {
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
@@ -580,6 +729,7 @@ impl Filesystem for Adbfs {
         };
         match self.proxy.unlink(&path_str) {
             Ok(()) => {
+                self.invalidate_parent_listing(&path);
                 self.cache.invalidate(&path);
                 reply.ok();
             }
@@ -590,7 +740,10 @@ impl Filesystem for Adbfs {
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
@@ -598,6 +751,10 @@ impl Filesystem for Adbfs {
         };
         match self.proxy.rmdir(&path_str) {
             Ok(()) => {
+                // The directory itself disappears, and so does its entry in
+                // the parent.
+                self.dir_cache.invalidate(&path);
+                self.invalidate_parent_listing(&path);
                 self.cache.invalidate(&path);
                 reply.ok();
             }
@@ -617,11 +774,17 @@ impl Filesystem for Adbfs {
     ) {
         let src = match self.resolve_child(parent, name) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let dst = match self.resolve_child(newparent, newname) {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(src_str) = path_to_string(&src) else {
             reply.error(libc::EINVAL);
@@ -640,7 +803,11 @@ impl Filesystem for Adbfs {
                     .get(&src)
                     .map(|s| s.mode.is_dir())
                     .unwrap_or_else(|| {
-                        self.proxy.stat(&src_str).ok().map(|s| s.mode.is_dir()).unwrap_or(false)
+                        self.proxy
+                            .stat(&src_str)
+                            .ok()
+                            .map(|s| s.mode.is_dir())
+                            .unwrap_or(false)
                     });
 
                 // Move the inode mappings from src to dst so existing inode
@@ -687,6 +854,8 @@ impl Filesystem for Adbfs {
                 if is_dir {
                     self.cache.invalidate_prefix(&src);
                     self.cache.invalidate_prefix(&dst);
+                    self.dir_cache.invalidate_prefix(&src);
+                    self.dir_cache.invalidate_prefix(&dst);
                 } else {
                     self.cache.invalidate(&src);
                     self.cache.invalidate(&dst);
@@ -718,7 +887,10 @@ impl Filesystem for Adbfs {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
-            None => { reply.error(libc::EINVAL); return; }
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
         let Some(path_str) = path_to_string(&path) else {
             reply.error(libc::EINVAL);
@@ -731,6 +903,8 @@ impl Filesystem for Adbfs {
                 reply.error(Self::proxy_to_errno(e));
                 return;
             }
+            // The size shown in the parent listing just changed.
+            self.invalidate_parent_listing(&path);
         }
         if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
             // The proxy protocol has no chmod/chown/utimens ops. Fail
@@ -756,6 +930,15 @@ impl Filesystem for Adbfs {
         // statfs op to the protocol is a possible follow-up.
         const TOTAL_BLOCKS: u64 = 1 << 32; // 16 TiB at 4 KiB blocks
         const FREE_BLOCKS: u64 = 1 << 31; // 8 TiB
-        reply.statfs(TOTAL_BLOCKS, FREE_BLOCKS, FREE_BLOCKS, 1 << 20, 1 << 20, BLOCK_SIZE, 256, 4096);
+        reply.statfs(
+            TOTAL_BLOCKS,
+            FREE_BLOCKS,
+            FREE_BLOCKS,
+            1 << 20,
+            1 << 20,
+            BLOCK_SIZE,
+            256,
+            4096,
+        );
     }
 }

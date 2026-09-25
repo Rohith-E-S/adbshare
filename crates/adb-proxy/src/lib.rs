@@ -22,7 +22,7 @@ pub mod ops;
 mod tests;
 
 pub use client::{DiskUsage, ProxyClient, ProxyError, ProxyFile};
-pub use ops::{FileMode, OpenFlags, Stat, Status};
+pub use ops::{DirEntry, FileMode, OpenFlags, Stat, Status};
 
 /// The user-friendly name of the proxy binary on the device.
 pub const PROXY_BIN_PATH: &str = "/data/local/tmp/adbshare-proxy";

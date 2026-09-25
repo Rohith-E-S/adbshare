@@ -13,6 +13,10 @@ pub use filesystem::Adbfs;
 /// std::thread. Unmounting is expected to happen externally (fusermount3)
 /// or by terminating the thread/process; the call does not return on
 /// external unmount.
-pub fn run(device: adb_device::DeviceId, client: adb_proxy::ProxyClient, mountpoint: std::path::PathBuf) -> Result<(), filesystem::FsError> {
+pub fn run(
+    device: adb_device::DeviceId,
+    client: adb_proxy::ProxyClient,
+    mountpoint: std::path::PathBuf,
+) -> Result<(), filesystem::FsError> {
     mount::run(device, client, mountpoint)
 }
