@@ -423,6 +423,7 @@ pub struct FileBrowser {
     info_title: gtk4::Label,
     info_subtitle: gtk4::Label,
     info_count: gtk4::Label,
+    status_bar: gtk4::Box,
     status_label: gtk4::Label,
     status_progress: gtk4::ProgressBar,
     pub status_pause_btn: gtk4::Button,
@@ -502,7 +503,6 @@ impl FileBrowser {
         info_count.add_css_class("context-count");
         info_count.set_valign(gtk4::Align::Center);
         info_bar.append(&info_count);
-        root.append(&info_bar);
 
         // --- Search (entry lives in the header; see app.rs) ---
         let search_bar = gtk4::SearchBar::new();
@@ -545,7 +545,7 @@ impl FileBrowser {
         // width is propagated so the centered crumbs render fully; overflow
         // still scrolls horizontally on narrow windows.
         breadcrumb_scroll.set_width_request(120);
-        breadcrumb_scroll.set_propagate_natural_width(true);
+        breadcrumb_scroll.set_propagate_natural_width(false);
         breadcrumb_scroll.set_propagate_natural_height(true);
         let breadcrumb_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         breadcrumb_container.set_valign(gtk4::Align::Center);
@@ -613,8 +613,8 @@ impl FileBrowser {
         grid_box.set_selection_mode(gtk4::SelectionMode::Multiple);
         grid_box.set_activate_on_single_click(false);
         grid_box.set_homogeneous(false);
-        grid_box.set_column_spacing(6);
-        grid_box.set_row_spacing(10);
+        grid_box.set_column_spacing(4);
+        grid_box.set_row_spacing(6);
         grid_box.set_max_children_per_line(24);
         grid_box.set_min_children_per_line(1);
         grid_box.set_valign(gtk4::Align::Start);
@@ -655,12 +655,28 @@ impl FileBrowser {
         file_view_stack.add_named(&list_scroll, Some("list"));
         file_view_stack.set_visible_child_name("grid");
 
-        let status = adw::StatusPage::builder()
-            .title("Connect your phone")
-            .description("Plug in via USB, allow debugging, then pick the device in the sidebar.\nOr browse your local files under \u{201C}This computer.\u{201D}")
-            .icon_name("phone-symbolic")
-            .vexpand(true)
+        let status = gtk4::Overlay::new();
+        status.set_vexpand(true);
+        let status_content = gtk4::Box::new(gtk4::Orientation::Vertical, 14);
+        status_content.set_valign(gtk4::Align::Center);
+        status_content.set_halign(gtk4::Align::Center);
+        status_content.set_margin_bottom(110);
+        status.set_child(Some(&status_content));
+        let status_icon = gtk4::Image::from_icon_name("phone-symbolic");
+        status_icon.set_pixel_size(58);
+        status_content.append(&status_icon);
+        let status_title = gtk4::Label::new(Some("Connect your phone"));
+        status_title.add_css_class("empty-state-title");
+        status_content.append(&status_title);
+        let status_description = gtk4::Label::builder()
+            .label("Plug in via USB, allow debugging, then pick the device in the sidebar.\nOr browse your local files under \u{201C}This computer.\u{201D}")
+            .justify(gtk4::Justification::Center)
+            .wrap(true)
+            .wrap_mode(gtk4::pango::WrapMode::WordChar)
+            .lines(2)
             .build();
+        status_description.add_css_class("empty-state-message");
+        status_content.append(&status_description);
 
         let main_stack = gtk4::Stack::new();
         main_stack.set_vexpand(true);
@@ -674,6 +690,7 @@ impl FileBrowser {
         // progress indicator. Never floats over files.
         let status_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         status_bar.add_css_class("status-bar");
+        status_bar.set_visible(false);
         let status_label = gtk4::Label::builder()
             .label("No folder open")
             .xalign(0.0)
@@ -705,7 +722,7 @@ impl FileBrowser {
         let local_mode = Rc::new(RefCell::new(false));
         let fuse_mount: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let show_hidden = Rc::new(RefCell::new(false));
-        let zoom = Rc::new(Cell::new(48));
+        let zoom = Rc::new(Cell::new(28));
         let entries = Rc::new(RefCell::new(Vec::new()));
         let history_back = Rc::new(RefCell::new(Vec::new()));
         let history_forward = Rc::new(RefCell::new(Vec::new()));
@@ -741,6 +758,7 @@ impl FileBrowser {
             info_title,
             info_subtitle,
             info_count,
+            status_bar,
             status_label,
             status_progress,
             status_pause_btn,
@@ -761,6 +779,7 @@ impl FileBrowser {
         };
 
         browser.wire_controls();
+        browser.render_breadcrumbs(&PathBuf::from("/"));
         browser.set_buttons_sensitive(false);
         browser
     }
@@ -820,6 +839,7 @@ impl FileBrowser {
     /// when idle. This is the ONLY progress indicator in the content area.
     pub fn update_transfer_banner(&self, active: bool, text: &str, fraction: f64) {
         if active {
+            self.status_bar.set_visible(true);
             self.status_label.set_label(text);
             self.status_progress.set_fraction(fraction);
             self.status_progress.set_visible(true);
@@ -875,7 +895,7 @@ impl FileBrowser {
             self.status_label.set_label("This folder is empty");
         } else if hidden > 0 {
             self.status_label.set_label(&format!(
-                "{} item{} · {} hidden",
+                "{} item{} • {} hidden",
                 total,
                 if total == 1 { "" } else { "s" },
                 hidden
@@ -994,8 +1014,8 @@ impl FileBrowser {
 
     pub fn zoom_out(&self) {
         let cur = self.zoom.get();
-        if cur > 32 {
-            self.zoom.set((cur / 2).max(32));
+        if cur > 24 {
+            self.zoom.set((cur / 2).max(24));
             let all = self.entries.borrow().clone();
             self.set_entries(all);
         }
@@ -1228,16 +1248,12 @@ impl FileBrowser {
             // width, so the card must FILL its cell (not center a fixed
             // 78px box inside it) — otherwise the leftover becomes the
             // huge dead gutters seen in screenshots.
-            let card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            let card = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
             card.add_css_class("grid-item-card");
-            card.set_valign(gtk4::Align::Start);
+            card.set_valign(gtk4::Align::Center);
             let icon_px = self.zoom.get();
-            // Minimum width only: the card expands with its cell, and the
-            // height stays natural so labels never clip.
-            card.set_size_request(104, -1);
+            card.set_size_request(84, -1);
             card.set_halign(gtk4::Align::Fill);
-            card.set_hexpand(true);
-            card.set_valign(gtk4::Align::Start);
             card.set_widget_name(&e.name);
 
             // Design uses full-color icons: bundled SVGs first, theme fallback.
@@ -1245,23 +1261,14 @@ impl FileBrowser {
             icon_box.set_size_request(icon_px as i32, icon_px as i32);
             icon_box.set_halign(gtk4::Align::Center);
             icon_box.set_valign(gtk4::Align::Center);
-            let grid_icon = match asset_icon_for(&e)
-                .and_then(|name| asset_icon_dir().map(|dir| dir.join(name)))
-                .map(|p| gtk4::Image::from_file(&p))
-            {
-                Some(img) => img,
-                None => {
-                    let img = gtk4::Image::from_icon_name(e.icon_name());
-                    if e.is_dir {
-                        img.add_css_class("folder-icon");
-                    } else if e.name.ends_with(".apk") {
-                        img.add_css_class("apk-icon");
-                    } else {
-                        img.add_css_class("file-icon");
-                    }
-                    img
-                }
-            };
+            let grid_icon = gtk4::Image::from_icon_name(e.icon_name());
+            if e.is_dir {
+                grid_icon.add_css_class("folder-icon");
+            } else if e.name.ends_with(".apk") {
+                grid_icon.add_css_class("apk-icon");
+            } else {
+                grid_icon.add_css_class("file-icon");
+            }
             grid_icon.set_pixel_size(icon_px as i32);
             icon_box.append(&grid_icon);
             card.append(&icon_box);
@@ -1395,10 +1402,12 @@ impl FileBrowser {
 
     pub fn show_empty(&self) {
         self.main_stack.set_visible_child_name("empty");
+        self.status_bar.set_visible(false);
     }
 
     pub fn show_list(&self) {
         self.main_stack.set_visible_child_name("files");
+        self.status_bar.set_visible(true);
     }
 
     fn clear(&self) {
@@ -1417,7 +1426,7 @@ impl FileBrowser {
         self.upload_button.set_sensitive(on);
         self.new_folder_button.set_sensitive(on);
         self.open_external_button.set_sensitive(on);
-        self.search_button.set_sensitive(on);
+        self.search_button.set_sensitive(true);
         self.download_button.set_sensitive(false);
     }
 
@@ -1504,11 +1513,11 @@ impl FileBrowser {
         // If no device is connected, show an inactive pill and stop
         if self.device.borrow().is_none() {
             let dev_btn = nav_pill_button(
-                Some("phone-symbolic"),
+                None,
                 "No phone connected",
                 "Connect a phone via USB or Wi-Fi",
             );
-            dev_btn.set_sensitive(false);
+            dev_btn.add_css_class("current");
             self.breadcrumb_container.append(&dev_btn);
             return;
         }
@@ -1526,11 +1535,7 @@ impl FileBrowser {
         };
 
         // 1. Device pill button - clicking navigates to root "/"
-        let dev_btn = nav_pill_button(
-            Some("phone-symbolic"),
-            &dev_name,
-            "Phone root (/)",
-        );
+        let dev_btn = nav_pill_button(None, &dev_name, "Phone root (/)");
         let on_event = self.on_event.clone();
         dev_btn.connect_clicked(move |_| {
             if let Some(cb) = on_event.borrow().as_ref() {
@@ -1553,11 +1558,8 @@ impl FileBrowser {
 
         if path_str.starts_with("/sdcard") {
             let is_storage_root = path_str == "/sdcard" || path_str == "/sdcard/";
-            let storage_btn = nav_pill_button(
-                None,
-                "Internal storage",
-                "Internal storage (/sdcard)",
-            );
+            let storage_btn =
+                nav_pill_button(None, "Internal storage", "Internal storage (/sdcard)");
             if is_storage_root {
                 storage_btn.add_css_class("current");
             }
@@ -1763,12 +1765,13 @@ impl FileBrowser {
             search_bar.set_search_mode(btn.is_active());
         });
         let search_btn = self.search_button.clone();
-        self.search_bar.connect_search_mode_enabled_notify(move |bar| {
-            let enabled = bar.is_search_mode();
-            if search_btn.is_active() != enabled {
-                search_btn.set_active(enabled);
-            }
-        });
+        self.search_bar
+            .connect_search_mode_enabled_notify(move |bar| {
+                let enabled = bar.is_search_mode();
+                if search_btn.is_active() != enabled {
+                    search_btn.set_active(enabled);
+                }
+            });
 
         // Search filtering (applies to both list_box and grid_box)
         let search_query = self.search_query.clone();
@@ -2858,9 +2861,7 @@ fn show_new_folder_dialog(
     let window = parent
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok());
-    let mut builder = gtk4::Dialog::builder()
-        .title("New Folder")
-        .modal(true);
+    let mut builder = gtk4::Dialog::builder().title("New Folder").modal(true);
     if let Some(ref w) = window {
         builder = builder.transient_for(w);
     }
@@ -2904,9 +2905,7 @@ fn show_rename_dialog(
     let window = parent
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok());
-    let mut builder = gtk4::Dialog::builder()
-        .title("Rename")
-        .modal(true);
+    let mut builder = gtk4::Dialog::builder().title("Rename").modal(true);
     if let Some(ref w) = window {
         builder = builder.transient_for(w);
     }
@@ -2997,9 +2996,7 @@ fn show_delete_dialog(
     let window = parent
         .root()
         .and_then(|r| r.downcast::<gtk4::Window>().ok());
-    let mut builder = gtk4::Dialog::builder()
-        .title("Delete Items")
-        .modal(true);
+    let mut builder = gtk4::Dialog::builder().title("Delete Items").modal(true);
     if let Some(ref w) = window {
         builder = builder.transient_for(w);
     }
@@ -3226,7 +3223,12 @@ mod tests {
             }
             popover.unparent();
         }
-        trash_local_entries(&parent, std::path::Path::new("/dev/null"), &entries, &on_event);
+        trash_local_entries(
+            &parent,
+            std::path::Path::new("/dev/null"),
+            &entries,
+            &on_event,
+        );
         assert!(events.borrow().is_empty());
         let context = glib::MainContext::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
