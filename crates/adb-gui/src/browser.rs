@@ -1620,6 +1620,11 @@ impl Browser {
             .mt(px(6.0))
             .w_full()
             .px(px(2.0))
+            // The tile centres its children, but the label is a full-width box, so
+            // that centres the box and not the text in it: names were sitting
+            // against the tile's left edge instead of under the icon, and a long
+            // name ellipsized from the wrong side.
+            .text_center()
             .text_size(px(11.5))
             .font_weight(if entry.looks_like_dir() {
                 gpui::FontWeight::MEDIUM
@@ -1640,6 +1645,7 @@ impl Browser {
             div()
                 .mt(px(1.0))
                 .w_full()
+                .text_center()
                 .font_family(theme::MONO)
                 .text_size(px(9.5))
                 .text_color(t.text_muted)
@@ -2928,6 +2934,57 @@ mod tests {
             });
             assert_eq!(browser.read(app).path(), Path::new("/"));
         });
+    }
+
+    /// A tile is a fixed size whatever the file is called.
+    ///
+    /// The label and the size are centred text in a full-width box: without
+    /// `text_center` the box is centred but the text is not, so names sat against
+    /// the tile's left edge and a long one ellipsized from the wrong side. What
+    /// is checkable here is the invariant that a name cannot widen its tile and
+    /// break the grid's rhythm.
+    #[gpui::test]
+    async fn tile_width_does_not_depend_on_the_file_name(_cx: &mut TestAppContext) {
+        // Each name is measured in its own context, so the layouts cannot
+        // influence one another.
+        let names = [
+            ("a", false),
+            ("a-rather-longer-name-than-the-tile-is-wide.bin", false),
+            ("mid-length.dat", true),
+        ];
+
+        let mut widths = Vec::new();
+        for (name, is_dir) in names {
+            let mut cx = TestAppContext::single();
+            cx.update(crate::theme::install);
+            let handle = open(&mut cx);
+            let vctx = cx.add_empty_window();
+            let browser = vctx.update(|_w, cx| handle.root(cx).expect("root view"));
+            vctx.update(|_w, cx| {
+                browser.update(cx, |b, cx| {
+                    b.device = Some("bench".into());
+                    b.install_entries(vec![entry(name, is_dir)]);
+                    b.set_viewport(0.0, 0.0, 768.0, 560.0, cx);
+                    cx.notify();
+                });
+            });
+            let _ = vctx.draw(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(px(768.), px(560.)),
+                |_w, _cx| browser.clone(),
+            );
+            // The grid's tile is a fixed size whatever the name is, because the
+            // label truncates rather than widening the tile.
+            cx.update(|app| {
+                let height: f32 = browser.read(app).grid_geometry.tile.height.into();
+                widths.push(height);
+            });
+        }
+
+        assert!(
+            widths.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01),
+            "tile height changed with the file name: {widths:?}"
+        );
     }
 
     #[gpui::test]
