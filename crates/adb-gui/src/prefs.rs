@@ -41,6 +41,10 @@ pub struct Preferences {
     pub list_view: bool,
     /// Whether dotfiles are shown.
     pub show_hidden: bool,
+    /// What listings are ordered by.
+    pub sort_key: crate::protocol::SortKey,
+    /// Whether that order is reversed.
+    pub sort_descending: bool,
 }
 
 impl Default for Preferences {
@@ -51,6 +55,8 @@ impl Default for Preferences {
             zoom: ZOOM_DEFAULT,
             list_view: false,
             show_hidden: false,
+            sort_key: crate::protocol::SortKey::default(),
+            sort_descending: false,
         }
     }
 }
@@ -115,6 +121,28 @@ impl Preferences {
             ViewMode::Grid
         }
     }
+
+    /// Just the parts the browser cares about, so it can take them in one
+    /// argument instead of five.
+    pub fn view(&self) -> ViewPreferences {
+        ViewPreferences {
+            zoom: self.zoom,
+            view_mode: self.view_mode(),
+            show_hidden: self.show_hidden,
+            sort_key: self.sort_key,
+            sort_descending: self.sort_descending,
+        }
+    }
+}
+
+/// The browser's share of the preferences.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewPreferences {
+    pub zoom: f32,
+    pub view_mode: ViewMode,
+    pub show_hidden: bool,
+    pub sort_key: crate::protocol::SortKey,
+    pub sort_descending: bool,
 }
 
 /// `~/.config/adbshare/gui.json`, or the XDG equivalent.
@@ -195,6 +223,30 @@ mod tests {
     }
 
     #[test]
+    fn the_sort_choice_survives_a_write_and_read() {
+        let saved = Preferences {
+            sort_key: crate::protocol::SortKey::Size,
+            sort_descending: true,
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&saved).expect("serialises");
+        let back: Preferences = serde_json::from_str(&text).expect("parses");
+        assert_eq!(back.sort_key, crate::protocol::SortKey::Size);
+        assert!(back.sort_descending);
+        assert_eq!(back.view().sort_key, crate::protocol::SortKey::Size);
+        assert!(back.view().sort_descending);
+    }
+
+    #[test]
+    fn a_file_with_an_unknown_sort_key_falls_back_to_name() {
+        let p: Preferences =
+            serde_json::from_str(r#"{"sort_key": "by-colour", "sort_descending": true}"#)
+                .expect("unknown keys are ignored, not fatal");
+        assert_eq!(p.sort_key, crate::protocol::SortKey::Name);
+        assert!(p.sort_descending, "the rest of the file still applies");
+    }
+
+    #[test]
     fn view_mode_round_trips_through_the_flag() {
         assert_eq!(Preferences::default().view_mode(), ViewMode::Grid);
         let p = Preferences {
@@ -223,6 +275,8 @@ mod tests {
             zoom: 72.0,
             list_view: true,
             show_hidden: true,
+            sort_key: crate::protocol::SortKey::Modified,
+            sort_descending: true,
         };
         std::fs::write(&path, serde_json::to_string_pretty(&saved).unwrap()).unwrap();
 

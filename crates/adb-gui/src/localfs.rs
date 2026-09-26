@@ -20,7 +20,7 @@ use crate::protocol::DirEntry;
 const MAX_COPY_FILES: usize = 10_000;
 const MAX_COPY_DEPTH: u32 = 32;
 
-/// List a local directory, folders first then case-insensitive by name.
+/// List a local directory.
 ///
 /// Every entry is returned including dotfiles: the browser's "Show hidden
 /// files" toggle filters them, so filtering here would make the toggle a no-op
@@ -53,16 +53,7 @@ pub fn list_dir(path: &Path) -> Result<Vec<DirEntry>, String> {
         });
     }
 
-    sort_entries(&mut out);
     Ok(out)
-}
-
-/// Folders first, then case-insensitive by name.
-///
-/// The daemon already returns its listings in that order; local ones are sorted
-/// here so both views order identically.
-pub fn sort_entries(entries: &mut Vec<DirEntry>) {
-    crate::protocol::sort_by_folder_then_name(entries);
 }
 
 /// Create one directory, including parents.
@@ -353,9 +344,16 @@ mod tests {
         fs::write(base.join("b.txt"), b"b").unwrap();
         fs::write(base.join(".hidden"), b"h").unwrap();
 
-        let entries = list_dir(&base).expect("list succeeds");
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // `list_dir` no longer sorts: the order is a user preference, so the
+        // caller applies it. This is what the browser does.
+        let mut entries = list_dir(&base).expect("list succeeds");
+        assert!(
+            entries.iter().any(|e| e.name == ".hidden"),
+            "dotfiles come back from the read; filtering is the browser's job"
+        );
+        crate::protocol::sort_entries(&mut entries, crate::protocol::SortKey::Name, false);
 
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&".hidden"), "{names:?}");
         assert_eq!(
             &names[..2],

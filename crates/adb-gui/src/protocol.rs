@@ -728,31 +728,129 @@ pub fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(needle)
 }
 
-/// Sort directory entries: folders first, then by a case-folded name.
+/// What a listing is ordered by.
 ///
-/// Built as decorate-sort-undecorate rather than a custom comparator, because a
-/// comparator that lowercases both names allocates twice per comparison: for
-/// 5,000 entries that is well over a hundred thousand allocations for one sort.
-/// Folding each name once turns that into 5,000.
-pub fn sort_by_folder_then_name(entries: &mut Vec<DirEntry>) {
-    // Folders first, then the folded name. `is_dir` descending puts folders
-    // ahead of files, which is what both the daemon and the local listing have
-    // always shown.
-    let mut keyed: Vec<(bool, String, usize)> = entries
+/// Serialised by its stable lower-case name rather than as a variant index, so
+/// reordering the enum cannot silently reinterpret a saved preference. An
+/// unrecognised name deserialises to the default rather than failing, so a
+/// preferences file written by a newer build — or hand-edited — does not cost
+/// the user every other setting in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortKey {
+    #[default]
+    Name,
+    Size,
+    Modified,
+}
+
+impl SortKey {
+    /// The menu item id, which is also the preference name.
+    pub fn id(self) -> &'static str {
+        self.as_name()
+    }
+
+    /// The label shown in the sort menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Name => "Name",
+            SortKey::Size => "Size",
+            SortKey::Modified => "Modified",
+        }
+    }
+
+    /// Every key, in menu order.
+    pub fn all() -> [SortKey; 3] {
+        [SortKey::Name, SortKey::Size, SortKey::Modified]
+    }
+
+    /// Every key, for iterating without importing the enum's variants.
+    pub fn values() -> impl Iterator<Item = Self> {
+        Self::all().into_iter()
+    }
+
+    /// The `SortKey` a persisted string names, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "name" => Some(SortKey::Name),
+            "size" => Some(SortKey::Size),
+            "modified" => Some(SortKey::Modified),
+            _ => None,
+        }
+    }
+
+    /// The stable name used in the preferences file.
+    pub fn as_name(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Modified => "modified",
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SortKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(SortKey::from_name(&name).unwrap_or_default())
+    }
+}
+
+/// Order directory entries.
+///
+/// Folders always come first — every file manager does it, the daemon's own
+/// listings already do it, and changing it would be a regression. Within a
+/// group the entries are ordered by `key`, optionally reversed, with names folded
+/// to lowercase so ordering is case-insensitive.
+///
+/// Built as decorate-sort-undecorate rather than a custom comparator: a
+/// comparator that folds both names allocates twice per comparison, which for
+/// 5,000 entries is well over a hundred thousand allocations for one sort.
+pub fn sort_entries(entries: &mut Vec<DirEntry>, key: SortKey, descending: bool) {
+    let mut keyed: Vec<(bool, SortField, usize)> = entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| (entry.is_dir, entry.name.to_lowercase(), index))
+        .map(|(index, entry)| (entry.is_dir, sort_field(entry, key), index))
         .collect();
-    // Stable, so entries whose names fold to the same string keep their
-    // original relative order.
-    keyed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    // Stable, so entries that compare equal keep their original relative order.
+    // Only the in-group comparison is reversed: flipping the folder comparison
+    // too would bury the directories at the bottom, which is never what
+    // "reverse order" means.
+    keyed.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            let ordering = a.1.cmp(&b.1);
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        })
+    });
     apply_permutation(entries, keyed.into_iter().map(|(_, _, index)| index));
+}
+
+/// The comparable sort field for one entry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SortField {
+    /// Case-folded name, so `apple` and `Banana` order as a person expects.
+    Name(String),
+    Size(u64),
+    Modified(i64),
+}
+
+fn sort_field(entry: &DirEntry, key: SortKey) -> SortField {
+    match key {
+        SortKey::Name => SortField::Name(entry.name.to_lowercase()),
+        SortKey::Size => SortField::Size(entry.size),
+        SortKey::Modified => SortField::Modified(entry.mtime),
+    }
 }
 
 /// Reorder `entries` into the given sequence of original indices.
 ///
 /// Implemented by draining into slots and refilling, which is correct for any
-/// permutation and does not need a placeholder value.
+/// permutation and needs no placeholder value.
 fn apply_permutation(entries: &mut Vec<DirEntry>, order: impl Iterator<Item = usize>) {
     let mut slots: Vec<Option<DirEntry>> = entries.drain(..).map(Some).collect();
     entries.extend(order.map(|index| {
@@ -774,6 +872,20 @@ mod case_tests {
             size: 0,
             mode: 0,
             mtime: 0,
+        }
+    }
+
+    fn big(name: &str, size: u64) -> DirEntry {
+        DirEntry {
+            size,
+            ..entry(name, false)
+        }
+    }
+
+    fn at(name: &str, mtime: i64) -> DirEntry {
+        DirEntry {
+            mtime,
+            ..entry(name, false)
         }
     }
 
@@ -822,25 +934,68 @@ mod case_tests {
             entry("Zoo", true),
             entry("avocado", true),
         ];
-        sort_by_folder_then_name(&mut entries);
+        sort_entries(&mut entries, SortKey::Name, false);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["avocado", "Zoo", "apple", "banana", "Zebra"]);
     }
 
     #[test]
-    fn sorting_is_stable_for_names_that_fold_together() {
+    fn reversing_flips_the_order_within_each_group() {
         let mut entries = vec![
-            entry("README", false),
-            entry("readme", false),
-            entry("ReadMe", false),
+            entry("b", false),
+            entry("a", false),
+            entry("d", true),
+            entry("c", true),
         ];
-        sort_by_folder_then_name(&mut entries);
+        sort_entries(&mut entries, SortKey::Name, true);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // Folders stay first; only the order inside each group reverses.
+        assert_eq!(names, vec!["d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn sorting_by_size_orders_by_the_size_field() {
+        let mut entries = vec![
+            big("large.bin", 9_000),
+            big("small.bin", 10),
+            big("medium.bin", 500),
+        ];
+        sort_entries(&mut entries, SortKey::Size, false);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["small.bin", "medium.bin", "large.bin"]);
+
+        sort_entries(&mut entries, SortKey::Size, true);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["large.bin", "medium.bin", "small.bin"]);
+    }
+
+    #[test]
+    fn sorting_by_modified_orders_by_the_mtime_field() {
+        let mut entries = vec![at("old", 100), at("new", 900), at("mid", 500)];
+        sort_entries(&mut entries, SortKey::Modified, false);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["old", "mid", "new"]);
+    }
+
+    #[test]
+    fn sorting_by_size_still_puts_folders_first() {
+        let mut entries = vec![big("a-huge-file", 900_000), entry("z-folder", true)];
+        sort_entries(&mut entries, SortKey::Size, false);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["README", "readme", "ReadMe"],
-            "equal keys keep their original order"
+            vec!["z-folder", "a-huge-file"],
+            "a folder outranks a 900KB file"
         );
+    }
+
+    #[test]
+    fn sort_keys_round_trip_through_their_persisted_names() {
+        for key in SortKey::all() {
+            assert_eq!(SortKey::from_name(key.as_name()), Some(key), "{key:?}");
+        }
+        assert_eq!(SortKey::from_name("nonsense"), None);
+        assert_eq!(SortKey::default(), SortKey::Name, "name is the default");
     }
 
     #[test]
@@ -850,7 +1005,7 @@ mod case_tests {
             .collect();
         let before: std::collections::HashSet<String> =
             entries.iter().map(|e| e.name.clone()).collect();
-        sort_by_folder_then_name(&mut entries);
+        sort_entries(&mut entries, SortKey::Name, false);
         assert_eq!(entries.len(), 500);
         let after: std::collections::HashSet<String> =
             entries.iter().map(|e| e.name.clone()).collect();
@@ -871,11 +1026,11 @@ mod case_tests {
     #[test]
     fn sorting_an_empty_or_single_list_is_a_no_op() {
         let mut none: Vec<DirEntry> = Vec::new();
-        sort_by_folder_then_name(&mut none);
+        sort_entries(&mut none, SortKey::Name, false);
         assert!(none.is_empty());
 
         let mut one = vec![entry("only", true)];
-        sort_by_folder_then_name(&mut one);
+        sort_entries(&mut one, SortKey::Name, false);
         assert_eq!(one[0].name, "only");
     }
 }

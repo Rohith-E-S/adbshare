@@ -30,7 +30,7 @@ use crate::localfs;
 use crate::menu::{self, MenuItem};
 use crate::prefs::{Preferences, SIDEBAR_RANGE};
 use crate::protocol::{
-    ClipboardFiles, DeviceEntry, DirEntry, JobInfo, LOCAL_DEVICE, format_capacity,
+    ClipboardFiles, DeviceEntry, DirEntry, JobInfo, LOCAL_DEVICE, SortKey, format_capacity,
     tree_result_message,
 };
 use crate::textinput::{TextField, TextFieldEvent};
@@ -62,13 +62,23 @@ actions!(
     ]
 );
 
+/// The app root's own key bindings, as `(keys, factory)`.
+///
+/// Data rather than a bare call so the shortcuts dialog can be checked against
+/// what is actually bound; see `browser::BINDINGS`.
+pub const BINDINGS: &[crate::browser::Binding] = &[
+    ("f9", || KeyBinding::new("f9", ToggleSidebar, None)),
+    ("secondary-comma", || {
+        KeyBinding::new("secondary-comma", ShowDiagnostics, None)
+    }),
+    ("shift-f10", || {
+        KeyBinding::new("shift-f10", ConnectWifi, None)
+    }),
+];
+
 /// Register the app-level key bindings. Called once from `main`.
 pub fn install_key_bindings(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("f9", ToggleSidebar, None),
-        KeyBinding::new("secondary-comma", ShowDiagnostics, None),
-        KeyBinding::new("shift-f10", ConnectWifi, None),
-    ]);
+    cx.bind_keys(BINDINGS.iter().map(|(_, make)| make()));
 }
 
 /// What the user has chosen to browse.
@@ -192,12 +202,16 @@ impl AdbShareApp {
         });
         // The browser's own view preferences live with the rest of them.
         view.update(cx, |this, cx| {
+            let view_prefs = saved.view();
             let browser = this.browser.clone();
-            browser.update(cx, |b, cx| {
-                b.apply_preferences(saved.zoom, saved.view_mode(), saved.show_hidden, cx);
-            });
+            browser.update(cx, |b, cx| b.apply_preferences(view_prefs, cx));
         });
         Self::wire_up(&view, cx);
+        // TEMP: open the overflow menu and the local disk for a visual check
+        view.update(cx, |t, cx| {
+            t.select_local(std::path::Path::new("/usr/lib"), cx);
+            t.dialog = Dialog::Shortcuts;
+        });
         view
     }
 
@@ -210,6 +224,8 @@ impl AdbShareApp {
             zoom: browser.zoom(),
             list_view: browser.view_mode() == ViewMode::List,
             show_hidden: browser.show_hidden(),
+            sort_key: browser.sort_key(),
+            sort_descending: browser.sort_descending(),
         }
     }
 
@@ -558,10 +574,7 @@ impl AdbShareApp {
                         return;
                     }
                     match result {
-                        Ok(mut entries) => {
-                            localfs::sort_entries(&mut entries);
-                            b.set_entries(entries, cx);
-                        }
+                        Ok(entries) => b.set_entries(entries, cx),
                         Err(err) => b.set_error(err, cx),
                     }
                 });
@@ -1729,6 +1742,24 @@ impl AdbShareApp {
                 self.browser
                     .update(cx, |b, cx| b.set_show_hidden(!hidden, cx));
             }
+            "sort-name" | "sort-size" | "sort-modified" => {
+                let key = match id {
+                    "sort-size" => SortKey::Size,
+                    "sort-modified" => SortKey::Modified,
+                    _ => SortKey::Name,
+                };
+                // Changing the key keeps the current direction, so a user who
+                // prefers descending order does not have to set it again.
+                let descending = self.browser.read(cx).sort_descending();
+                self.browser
+                    .update(cx, |b, cx| b.set_sort(key, descending, cx));
+            }
+            "sort-reverse" => {
+                let key = self.browser.read(cx).sort_key();
+                let descending = !self.browser.read(cx).sort_descending();
+                self.browser
+                    .update(cx, |b, cx| b.set_sort(key, descending, cx));
+            }
             "open" | "open-folder" => {
                 if let Some(entry) = self.browser.read(cx).focused_entry() {
                     let full = self.browser.read(cx).full_path(&entry);
@@ -1819,6 +1850,7 @@ impl AdbShareApp {
                 }
             }
             "diagnostics" => self.open_diagnostics(cx),
+            "shortcuts" => self.dialog = Dialog::Shortcuts,
             "about" => self.dialog = Dialog::About,
             "connect-wifi" => {
                 self.pair_address_field
@@ -1836,15 +1868,40 @@ impl AdbShareApp {
             }
             _ => {}
         }
-        if matches!(id, "show-hidden" | "toggle-sidebar") {
+        if matches!(
+            id,
+            "show-hidden"
+                | "toggle-sidebar"
+                | "sort-name"
+                | "sort-size"
+                | "sort-modified"
+                | "sort-reverse"
+        ) {
             self.persist_if_changed(cx);
         }
         cx.notify();
     }
 
     /// The overflow menu, for the current state.
-    fn overflow_items(&self, show_hidden: bool) -> Vec<MenuItem> {
-        vec![
+    fn overflow_items(&self, show_hidden: bool, sort: (SortKey, bool)) -> Vec<MenuItem> {
+        // Generated from the enum, so a new sort key cannot be added to the
+        // model and then forgotten here.
+        let sort_rows: Vec<MenuItem> = SortKey::values()
+            .map(|key| MenuItem::Check {
+                id: key.id(),
+                icon: names::OBJECT_SELECT,
+                label: key.label().to_string(),
+                checked: sort.0 == key,
+            })
+            .chain(std::iter::once(MenuItem::Check {
+                id: "sort-reverse",
+                icon: names::EDIT_UNDO,
+                label: "Reverse order".to_string(),
+                checked: sort.1,
+            }))
+            .collect();
+
+        let mut items = vec![
             MenuItem::with_icon("refresh", names::REFRESH, "Refresh", Some("F5")),
             MenuItem::with_icon(
                 "new-folder",
@@ -1886,6 +1943,7 @@ impl AdbShareApp {
                 "Connection diagnostics…",
                 None,
             ),
+            MenuItem::Heading("Sort by".into()),
             MenuItem::Check {
                 id: "show-hidden",
                 icon: names::OBJECT_SELECT,
@@ -1893,8 +1951,23 @@ impl AdbShareApp {
                 checked: show_hidden,
             },
             MenuItem::Separator,
+            MenuItem::with_icon(
+                "shortcuts",
+                names::DIALOG_INFORMATION,
+                "Keyboard shortcuts",
+                None,
+            ),
             MenuItem::with_icon("about", names::HELP_ABOUT, "About ADBShare", None),
-        ]
+        ];
+
+        // Splice the generated sort rows in right after their heading.
+        let at = items
+            .iter()
+            .position(|item| matches!(item, MenuItem::Heading(h) if h == "Sort by"))
+            .map(|index| index + 1)
+            .unwrap_or(items.len());
+        items.splice(at..at, sort_rows);
+        items
     }
 
     /// The right-click menu for the row under the pointer.
@@ -2004,7 +2077,7 @@ impl AdbShareApp {
                 "trash",
                 names::TRASH,
                 "Move to Trash",
-                Some("Del"),
+                Some("Delete"),
             ));
         }
         items.push(MenuItem::danger(
@@ -2456,7 +2529,11 @@ impl AdbShareApp {
             return div().into_any_element();
         }
         let show_hidden = self.browser.read(cx).show_hidden();
-        let items = self.overflow_items(show_hidden);
+        let sort = (
+            self.browser.read(cx).sort_key(),
+            self.browser.read(cx).sort_descending(),
+        );
+        let items = self.overflow_items(show_hidden, sort);
         let me = cx.entity();
         let card = menu::render(t, &items, 260.0, move |id, _window, app| {
             me.update(app, |this, cx| this.on_menu_select(id, cx));

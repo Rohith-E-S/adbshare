@@ -116,6 +116,8 @@ pub enum Dialog {
         /// A second, quieter button, e.g. "Copy report" beside "Close".
         extra: Option<(String, DialogResult)>,
     },
+    /// The keyboard shortcut reference.
+    Shortcuts,
     /// A still image from a device, read through its FUSE mount.
     ImagePreview {
         name: String,
@@ -150,6 +152,7 @@ impl Dialog {
             Dialog::SideloadApk { .. } => "Install this APK?",
             Dialog::Message { title, .. } => title,
             Dialog::ImagePreview { name, .. } => name,
+            Dialog::Shortcuts => "Keyboard shortcuts",
             Dialog::About => "About ADBShare",
         }
     }
@@ -461,6 +464,8 @@ where
                 ],
             )
         }
+
+        Dialog::Shortcuts => shortcuts(t, on_result.clone()),
 
         Dialog::ImagePreview { name, local } => {
             image_preview(t, name, local, on_result.clone())
@@ -1004,6 +1009,134 @@ where
     )
 }
 
+/// The keyboard shortcuts, in one place.
+///
+/// The app has always had this many bindings and they were only documented in
+/// the README, which nobody has open while using the thing. Listing them is
+/// cheap and removes the need to guess.
+/// Every shortcut the app binds, grouped for display.
+///
+/// A test asserts no two rows claim the same keys, because a duplicate row is
+/// how "Alt+Up" ended up listed twice.
+const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Navigation",
+        &[
+            ("Back / Forward", "Alt+Left / Alt+Right"),
+            ("Up one folder", "Alt+Up"),
+            ("Edit the path directly", "Ctrl+L"),
+            ("Refresh", "F5"),
+        ],
+    ),
+    (
+        "Selection",
+        &[
+            ("Move focus", "Up / Down"),
+            ("First / last item", "Home / End"),
+            ("Select all", "Ctrl+A"),
+            ("Extend selection", "Shift or Ctrl + click"),
+            ("Select a band", "Drag in the file area"),
+            ("Clear selection", "Esc"),
+        ],
+    ),
+    (
+        "Files",
+        &[
+            ("Open", "Enter or double click"),
+            ("New folder", "Ctrl+N"),
+            ("Rename", "F2"),
+            ("Move to Trash", "Delete"),
+            ("Delete permanently", "Shift+Delete"),
+            ("Copy / Paste", "Ctrl+C / Ctrl+V"),
+            ("Send to phone", "Ctrl+U"),
+            ("Save to computer", "Ctrl+Shift+C"),
+            ("Open in terminal", "Context menu"),
+        ],
+    ),
+    (
+        "View",
+        &[
+            ("Toggle sidebar", "F9"),
+            ("Switch grid / list", "Alt+T"),
+            ("Zoom out / in", "Ctrl+minus / Ctrl+plus"),
+            ("Search this folder", "Ctrl+F"),
+            ("Show hidden files", "Overflow menu"),
+        ],
+    ),
+];
+
+fn shortcuts<F>(t: &Palette, on_result: F) -> AnyElement
+where
+    F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
+{
+    let mut body: Vec<AnyElement> = Vec::new();
+    for (group, rows) in SHORTCUT_GROUPS {
+        body.push(
+            div()
+                .px(px(18.0))
+                .pt(px(12.0))
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(t.text_muted)
+                .child(group.to_uppercase())
+                .into_any_element(),
+        );
+        for (label, keys) in rows.iter() {
+            body.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .px(px(18.0))
+                    .py(px(3.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(t.text_primary)
+                            .child(*label),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme::MONO)
+                            .text_size(px(11.0))
+                            .text_color(t.text_dim)
+                            .child(*keys),
+                    )
+                    .into_any_element(),
+            );
+        }
+    }
+
+    card(
+        t,
+        WIDE_W,
+        vec![
+            header(
+                t,
+                names::DIALOG_INFORMATION,
+                t.text_dim,
+                "Keyboard shortcuts",
+            )
+            .into_any_element(),
+            div()
+                .id("shortcut-list")
+                .pb(px(12.0))
+                .max_h(px(460.0))
+                .overflow_y_scroll()
+                .scrollbar_width(px(6.0))
+                .children(body)
+                .into_any_element(),
+            buttons(
+                t,
+                vec![Button::normal("close", DialogResult::Dismiss)],
+                on_result,
+            )
+            .into_any_element(),
+        ],
+    )
+}
+
 /// A still image, read through the device's FUSE mount.
 fn image_preview<F>(t: &Palette, name: &str, local: &Path, on_result: F) -> AnyElement
 where
@@ -1215,6 +1348,92 @@ mod tests {
             },
         ] {
             assert!(step_is_dismissible(&step), "{step:?} should be dismissible");
+        }
+    }
+
+    /// Map a human key label to the spelling the bindings table uses.
+    ///
+    /// GPUI's grammar is `[secondary-][ctrl-][alt-][shift-]key`, where
+    /// `secondary` is Ctrl on Linux. The dialog writes the labels a person
+    /// would read, so they have to be translated before they can be checked.
+    fn normalise(keys: &str) -> Vec<String> {
+        keys.split(" / ")
+            .map(|combo| combo.trim())
+            .filter(|combo| !combo.is_empty())
+            .map(|combo| {
+                let mut out = String::new();
+                for part in combo.split('+') {
+                    match part.trim().to_lowercase().as_str() {
+                        "ctrl" => out.push_str("secondary-"),
+                        "cmd" | "super" => out.push_str("cmd-"),
+                        "alt" | "option" => out.push_str("alt-"),
+                        "shift" => out.push_str("shift-"),
+                        "ctrlcmd" => out.push_str("secondary-"),
+                        key => {
+                            out.push_str(key);
+                            return out;
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// Human labels that describe a gesture or a menu rather than a key.
+    const NOT_KEYS: &[&str] = &[
+        "context menu",
+        "overflow menu",
+        "enter or double click",
+        "esc",
+        "drag in the file area",
+        "shift or ctrl + click",
+    ];
+
+    #[test]
+    fn every_key_the_shortcuts_dialog_claims_is_actually_bound() {
+        // Regression: the dialog promised Alt+T for "open in terminal" when
+        // Alt+T switches the view and the terminal has no binding at all.
+        for (_, rows) in SHORTCUT_GROUPS {
+            for (label, keys) in rows.iter() {
+                if NOT_KEYS.contains(&keys.trim().to_lowercase().as_str()) {
+                    continue;
+                }
+                for key in normalise(keys) {
+                    assert!(
+                        crate::browser::is_bound(&key),
+                        "{label:?} claims {key:?}, which nothing binds"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_shortcut_rows_claim_the_same_keys() {
+        // A duplicate row is how "Alt+Up" came to be listed twice.
+        let mut seen: Vec<&str> = Vec::new();
+        for (_, rows) in SHORTCUT_GROUPS {
+            for (label, keys) in rows.iter() {
+                for key in keys.split(" / ") {
+                    assert!(
+                        !seen.contains(&key),
+                        "{key:?} is claimed by more than one row ({label:?})"
+                    );
+                    seen.push(key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_shortcut_row_has_a_label_and_keys() {
+        for (group, rows) in SHORTCUT_GROUPS {
+            assert!(!group.is_empty());
+            for (label, keys) in rows.iter() {
+                assert!(!label.trim().is_empty(), "{group}: a row has no label");
+                assert!(!keys.trim().is_empty(), "{label}: a row has no keys");
+            }
         }
     }
 

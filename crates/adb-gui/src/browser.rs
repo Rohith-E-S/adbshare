@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::icons::{self, names};
 use crate::prefs;
-use crate::protocol::{DirEntry, contains_ignore_case, human_size};
+use crate::protocol::{DirEntry, SortKey, contains_ignore_case, human_size, sort_entries};
 use crate::theme::{self, Themed};
 use crate::ui;
 
@@ -59,6 +59,7 @@ actions!(
         NewFolder,
         RenameFocused,
         DeleteSelection,
+        DeletePermanently,
         Up,
         Back,
         Forward,
@@ -76,34 +77,88 @@ actions!(
 /// The key context the browser registers its actions under.
 pub const BROWSER_CONTEXT: &str = "Browser";
 
+/// One entry in a binding table: the key spelling, and a factory for the
+/// `KeyBinding` it builds.
+pub type Binding = (&'static str, fn() -> KeyBinding);
+
+/// Every key binding the browser registers, as `(keys, factory)`.
+///
+/// Held as data rather than a bare `bind_keys` call so the shortcuts dialog can
+/// be checked against what is actually bound. A test asserts the dialog claims
+/// no key the browser does not bind — which is how the dialog came to promise
+/// Alt+T for "open in terminal" when Alt+T actually switches the view.
+///
+/// The factory exists because each `actions!` entry is its own type, so the
+/// bindings cannot be one homogeneous array.
+pub const BINDINGS: &[Binding] = &[
+    ("secondary-a", || {
+        KeyBinding::new("secondary-a", SelectAll, None)
+    }),
+    ("escape", || KeyBinding::new("escape", Deselect, None)),
+    ("delete", || {
+        KeyBinding::new("delete", DeleteSelection, None)
+    }),
+    // Delete is recoverable on the disk and permanent on a device; Shift+Delete
+    // is always permanent, which is what the context menu has always said.
+    ("shift-delete", || {
+        KeyBinding::new("shift-delete", DeletePermanently, None)
+    }),
+    ("f2", || KeyBinding::new("f2", RenameFocused, None)),
+    // The dialog and the overflow menu both advertise this, so it has to exist.
+    ("secondary-n", || {
+        KeyBinding::new("secondary-n", NewFolder, None)
+    }),
+    ("alt-left", || KeyBinding::new("alt-left", Back, None)),
+    ("alt-right", || KeyBinding::new("alt-right", Forward, None)),
+    ("alt-up", || KeyBinding::new("alt-up", Up, None)),
+    ("f5", || KeyBinding::new("f5", Refresh, None)),
+    ("secondary-f", || {
+        KeyBinding::new("secondary-f", ToggleSearch, None)
+    }),
+    ("secondary-l", || {
+        KeyBinding::new("secondary-l", TogglePathEntry, None)
+    }),
+    ("secondary-shift-c", || {
+        KeyBinding::new("secondary-shift-c", CopySelection, None)
+    }),
+    ("secondary-c", || {
+        KeyBinding::new("secondary-c", CopySelection, None)
+    }),
+    ("secondary-v", || {
+        KeyBinding::new("secondary-v", Paste, None)
+    }),
+    ("secondary-u", || {
+        KeyBinding::new("secondary-u", Paste, None)
+    }),
+    ("secondary-equal", || {
+        KeyBinding::new("secondary-equal", ZoomIn, None)
+    }),
+    ("secondary-plus", || {
+        KeyBinding::new("secondary-plus", ZoomIn, None)
+    }),
+    ("secondary-minus", || {
+        KeyBinding::new("secondary-minus", ZoomOut, None)
+    }),
+    ("alt-t", || KeyBinding::new("alt-t", ToggleView, None)),
+    ("up", || KeyBinding::new("up", FocusPrevious, None)),
+    ("down", || KeyBinding::new("down", FocusNext, None)),
+    ("home", || KeyBinding::new("home", FocusFirst, None)),
+    ("end", || KeyBinding::new("end", FocusLast, None)),
+];
+
 /// Register the browser's key bindings. Called once from `main`.
+///
+/// `secondary-` is Ctrl on Linux and Cmd on macOS; writing `cmd-` here would
+/// bind the Super key, which is not what a file manager should use.
 pub fn install_key_bindings(cx: &mut gpui::App) {
-    // `secondary-` is Ctrl on Linux and Cmd on macOS. Writing `cmd-` here would
-    // bind the Super key, which is not what a file manager should use.
-    cx.bind_keys([
-        KeyBinding::new("secondary-a", SelectAll, None),
-        KeyBinding::new("escape", Deselect, None),
-        KeyBinding::new("delete", DeleteSelection, None),
-        KeyBinding::new("f2", RenameFocused, None),
-        KeyBinding::new("alt-left", Back, None),
-        KeyBinding::new("alt-right", Forward, None),
-        KeyBinding::new("alt-up", Up, None),
-        KeyBinding::new("f5", Refresh, None),
-        KeyBinding::new("secondary-f", ToggleSearch, None),
-        KeyBinding::new("secondary-l", TogglePathEntry, None),
-        KeyBinding::new("secondary-shift-c", CopySelection, None),
-        KeyBinding::new("secondary-c", CopySelection, None),
-        KeyBinding::new("secondary-v", Paste, None),
-        KeyBinding::new("secondary-u", Paste, None),
-        KeyBinding::new("secondary-equal", ZoomIn, None),
-        KeyBinding::new("secondary-plus", ZoomIn, None),
-        KeyBinding::new("secondary-minus", ZoomOut, None),
-        KeyBinding::new("alt-t", ToggleView, None),
-        KeyBinding::new("up", FocusPrevious, None),
-        KeyBinding::new("down", FocusNext, None),
-        KeyBinding::new("home", FocusFirst, None),
-        KeyBinding::new("end", FocusLast, None),
-    ]);
+    cx.bind_keys(BINDINGS.iter().map(|(_, make)| make()));
+}
+
+/// Whether `keys` is bound by the browser or by the app root.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_bound(keys: &str) -> bool {
+    BINDINGS.iter().any(|(bound, _)| *bound == keys)
+        || crate::app::BINDINGS.iter().any(|(bound, _)| *bound == keys)
 }
 
 /// Anything the browser asks the app to do.
@@ -210,6 +265,9 @@ pub struct Browser {
     // ── Presentation ───────────────────────────────────────────────────────
     view_mode: ViewMode,
     show_hidden: bool,
+    /// What listings are ordered by, and whether that order is reversed.
+    sort_key: SortKey,
+    sort_descending: bool,
     zoom: f32,
     search_query: String,
     search_active: bool,
@@ -259,6 +317,8 @@ impl Browser {
             navigating_history: false,
             view_mode: ViewMode::Grid,
             show_hidden: false,
+            sort_key: SortKey::Name,
+            sort_descending: false,
             zoom: prefs::ZOOM_DEFAULT,
             search_query: String::new(),
             search_active: false,
@@ -375,14 +435,14 @@ impl Browser {
     /// Apply the persisted view preferences.
     pub fn apply_preferences(
         &mut self,
-        zoom: f32,
-        view_mode: ViewMode,
-        show_hidden: bool,
+        prefs: crate::prefs::ViewPreferences,
         cx: &mut Context<Self>,
     ) {
-        self.zoom = step_zoom(zoom, 0.0);
-        self.view_mode = view_mode;
-        self.show_hidden = show_hidden;
+        self.zoom = step_zoom(prefs.zoom, 0.0);
+        self.view_mode = prefs.view_mode;
+        self.show_hidden = prefs.show_hidden;
+        self.sort_key = prefs.sort_key;
+        self.sort_descending = prefs.sort_descending;
         self.recompute_visible();
         cx.notify();
     }
@@ -508,6 +568,32 @@ impl Browser {
 
     /// Report where the file area is laid out, so rubber-band hit-testing has
     /// exact geometry to work from.
+    /// What listings are currently ordered by.
+    pub fn sort_key(&self) -> SortKey {
+        self.sort_key
+    }
+
+    /// Whether the current order is reversed.
+    pub fn sort_descending(&self) -> bool {
+        self.sort_descending
+    }
+
+    /// Change how listings are ordered and re-sort what is on screen.
+    pub fn set_sort(&mut self, key: SortKey, descending: bool, cx: &mut Context<Self>) {
+        self.sort_key = key;
+        self.sort_descending = descending;
+        self.apply_sort(cx);
+    }
+
+    /// Re-sort the current listing in place.
+    ///
+    /// The daemon returns device listings folders-first by name, so the sort
+    /// has to be re-applied here for the other keys to mean anything.
+    pub fn apply_sort(&mut self, cx: &mut Context<Self>) {
+        sort_entries(&mut self.entries, self.sort_key, self.sort_descending);
+        cx.notify();
+    }
+
     /// The current grid icon size.
     pub fn zoom(&self) -> f32 {
         self.zoom
@@ -535,7 +621,8 @@ impl Browser {
 
     /// The state part of [`Self::set_entries`], so it can be driven without a
     /// `Context`.
-    pub fn install_entries(&mut self, entries: Vec<DirEntry>) {
+    pub fn install_entries(&mut self, mut entries: Vec<DirEntry>) {
+        sort_entries(&mut entries, self.sort_key, self.sort_descending);
         self.entries = entries;
         self.selection.clear();
         self.focused = None;
@@ -787,6 +874,18 @@ impl Browser {
         if self.delete_is_recoverable() {
             cx.emit(BrowserEvent::Trash(selected));
         } else {
+            cx.emit(BrowserEvent::DeletePermanently(selected));
+        }
+    }
+
+    fn delete_permanently(
+        &mut self,
+        _: &DeletePermanently,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.selected();
+        if !selected.is_empty() {
             cx.emit(BrowserEvent::DeletePermanently(selected));
         }
     }
@@ -1736,6 +1835,7 @@ impl Render for Browser {
             .on_action(cx.listener(Self::new_folder))
             .on_action(cx.listener(Self::rename_focused))
             .on_action(cx.listener(Self::delete_selection))
+            .on_action(cx.listener(Self::delete_permanently))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::back))
             .on_action(cx.listener(Self::forward))
@@ -2367,7 +2467,12 @@ mod tests {
             let b = handle.root(app).expect("root view");
             b.update(app, |b, _| {
                 b.install_entries(vec![entry("keep", false), entry("drop", false)]);
-                b.click_row(1, false);
+                // Entries are sorted on the way in, so find the row by name
+                // rather than assuming an index.
+                let drop = (0..b.entries.len())
+                    .find(|ix| b.entries[*ix].name == "drop")
+                    .expect("the entry is present");
+                b.click_row(drop, false);
                 assert_eq!(b.selected().len(), 1);
 
                 b.set_search_query_raw("keep".into());
@@ -2791,7 +2896,7 @@ mod tests {
             for _ in 0..8 {
                 let mut copy = entries.clone();
                 let start = std::time::Instant::now();
-                crate::protocol::sort_by_folder_then_name(&mut copy);
+                crate::protocol::sort_entries(&mut copy, crate::protocol::SortKey::Name, false);
                 best = best.min(start.elapsed().as_secs_f64() * 1000.0);
                 std::hint::black_box(&copy);
             }

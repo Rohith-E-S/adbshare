@@ -42,6 +42,7 @@ asset_table! {
     "icons/edit-delete.svg" => "../assets/icons/edit-delete.svg",
     "icons/edit-find.svg" => "../assets/icons/edit-find.svg",
     "icons/edit-paste.svg" => "../assets/icons/edit-paste.svg",
+    "icons/edit-undo.svg" => "../assets/icons/edit-undo.svg",
     "icons/emblem-synchronizing.svg" => "../assets/icons/emblem-synchronizing.svg",
     "icons/folder.svg" => "../assets/icons/folder.svg",
     "icons/folder-documents.svg" => "../assets/icons/folder-documents.svg",
@@ -135,6 +136,7 @@ pub mod names {
     pub const EDIT_DELETE: &str = "edit-delete";
     pub const EDIT_FIND: &str = "edit-find";
     pub const EDIT_PASTE: &str = "edit-paste";
+    pub const EDIT_UNDO: &str = "edit-undo";
     pub const EMBLEM_SYNC: &str = "emblem-synchronizing";
     pub const FOLDER: &str = "folder";
     pub const FOLDER_DOCUMENTS: &str = "folder-documents";
