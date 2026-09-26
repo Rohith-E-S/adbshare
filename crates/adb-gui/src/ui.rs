@@ -11,13 +11,13 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Div, ElementId, FontWeight, Rgba, Stateful, StatefulInteractiveElement, Styled,
-    Window, deferred, div, px, relative, rgba,
+    AnyElement, AnyView, App, Div, ElementId, FontWeight, Rgba, Stateful,
+    StatefulInteractiveElement, Styled, Window, deferred, div, px, relative, rgba,
 };
 
 use crate::icons::{self, names};
 use crate::protocol::StateTone;
-use crate::theme::{self, Palette};
+use crate::theme::{self, Palette, Themed};
 
 /// Build an [`ElementId`] from a runtime string.
 ///
@@ -40,7 +40,7 @@ pub fn icon_button(
     size: f32,
     tint: Rgba,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -64,7 +64,7 @@ pub fn icon_button_active(
     size: f32,
     active: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let tint = if active { t.text_header } else { t.text_dim };
     div()
         .id(id)
@@ -391,6 +391,85 @@ pub fn breadcrumb_separator(t: &Palette) -> Div {
         .child(icons::icon(names::GO_NEXT, 11.0, t.text_muted))
 }
 
+// ── Tooltips ─────────────────────────────────────────────────────────────────
+//
+// A tooltip's colours come from the installed palette rather than being passed
+// in, because GPUI builds the tooltip inside a closure that only receives
+// `&mut App` — no view state, and so no `&Palette` to hand it.
+
+/// A small bubble with a line of text, shown on hover.
+///
+/// A view rather than a bare element because GPUI's `tooltip` takes an
+/// `AnyView`, which is a thing it can render later, not an element it paints
+/// now.
+///
+/// Icons in the tool bar and sidebar carry no visible label, so without this the
+/// chrome asks the user to guess what a glyph means.
+pub struct Tooltip {
+    label: gpui::SharedString,
+}
+
+impl Render for Tooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme();
+        div()
+            .max_w(px(280.0))
+            .px(px(9.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            // A tooltip is an overlay, so it sits above every surface.
+            .bg(t.tooltip)
+            .text_color(t.tooltip_text)
+            .border_1()
+            .border_color(t.tooltip_border)
+            .shadow_lg()
+            .text_size(px(11.0))
+            .line_height(relative(1.35))
+            .whitespace_normal()
+            .child(self.label.clone())
+    }
+}
+
+/// Build the hover hint for a label.
+pub fn hover_hint(
+    label: impl Into<gpui::SharedString> + 'static,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    // Converted once here rather than per hover: `SharedString` is a cheap Arc
+    // clone, and the closure has to be `Fn` because the tooltip may be shown
+    // repeatedly.
+    let label: gpui::SharedString = label.into();
+    move |_window, cx: &mut App| {
+        let label = label.clone();
+        AnyView::from(cx.new(|_cx| Tooltip { label }))
+    }
+}
+
+/// Attach a hover hint to an icon button.
+pub fn icon_button_with_hint(
+    t: &Palette,
+    id: impl Into<ElementId>,
+    icon: &'static str,
+    size: f32,
+    tint: Rgba,
+    hint: impl Into<gpui::SharedString> + 'static,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    icon_button(t, id, icon, size, tint, on_click).tooltip(hover_hint(hint.into()))
+}
+
+/// Attach a hover hint to a toggling icon button.
+pub fn icon_button_active_with_hint(
+    t: &Palette,
+    id: impl Into<ElementId>,
+    icon: &'static str,
+    size: f32,
+    active: bool,
+    hint: impl Into<gpui::SharedString> + 'static,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    icon_button_active(t, id, icon, size, active, on_click).tooltip(hover_hint(hint.into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +557,50 @@ mod tests {
             DefaultAppearance::from(gpui::WindowAppearance::Dark),
             DefaultAppearance::Dark
         );
+    }
+
+    /// The hover hint is a real view, so it has to lay out and read its colours
+    /// from the installed palette.
+    ///
+    /// The hover *trigger* is GPUI's own `tooltip`, attached to the buttons; what
+    /// this covers is that the bubble itself is well formed, which a missing
+    /// palette entry or a bad size would break.
+    #[gpui::test]
+    async fn the_tooltip_view_lays_out(cx: &mut gpui::TestAppContext) {
+        // The palette is a global, and a bare test context has none.
+        cx.update(crate::theme::install);
+        let (tooltip, vctx) = cx.add_window_view(|_w, _cx| Tooltip {
+            label: "Save to this computer".into(),
+        });
+
+        let _ = vctx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(400.), px(200.)),
+            |_w, _cx| tooltip.clone(),
+        );
+
+        cx.update(|app| {
+            let t = app.theme();
+            // A tooltip has to be opaque enough to read against whatever it
+            // hovers, and its ink has to contrast.
+            assert!(t.tooltip.a >= 0.9, "the tooltip surface is see-through");
+            let lum = |c: Rgba| {
+                let f = |v: f32| {
+                    if v <= 0.03928 {
+                        v / 12.92
+                    } else {
+                        ((v + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+            };
+            let (ink, bg) = (lum(t.tooltip_text), lum(t.tooltip));
+            let ratio = (ink.max(bg) + 0.05) / (ink.min(bg) + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "tooltip text is only {ratio:.1}:1 on its bubble"
+            );
+        });
     }
 
     #[test]

@@ -454,14 +454,6 @@ impl Browser {
         cx.notify();
     }
 
-    /// Switch between the grid and list layouts.
-    pub fn toggle_view_mode(&mut self) {
-        self.view_mode = match self.view_mode {
-            ViewMode::Grid => ViewMode::List,
-            ViewMode::List => ViewMode::Grid,
-        };
-    }
-
     /// Select every visible row, as Ctrl+A does.
     pub fn select_all_entries(&mut self) {
         self.selection = self.visible.iter().copied().collect();
@@ -856,7 +848,39 @@ impl Browser {
     }
 
     fn toggle_view(&mut self, _: &ToggleView, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_view_mode();
+        self.flip_view_mode(cx);
+    }
+
+    /// Flip between the grid and the list. See [`Self::step_back`] for why the
+    /// top bar calls this directly.
+    pub fn flip_view_mode(&mut self, cx: &mut Context<Self>) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Grid => ViewMode::List,
+            ViewMode::List => ViewMode::Grid,
+        };
+        cx.notify();
+    }
+
+    /// Switch to a specific layout, so each button sets what it names rather
+    /// than toggling: the list button used to switch to the grid when pressed
+    /// while already in the list.
+    pub fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        if self.view_mode != mode {
+            self.view_mode = mode;
+            cx.notify();
+        }
+    }
+
+    /// Show or hide the search strip. See [`Self::step_back`] for why this is
+    /// public.
+    pub fn set_search_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.search_active == active {
+            return;
+        }
+        self.search_active = active;
+        if !active && !self.search_query.is_empty() {
+            self.set_search_query_raw(String::new());
+        }
         cx.notify();
     }
 
@@ -898,19 +922,38 @@ impl Browser {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_up(cx);
+    }
+
+    /// Go to the parent directory. See [`Self::step_back`] for why this is public.
+    pub fn step_up(&mut self, cx: &mut Context<Self>) {
         if self.can_go_up() {
             cx.emit(BrowserEvent::Up);
         }
     }
 
     fn back(&mut self, _: &Back, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_back(cx);
+    }
+
+    fn forward(&mut self, _: &Forward, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_forward(cx);
+    }
+
+    /// Go back one directory, asking the app for the listing.
+    ///
+    /// Public because the top bar's back button drives this directly. It used to
+    /// dispatch the `Back` action instead, which travels the focus path — and
+    /// nothing ever focuses the browser, so the button did nothing at all.
+    pub fn step_back(&mut self, cx: &mut Context<Self>) {
         if let Some(target) = self.go_back() {
             cx.notify();
             cx.emit(BrowserEvent::OpenedDirectory(target));
         }
     }
 
-    fn forward(&mut self, _: &Forward, _: &mut Window, cx: &mut Context<Self>) {
+    /// Go forward one directory. See [`Self::step_back`] for why this is public.
+    pub fn step_forward(&mut self, cx: &mut Context<Self>) {
         if let Some(target) = self.go_forward() {
             cx.notify();
             cx.emit(BrowserEvent::OpenedDirectory(target));
@@ -918,6 +961,11 @@ impl Browser {
     }
 
     fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_refresh(cx);
+    }
+
+    /// Ask for the listing again. See [`Self::step_back`] for why this is public.
+    pub fn step_refresh(&mut self, cx: &mut Context<Self>) {
         cx.emit(BrowserEvent::Refresh);
     }
 
@@ -930,11 +978,8 @@ impl Browser {
     }
 
     fn toggle_search(&mut self, _: &ToggleSearch, _: &mut Window, cx: &mut Context<Self>) {
-        self.search_active = !self.search_active;
-        if !self.search_active && !self.search_query.is_empty() {
-            self.set_search_query_raw(String::new());
-        }
-        cx.notify();
+        let next = !self.search_active;
+        self.set_search_active(next, cx);
     }
 
     fn focus_previous(&mut self, _: &FocusPrevious, window: &mut Window, cx: &mut Context<Self>) {
@@ -2810,6 +2855,78 @@ mod tests {
                     "with no focused row the selection is used"
                 );
             });
+        });
+    }
+
+    /// The top bar's buttons drive the browser directly, so they need a public
+    /// entry point for each. These cover the ones the top bar calls, because
+    /// they used to dispatch an action instead — and an action travels the focus
+    /// path, which nothing ever entered, so the buttons did nothing at all.
+    #[gpui::test]
+    async fn the_top_bar_buttons_can_drive_the_browser(cx: &mut TestAppContext) {
+        let handle = open(cx);
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| {
+                b.device = Some("s".into());
+                b.install_entries(vec![entry("a", false), entry("b", true)]);
+                b.navigate(PathBuf::from("/sdcard/Download"));
+                cx.notify();
+            });
+        });
+
+        // The two layout buttons set what they name, so the list button does not
+        // switch back to the grid when pressed while already in the list.
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| b.set_view_mode(ViewMode::List, cx));
+            assert_eq!(browser.read(app).view_mode(), ViewMode::List);
+            browser.update(app, |b, cx| b.set_view_mode(ViewMode::List, cx));
+            assert_eq!(
+                browser.read(app).view_mode(),
+                ViewMode::List,
+                "pressing the active layout button must not flip it"
+            );
+            browser.update(app, |b, cx| b.set_view_mode(ViewMode::Grid, cx));
+            assert_eq!(browser.read(app).view_mode(), ViewMode::Grid);
+            browser.update(app, |b, cx| b.flip_view_mode(cx));
+            assert_eq!(browser.read(app).view_mode(), ViewMode::List);
+        });
+
+        // Search toggles both ways and clears the query on close.
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| b.set_search_active(true, cx));
+            assert!(browser.read(app).search_active());
+            browser.update(app, |b, _cx| b.set_search_query_raw("a".into()));
+            browser.update(app, |b, cx| b.set_search_active(false, cx));
+            let b = browser.read(app);
+            assert!(!b.search_active());
+            assert_eq!(b.search_query, "", "closing search clears the query");
+        });
+
+        // Navigation moves the browser and asks for the new listing.
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            browser.update(app, |b, cx| {
+                b.navigate(PathBuf::from("/sdcard/DCIM"));
+                b.step_back(cx);
+            });
+            assert_eq!(
+                browser.read(app).path(),
+                Path::new("/sdcard/Download"),
+                "back returns to the previous directory"
+            );
+
+            browser.update(app, |b, cx| b.step_forward(cx));
+            assert_eq!(browser.read(app).path(), Path::new("/sdcard/DCIM"));
+
+            // `up` at the root is a no-op rather than an error.
+            browser.update(app, |b, cx| {
+                b.navigate(PathBuf::from("/"));
+                b.step_up(cx);
+            });
+            assert_eq!(browser.read(app).path(), Path::new("/"));
         });
     }
 

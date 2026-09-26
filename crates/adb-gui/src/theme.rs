@@ -113,6 +113,13 @@ pub struct Palette {
     pub danger_soft: Rgba,
     /// `error` at medium opacity, for that panel's border.
     pub danger_border: Rgba,
+
+    /// A tooltip is an overlay, so it sits above every surface: One Dark's
+    /// `overlay.background`, with `text` on top.
+    pub tooltip: Rgba,
+    pub tooltip_text: Rgba,
+    /// The border around a tooltip, `border`.
+    pub tooltip_border: Rgba,
 }
 
 impl Palette {
@@ -161,6 +168,10 @@ impl Palette {
             danger: rgba(0xD07277FF),
             danger_soft: rgba(0xD0727726),
             danger_border: rgba(0xD0727773),
+
+            tooltip: rgba(0x1B1F26F2),
+            tooltip_text: rgba(0xDCE0E5FF),
+            tooltip_border: rgba(0x464B57FF),
         }
     }
 }

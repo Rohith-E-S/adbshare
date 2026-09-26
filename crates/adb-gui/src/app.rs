@@ -38,6 +38,9 @@ use crate::theme::{self, Themed};
 use crate::toast::{ActionId, ToastStack, ToastTone};
 use crate::ui;
 
+/// The application's name, as it appears in a window title.
+const APP_NAME: &str = "ADBShare";
+
 /// How often the device list is refreshed.
 const DEVICE_POLL: Duration = Duration::from_secs(3);
 /// How often the transfer queue is refreshed. Much faster than the device poll
@@ -165,6 +168,8 @@ pub struct AdbShareApp {
     clipboard: Option<ClipboardFiles>,
 
     toasts: ToastStack,
+    /// The title last pushed to the platform, so it is only sent on a change.
+    last_title: Option<String>,
     /// Consecutive failed device polls. The first failure is usually just the
     /// daemon still starting; by the second, the user needs telling.
     daemon_failures: u32,
@@ -223,6 +228,7 @@ impl AdbShareApp {
             pair_code_field: cx.new(|cx| TextField::new(cx, "000000").monospace()),
             clipboard: None,
             toasts: ToastStack::default(),
+            last_title: None,
             daemon_failures: 0,
             daemon_error: None,
             focus: cx.focus_handle(),
@@ -2232,40 +2238,58 @@ impl AdbShareApp {
             // Grid/list switch plus search, the way the old view capsule did.
             let grid = self.browser.read(cx).view_mode() == ViewMode::Grid;
             let search_on = self.browser.read(cx).search_active();
+            let browser = self.browser.clone();
             capsules.push(
                 ui::capsule([
-                    ui::icon_button_active(
+                    // Each button sets the layout it names. They used to both
+                    // dispatch the toggle action, which meant the list button
+                    // switched to the grid when pressed while already in the
+                    // list.
+                    ui::icon_button_active_with_hint(
                         t,
                         "view-grid",
                         names::VIEW_GRID,
                         theme::CAPSULE_BTN,
                         grid,
-                        cx.listener(|_this, _e, _w, cx| {
-                            cx.dispatch_action(&crate::browser::ToggleView);
-                        }),
+                        "Grid view",
+                        {
+                            let browser = browser.clone();
+                            move |_, _w, cx| {
+                                browser.update(cx, |b, cx| b.set_view_mode(ViewMode::Grid, cx));
+                            }
+                        },
                     )
                     .into_any_element(),
-                    ui::icon_button_active(
+                    ui::icon_button_active_with_hint(
                         t,
                         "view-list",
                         names::VIEW_LIST,
                         theme::CAPSULE_BTN,
                         !grid,
-                        cx.listener(|_this, _e, _w, cx| {
-                            cx.dispatch_action(&crate::browser::ToggleView);
-                        }),
+                        "List view (Alt+T)",
+                        {
+                            let browser = browser.clone();
+                            move |_, _w, cx| {
+                                browser.update(cx, |b, cx| b.set_view_mode(ViewMode::List, cx));
+                            }
+                        },
                     )
                     .into_any_element(),
                     ui::capsule_separator(t).into_any_element(),
-                    ui::icon_button_active(
+                    ui::icon_button_active_with_hint(
                         t,
                         "search",
                         names::EDIT_FIND,
                         theme::CAPSULE_BTN,
                         search_on,
-                        cx.listener(|_this, _e, _w, cx| {
-                            cx.dispatch_action(&crate::browser::ToggleSearch);
-                        }),
+                        "Search this folder (Ctrl+F)",
+                        {
+                            let browser = browser.clone();
+                            let next = !search_on;
+                            move |_, _w, cx| {
+                                browser.update(cx, |b, cx| b.set_search_active(next, cx));
+                            }
+                        },
                     )
                     .into_any_element(),
                 ])
@@ -2293,6 +2317,19 @@ impl AdbShareApp {
             .into_any_element()
     }
 
+    /// What a navigation button says on hover.
+    ///
+    /// These glyphs have no visible label anywhere, and the shortcuts are not
+    /// discoverable from the chrome, so each button explains itself.
+    fn nav_hint(id: &str) -> String {
+        match id {
+            "back" => "Back".into(),
+            "forward" => "Forward".into(),
+            "up" => "Up one folder".into(),
+            _ => "Refresh".into(),
+        }
+    }
+
     /// A navigation button that is dimmed when there is nowhere to go.
     fn nav_button(
         &self,
@@ -2311,23 +2348,25 @@ impl AdbShareApp {
         if !enabled {
             return ui::icon_button_disabled(t, icon, theme::CAPSULE_BTN).into_any_element();
         }
-        ui::icon_button(
+        let browser = browser.clone();
+        let label = Self::nav_hint(id);
+        ui::icon_button_with_hint(
             t,
             id,
             icon,
             theme::CAPSULE_BTN,
             t.text_dim,
-            move |_, window, cx| {
-                // Navigation is a browser action, so dispatch it rather than
-                // reimplementing the history here.
-                let action: Box<dyn gpui::Action> = match id {
-                    "back" => Box::new(crate::browser::Back),
-                    "forward" => Box::new(crate::browser::Forward),
-                    "up" => Box::new(crate::browser::Up),
-                    _ => Box::new(crate::browser::Refresh),
-                };
-                cx.dispatch_action(action.as_ref());
-                let _ = window;
+            label,
+            move |_, _window, cx| {
+                // Driven directly rather than by dispatching the action: an
+                // action travels the focus path, and nothing focuses the
+                // browser, so these buttons used to do nothing.
+                browser.update(cx, |b, cx| match id {
+                    "back" => b.step_back(cx),
+                    "forward" => b.step_forward(cx),
+                    "up" => b.step_up(cx),
+                    _ => b.step_refresh(cx),
+                });
             },
         )
         .into_any_element()
@@ -2462,6 +2501,7 @@ impl AdbShareApp {
                 this.overflow_open = false;
                 cx.notify();
             }))
+            .tooltip(ui::hover_hint("Transfers"))
             .into_any_element()
     }
 
@@ -2482,6 +2522,7 @@ impl AdbShareApp {
                 this.transfers_open = false;
                 cx.notify();
             }))
+            .tooltip(ui::hover_hint("More actions"))
             .into_any_element()
     }
 
@@ -2753,6 +2794,7 @@ impl AdbShareApp {
                 .on_click(cx.listener(|this, _e, _w, cx| {
                     this.on_menu_select("connect-wifi", cx);
                 }))
+                .tooltip(ui::hover_hint("Pair with a phone over wireless debugging"))
                 .into_any_element(),
         );
 
@@ -3224,20 +3266,18 @@ impl Render for AdbShareApp {
 
         // The window title says where the user is, or which dialog is in the
         // way. Both matter once more than one window is open.
-        let heading = self.dialog.heading();
-        if heading.is_empty() {
-            let target = if self.browser.read(cx).has_device() {
-                let name = self.browser.read(cx).path().display().to_string();
-                match name.rsplit('/').find(|part| !part.is_empty()) {
-                    Some(last) if name != "/" => format!("{last} — ADBShare"),
-                    _ => "ADBShare".to_string(),
-                }
-            } else {
-                "ADBShare".to_string()
-            };
+        //
+        // Only pushed when it changes. Setting it is a platform round trip, and
+        // doing that on every frame made the Wayland backend re-enter the window
+        // while a render was already in flight, which it reports as
+        // "window not found" once per navigation.
+        let target = {
+            let browser = self.browser.read(cx);
+            window_title(self.dialog.heading(), browser.has_device(), browser.path())
+        };
+        if self.last_title.as_deref() != Some(target.as_str()) {
             window.set_window_title(&target);
-        } else {
-            window.set_window_title(heading);
+            self.last_title = Some(target);
         }
 
         let show_sidebar = self.layout != Layout::Narrow && self.sidebar_visible;
@@ -3366,6 +3406,24 @@ impl AdbShareApp {
     }
 }
 
+/// The title to show for the window.
+///
+/// A dialog's heading wins, so the window manager and the taskbar say what is
+/// in the way. Otherwise the current directory's name, which is what tells two
+/// windows apart. `path` is only meaningful when there is a target to browse.
+fn window_title(heading: &str, has_target: bool, path: &Path) -> String {
+    if !heading.is_empty() {
+        return heading.to_string();
+    }
+    if !has_target || path == Path::new("/") {
+        return APP_NAME.to_string();
+    }
+    match path.file_name().map(|n| n.to_string_lossy().to_string()) {
+        Some(name) if !name.is_empty() => format!("{name} \u{2014} {APP_NAME}"),
+        _ => APP_NAME.to_string(),
+    }
+}
+
 /// What the shared name field is collecting.
 enum NamePurpose {
     CreateFolder,
@@ -3402,6 +3460,33 @@ mod tests {
         });
         let saved = Preferences::default();
         cx.new(|cx| AdbShareApp::new(cx, &saved))
+    }
+
+    #[test]
+    fn the_window_title_follows_where_the_user_is() {
+        use std::path::Path;
+        // Nothing to browse: just the app name.
+        assert_eq!(window_title("", false, Path::new("/")), APP_NAME);
+
+        // A dialog's heading wins, so the taskbar says what is in the way.
+        assert_eq!(
+            window_title("Rename", true, Path::new("/sdcard/DCIM")),
+            "Rename"
+        );
+
+        // Otherwise the directory's own name tells two windows apart.
+        assert_eq!(
+            window_title("", true, Path::new("/home/me/Downloads")),
+            "Downloads \u{2014} ADBShare"
+        );
+        assert_eq!(
+            window_title("", true, Path::new("/home/me/caf\u{e9}")),
+            "caf\u{e9} \u{2014} ADBShare",
+            "a non-ASCII directory name survives"
+        );
+
+        // The root of a target has no name of its own to show.
+        assert_eq!(window_title("", true, Path::new("/")), APP_NAME);
     }
 
     #[gpui::test]
