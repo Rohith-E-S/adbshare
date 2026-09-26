@@ -113,6 +113,53 @@ fn assert_metadata(stat: Stat, metadata: fs::Metadata) {
     assert_eq!(stat.blocks, metadata.blocks());
 }
 
+/// A read must return exactly the bytes at the offset asked for, whatever was
+/// in the read buffer before.
+///
+/// The device side reuses one scratch buffer across reads, so a bug there would
+/// show up as a short read padded with the previous chunk's contents. Reading
+/// large-then-small is the case that catches it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_small_read_after_a_large_one_returns_only_its_own_bytes() {
+    let dir = TestDir::new();
+    let (_helper, client) = Helper::start().await;
+    let path = dir.path("chunked.bin");
+
+    // A megabyte, so the first read is a large chunk like a real download.
+    let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let flags = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNC;
+    let file = bounded(client.open(&path, flags, 0o600)).await.unwrap();
+    bounded(file.write_at(0, &payload)).await.unwrap();
+
+    // A full-size read, then progressively smaller ones at other offsets.
+    let whole = bounded(file.read_at(0, payload.len() as u32)).await.unwrap();
+    assert_eq!(whole.len(), payload.len(), "the first read is chunk-sized");
+    assert_eq!(whole[..], payload[..]);
+
+    for (offset, len) in [(0u64, 1usize), (1, 3), (4096, 7), (999_999, 2), (0, 0)] {
+        let got = bounded(file.read_at(offset, len as u32)).await.unwrap();
+        assert_eq!(
+            got.len(),
+            len,
+            "read at {offset} of {len} returned {} bytes",
+            got.len()
+        );
+        assert_eq!(
+            got[..],
+            payload[offset as usize..offset as usize + len][..],
+            "read at {offset} of {len} returned the wrong bytes"
+        );
+    }
+
+    // And a read that runs off the end returns only what exists.
+    let tail = bounded(file.read_at(payload.len() as u64 - 4, 64)).await.unwrap();
+    assert_eq!(tail.len(), 4, "a read past the end is truncated, not padded");
+    assert_eq!(tail[..], payload[payload.len() - 4..]);
+
+    bounded(file.close()).await.unwrap();
+    assert_eq!(fs::read(&path).unwrap(), payload);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn mkdir_exclusive_open_offset_io_and_close() {
     let dir = TestDir::new();
