@@ -172,6 +172,37 @@ where
         .unwrap_or_else(|_| Err("the D-Bus task ended without a reply".into()))
 }
 
+/// Turn a D-Bus failure into something a person can act on.
+///
+/// The raw errors are developer-facing — `org.freedesktop.DBus.Error.
+/// ServiceUnknown: The name is not activatable` says nothing to someone whose
+/// daemon simply is not running, and the common causes have different fixes.
+pub fn explain(err: &str) -> String {
+    if err.contains("ServiceUnknown") || err.contains("was not provided by any .service files") {
+        return "The daemon is not running and could not be started automatically. \
+                Start it yourself with `adb-daemon`, or check that it is on PATH."
+            .to_string();
+    }
+    if err.contains("NameHasNoOwner") {
+        return "The daemon is not running. Start it with `adb-daemon`.".to_string();
+    }
+    if err.contains("AccessDenied") || err.contains("not allowed") {
+        return "The session bus refused the connection. Check that you are in a desktop \
+                session and that the bus policy allows it."
+            .to_string();
+    }
+    if err.contains("timed out") || err.contains("Timeout") {
+        return "The daemon did not answer in time. It may be busy or stuck; check its log."
+            .to_string();
+    }
+    if err.contains("D-Bus runtime") {
+        return "The D-Bus client could not start.".to_string();
+    }
+    // Anything else is passed through: a specific error is usually the useful
+    // one, and the reason is shown verbatim in the sidebar.
+    err.to_string()
+}
+
 async fn get_manager() -> anyhow::Result<&'static ManagerProxy<'static>> {
     MANAGER
         .get_or_try_init(|| async {
@@ -605,6 +636,35 @@ mod tests {
 
         std::fs::remove_dir_all(&good).ok();
         std::fs::remove_dir_all(&empty).ok();
+    }
+
+    #[test]
+    fn common_dbus_failures_are_translated_into_advice() {
+        // A name that cannot be activated is the overwhelmingly common case:
+        // the daemon is not running and could not be started.
+        for raw in [
+            "org.freedesktop.DBus.Error.ServiceUnknown: The name org.adbshare.Manager was not provided by any .service files",
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+        ] {
+            let advice = explain(raw);
+            assert!(
+                advice.contains("adb-daemon"),
+                "{raw:?} should point at the daemon, got {advice:?}"
+            );
+            assert!(
+                !advice.contains("org.freedesktop"),
+                "the D-Bus error name should not leak to the user: {advice:?}"
+            );
+        }
+        assert!(explain("AccessDenied").contains("desktop session"));
+        assert!(explain("request timed out").contains("log"));
+    }
+
+    #[test]
+    fn an_unrecognised_error_is_passed_through_verbatim() {
+        // A specific error is usually the useful one, and the sidebar shows it.
+        let raw = "device 'emulator-5554' not found";
+        assert_eq!(explain(raw), raw);
     }
 
     #[tokio::test]

@@ -165,6 +165,12 @@ pub struct AdbShareApp {
     clipboard: Option<ClipboardFiles>,
 
     toasts: ToastStack,
+    /// Consecutive failed device polls. The first failure is usually just the
+    /// daemon still starting; by the second, the user needs telling.
+    daemon_failures: u32,
+    /// Set while the daemon is unreachable, so the sidebar can say so instead of
+    /// implying no phone is plugged in.
+    daemon_error: Option<String>,
     focus: FocusHandle,
     /// The last preferences written out, so a save only happens on a real
     /// change.
@@ -176,7 +182,23 @@ impl AdbShareApp {
     /// Build the root view. Passed straight to `Application::open_window`.
     pub fn build(_window: &mut Window, cx: &mut App) -> Entity<Self> {
         let saved = Preferences::load();
-        let view = cx.new(|cx| Self {
+        let view = cx.new(|cx| Self::new(cx, &saved));
+        // The browser's own view preferences live with the rest of them.
+        view.update(cx, |this, cx| {
+            let view_prefs = saved.view();
+            let browser = this.browser.clone();
+            browser.update(cx, |b, cx| b.apply_preferences(view_prefs, cx));
+        });
+        Self::wire_up(&view, cx);
+        view
+    }
+
+    /// Construct the view with the given preferences already applied.
+    ///
+    /// Split out from [`Self::build`] so the state can be exercised without
+    /// opening a window, which is what the daemon-failure tests do.
+    fn new(cx: &mut Context<Self>, saved: &Preferences) -> Self {
+        Self {
             browser: cx.new(Browser::new),
             selection: None,
             devices: Vec::new(),
@@ -196,23 +218,12 @@ impl AdbShareApp {
             pair_code_field: cx.new(|cx| TextField::new(cx, "000000").monospace()),
             clipboard: None,
             toasts: ToastStack::default(),
+            daemon_failures: 0,
+            daemon_error: None,
             focus: cx.focus_handle(),
             saved: saved.clone(),
             subscriptions: Vec::new(),
-        });
-        // The browser's own view preferences live with the rest of them.
-        view.update(cx, |this, cx| {
-            let view_prefs = saved.view();
-            let browser = this.browser.clone();
-            browser.update(cx, |b, cx| b.apply_preferences(view_prefs, cx));
-        });
-        Self::wire_up(&view, cx);
-        // TEMP: open the overflow menu and the local disk for a visual check
-        view.update(cx, |t, cx| {
-            t.select_local(std::path::Path::new("/usr/lib"), cx);
-            t.dialog = Dialog::Shortcuts;
-        });
-        view
+        }
     }
 
     /// The preferences that describe the current view.
@@ -384,19 +395,33 @@ impl AdbShareApp {
 
     fn on_devices_result(&mut self, result: Result<Vec<String>, String>, cx: &mut Context<Self>) {
         let serials = match result {
-            Ok(serials) => serials,
+            Ok(serials) => {
+                self.daemon_failures = 0;
+                self.daemon_error = None;
+                serials
+            }
             Err(err) => {
-                // The daemon may simply not be up yet; complain only if it was
-                // working a moment ago.
-                if !self.devices.is_empty() {
+                self.daemon_failures += 1;
+                let had_devices = !self.devices.is_empty();
+                self.devices.clear();
+                self.selection = None;
+                self.browser.update(cx, |b, cx| b.set_idle(cx));
+
+                // A single failure is usually just the daemon still starting, so
+                // it is not worth a message. Once it has failed twice the user
+                // needs to be told, because an empty sidebar otherwise reads as
+                // "no phone plugged in" and sends them looking for the cable.
+                let repeated = self.daemon_failures >= 2;
+                if repeated || had_devices {
+                    // The raw D-Bus error tells the user nothing; the sidebar
+                    // keeps it for detail but leads with what to do about it.
+                    let advice = daemon::explain(&err);
+                    self.daemon_error = Some(advice);
                     self.toasts.push_with_action(
-                        format!("Lost contact with adb-daemon: {err}"),
+                        "Cannot reach adb-daemon",
                         ToastTone::Error,
                         Some(("Diagnose".into(), ActionId::CopyDiagnostics)),
                     );
-                    self.devices.clear();
-                    self.selection = None;
-                    self.browser.update(cx, |b, cx| b.set_idle(cx));
                 }
                 cx.notify();
                 return;
@@ -2623,9 +2648,61 @@ impl AdbShareApp {
         let mut rows: Vec<AnyElement> = Vec::new();
 
         rows.push(ui::section_heading("Phones & tablets", t).into_any_element());
-        if self.devices.is_empty() {
+        if let Some(error) = self.daemon_error.clone() {
+            // An unreachable daemon and an unplugged phone look identical from
+            // the device list alone, so say which one it is.
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .px(px(10.0))
+                    .py(px(9.0))
+                    .rounded(px(10.0))
+                    .bg(t.danger_soft)
+                    .border_1()
+                    .border_color(t.danger_border)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(t.danger_text)
+                            .child(icons::icon(names::DIALOG_WARNING, 14.0, t.danger_text))
+                            .child("Cannot reach adb-daemon"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(t.text_dim)
+                            .whitespace_normal()
+                            .child(error),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-diagnose")
+                            .mt(px(4.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .text_size(px(11.0))
+                            .text_color(t.text_header)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(t.danger_text))
+                            .child(icons::icon(names::DIALOG_INFORMATION, 12.0, t.text_dim))
+                            .child("Run connection diagnostics")
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.open_diagnostics(cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if self.devices.is_empty() && self.daemon_error.is_none() {
             rows.push(onboarding_card(t).into_any_element());
-        } else {
+        } else if !self.devices.is_empty() {
             for device in self.devices.clone() {
                 let active = matches!(&selected, Some(Selection::Device(s)) if *s == device.serial);
                 let serial = device.serial.clone();
@@ -3131,10 +3208,21 @@ impl Render for AdbShareApp {
         let viewport_w: f32 = f32::from(window.viewport_size().width);
         self.layout = Layout::for_width(viewport_w);
 
-        // Reflect the open dialog in the window title, so the taskbar and the
-        // window manager say what is happening.
+        // The window title says where the user is, or which dialog is in the
+        // way. Both matter once more than one window is open.
         let heading = self.dialog.heading();
-        if !heading.is_empty() {
+        if heading.is_empty() {
+            let target = if self.browser.read(cx).has_device() {
+                let name = self.browser.read(cx).path().display().to_string();
+                match name.rsplit('/').find(|part| !part.is_empty()) {
+                    Some(last) if name != "/" => format!("{last} — ADBShare"),
+                    _ => "ADBShare".to_string(),
+                }
+            } else {
+                "ADBShare".to_string()
+            };
+            window.set_window_title(&target);
+        } else {
             window.set_window_title(heading);
         }
 
@@ -3283,5 +3371,123 @@ fn describe_selection(entries: &[DirEntry]) -> String {
         [] => String::new(),
         [one] => one.name.clone(),
         many => format!("{} items", many.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Build the real root view, so the daemon-failure path is exercised through
+    /// the same code the app runs.
+    fn open(cx: &mut TestAppContext) -> Entity<AdbShareApp> {
+        cx.update(|app| {
+            theme::install(app);
+            app.set_global(crate::protocol::TransferPolicy::default());
+        });
+        let saved = Preferences::default();
+        cx.new(|cx| AdbShareApp::new(cx, &saved))
+    }
+
+    #[gpui::test]
+    async fn a_single_poll_failure_is_not_reported(cx: &mut TestAppContext) {
+        // The daemon is usually still starting when the GUI comes up; one
+        // failure is not worth alarming anyone about.
+        let app = open(cx);
+        cx.update(|cx| {
+            let this = app.read(cx);
+            assert!(this.daemon_error.is_none());
+        });
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.on_devices_result(Err("bus name has no owner".into()), cx)
+            });
+            let this = app.read(cx);
+            assert_eq!(this.daemon_failures, 1);
+            assert!(
+                this.daemon_error.is_none(),
+                "one failure is not enough to report"
+            );
+            assert!(this.toasts.is_empty(), "and nothing should be shown");
+        });
+    }
+
+    #[gpui::test]
+    async fn a_repeated_failure_says_the_daemon_is_unreachable(cx: &mut TestAppContext) {
+        // An empty device list looks the same whether no phone is plugged in or
+        // the daemon is dead, so the second failure has to say which it is.
+        let app = open(cx);
+        for _ in 0..2 {
+            cx.update(|cx| {
+                app.update(cx, |this, cx| {
+                    this.on_devices_result(Err("bus name has no owner".into()), cx)
+                });
+            });
+        }
+        cx.update(|cx| {
+            let this = app.read(cx);
+            assert_eq!(this.daemon_failures, 2);
+            assert_eq!(
+                this.daemon_error.as_deref(),
+                Some("bus name has no owner"),
+                "the reason is kept so the sidebar can show it"
+            );
+            assert_eq!(this.toasts.len(), 1, "the user is told once, not per poll");
+            assert!(!this.toasts.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn recovery_clears_the_daemon_error(cx: &mut TestAppContext) {
+        let app = open(cx);
+        for _ in 0..2 {
+            cx.update(|cx| {
+                app.update(cx, |this, cx| {
+                    this.on_devices_result(Err("gone".into()), cx)
+                });
+            });
+        }
+        cx.update(|cx| {
+            app.update(cx, |this, cx| this.on_devices_result(Ok(Vec::new()), cx));
+            let this = app.read(cx);
+            assert!(this.daemon_error.is_none(), "a good poll clears the error");
+            assert_eq!(this.daemon_failures, 0, "and the counter resets");
+        });
+    }
+
+    #[gpui::test]
+    async fn a_failure_after_working_reports_immediately(cx: &mut TestAppContext) {
+        // Losing a daemon that was working is news on the first poll, not the
+        // second: the user was mid-transfer.
+        let app = open(cx);
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.on_devices_result(Ok(vec!["serial".into()]), cx)
+            });
+        });
+        // A successful poll fans out to `device_info` before the list is
+        // populated; let that settle so the test really is starting from a
+        // working daemon.
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        cx.update(|cx| {
+            let this = app.read(cx);
+            assert!(
+                !this.devices.is_empty(),
+                "precondition: a device is listed, so the daemon was working"
+            );
+        });
+        cx.update(|cx| {
+            app.update(cx, |this, cx| {
+                this.on_devices_result(Err("gone".into()), cx)
+            });
+            let this = app.read(cx);
+            assert_eq!(this.daemon_failures, 1);
+            assert_eq!(this.daemon_error.as_deref(), Some("gone"));
+            assert!(!this.toasts.is_empty());
+            assert!(this.selection.is_none(), "the selection is dropped");
+        });
     }
 }

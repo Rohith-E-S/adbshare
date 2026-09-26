@@ -60,6 +60,10 @@ pub struct Palette {
     // ── Semantic ───────────────────────────────────────────────────────────
     pub success: Rgba,
     pub danger: Rgba,
+    /// A danger-tinted surface, for a persistent warning panel.
+    pub danger_soft: Rgba,
+    /// Its border.
+    pub danger_border: Rgba,
     pub danger_text: Rgba,
     pub warning: Rgba,
 }
@@ -96,6 +100,8 @@ impl Palette {
 
             success: rgba(0x22C55EFF),
             danger: rgba(0xEF4444FF),
+            danger_soft: rgba(0xEF444414),
+            danger_border: rgba(0xEF444466),
             danger_text: rgba(0xFCA5A5FF),
             warning: rgba(0xFACC15FF),
         }
