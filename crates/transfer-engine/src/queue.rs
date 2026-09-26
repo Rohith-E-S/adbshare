@@ -9,6 +9,19 @@ use tokio::sync::mpsc;
 
 use super::job::{Job, JobId, JobState};
 
+/// How many finished jobs to remember.
+///
+/// The completed list was previously unbounded, and it is not just memory: the
+/// GUI polls `list_jobs` twice a second, and every poll clones and JSON-encodes
+/// the whole list. A long session would grow that without limit and make each
+/// poll slower forever. A few hundred entries is far more history than the
+/// transfers popover shows, and it bounds both the memory and the poll.
+///
+/// The cost is that an individual job that finished more than this long ago
+/// can no longer be retried by id; `retry_failed` only looks at the retained
+/// window. Retrying is offered from the UI, not as a durable operation.
+pub const MAX_COMPLETED: usize = 200;
+
 pub struct JobQueue {
     pending: Mutex<VecDeque<Job>>,
     in_flight: Mutex<Vec<Job>>,
@@ -67,7 +80,14 @@ impl JobQueue {
         let mut inflight = self.in_flight.lock();
         inflight.retain(|j| j.id != job.id);
         drop(inflight);
-        self.completed.lock().push(job);
+        let mut completed = self.completed.lock();
+        completed.push(job);
+        // Oldest first, so the front is what falls off.
+        if completed.len() > MAX_COMPLETED {
+            let excess = completed.len() - MAX_COMPLETED;
+            completed.drain(0..excess);
+        }
+        drop(completed);
         // A parallelism slot just freed up; wake the dispatcher so a waiting
         // `try_dispatch` loop re-checks capacity and starts pending jobs.
         // Best-effort: a closed receiver simply means nobody is dispatching.
@@ -362,5 +382,137 @@ mod tests {
         assert!(!seen_dupe, "a job appeared more than once in a snapshot");
         // After the churn completes, every job is accounted for exactly once.
         assert_eq!(queue.jobs_snapshot().len(), 64);
+    }
+}
+
+#[cfg(test)]
+mod completed_bound_tests {
+    use super::super::JobOptions;
+    use super::*;
+    use super::super::Direction;
+
+    fn job(i: u64) -> Job {
+        Job::with_device(
+            i,
+            Direction::Push,
+            std::path::PathBuf::from(format!("/src/{i}")),
+            std::path::PathBuf::from(format!("/dst/{i}")),
+            JobOptions::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn the_completed_list_is_bounded() {
+        let (queue, _rx) = JobQueue::new(1);
+        for i in 0..(MAX_COMPLETED as u64 * 3) {
+            queue.submit(job(i));
+            let taken = queue.try_dispatch().expect("a slot is free");
+            queue.mark_done(taken);
+        }
+        assert_eq!(
+            queue.snapshot().completed,
+            MAX_COMPLETED,
+            "the history must not grow without bound"
+        );
+    }
+
+    #[test]
+    fn trimming_keeps_the_newest_jobs() {
+        let (queue, _rx) = JobQueue::new(1);
+        let total = MAX_COMPLETED as u64 + 10;
+        for i in 0..total {
+            queue.submit(job(i));
+            let taken = queue.try_dispatch().expect("a slot is free");
+            queue.mark_done(taken);
+        }
+        let snapshot = queue.jobs_snapshot();
+        assert_eq!(snapshot.len(), MAX_COMPLETED);
+        assert_eq!(
+            snapshot.first().map(|j| j.id),
+            Some(10),
+            "the oldest ten were dropped"
+        );
+        assert_eq!(snapshot.last().map(|j| j.id), Some(total - 1));
+    }
+
+    #[test]
+    fn a_full_history_does_not_block_new_work() {
+        let (queue, _rx) = JobQueue::new(1);
+        for i in 0..(MAX_COMPLETED as u64 + 50) {
+            queue.submit(job(i));
+            let taken = queue.try_dispatch().expect("a slot is free");
+            queue.mark_done(taken);
+        }
+        queue.submit(job(9_999));
+        assert!(
+            queue.try_dispatch().is_some(),
+            "a trimmed history must not stop dispatching"
+        );
+    }
+}
+
+/// What the daemon's `list_jobs` does, twice a second, for the GUI's poll.
+#[cfg(test)]
+mod poll_cost_tests {
+    use super::*;
+    use crate::job::{Direction, JobOptions, OverwriteMode, VerifyMode};
+
+    /// Fill the queue with `jobs` completed transfers, as a long session would.
+    fn filled(jobs: u64) -> (Arc<JobQueue>, mpsc::UnboundedReceiver<()>) {
+        let (queue, rx) = JobQueue::new(1);
+        for i in 0..jobs {
+            let job = Job::new(
+                i + 1,
+                Direction::Push,
+                std::path::PathBuf::from(format!("/very/long/source/path/{i}.bin")),
+                std::path::PathBuf::from(format!("/a/destination/path/{i}.bin")),
+                JobOptions {
+                    overwrite: OverwriteMode::SkipExisting,
+                    verify: VerifyMode::On,
+                    chunk_size: super::super::DEFAULT_CHUNK,
+                },
+            );
+            queue.submit(job);
+            let taken = queue.try_dispatch().expect("a slot is free");
+            queue.mark_done(taken);
+        }
+        (queue, rx)
+    }
+
+    #[test]
+    fn the_poll_cost_is_flat_once_the_history_is_full() {
+        // `list_jobs` clones the snapshot and encodes it to JSON on every GUI
+        // poll. Before the cap this grew without limit; now the cost at 10x the
+        // history is the same as at the cap.
+        let (small, _a) = filled(MAX_COMPLETED as u64);
+        let (large, _b) = filled(MAX_COMPLETED as u64 * 10);
+        assert_eq!(small.snapshot().completed, MAX_COMPLETED);
+        assert_eq!(
+            large.snapshot().completed,
+            MAX_COMPLETED,
+            "a ten-times-longer session keeps the same history"
+        );
+
+        let encode = |queue: &JobQueue| {
+            let snapshot = queue.jobs_snapshot();
+            std::hint::black_box(snapshot.len());
+        };
+        let mut best_small = f64::MAX;
+        for _ in 0..8 {
+            let start = std::time::Instant::now();
+            encode(&small);
+            best_small = best_small.min(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mut best_large = f64::MAX;
+        for _ in 0..8 {
+            let start = std::time::Instant::now();
+            encode(&large);
+            best_large = best_large.min(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        assert!(
+            best_large <= best_small * 3.0,
+            "snapshot cost must not track session length: {best_small:.3}ms vs {best_large:.3}ms"
+        );
     }
 }
