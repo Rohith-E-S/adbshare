@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adb_device::{DeviceId, DeviceWatcher};
 use adb_proxy::{ops::DirEntry, ProxyClient, DEFAULT_PROXY_PORT, PROXY_BIN_PATH};
@@ -182,7 +182,11 @@ mod tests {
             }
             let (queue, _rx) = JobQueue::new(1);
             let service = ConnectionBuilder::session().unwrap()
-                .serve_at("/org/adbshare/Manager", ManagerInterface { state, queue }).unwrap()
+                .serve_at("/org/adbshare/Manager", ManagerInterface {
+            state,
+            queue,
+            device_info: Arc::new(DeviceInfoCache::new(DEVICE_INFO_TTL)),
+        }).unwrap()
                 .build().await.unwrap();
             let connection = zbus::Connection::session().await.unwrap();
             let proxy = zbus::Proxy::new(
@@ -311,7 +315,11 @@ mod tests {
             DeviceId("mock".into()),
             DeviceSlot { mountpoint: None, client: Arc::new(client), host_port: 0, setup_ok: true },
         );
-        ManagerInterface { state, queue }
+        ManagerInterface {
+            state,
+            queue,
+            device_info: Arc::new(DeviceInfoCache::new(DEVICE_INFO_TTL)),
+        }
     }
 
     #[tokio::test]
@@ -407,6 +415,7 @@ mod tests {
     async fn pair_wireless_rejects_bad_input() {
         let (queue, _rx) = JobQueue::new(1);
         let manager = ManagerInterface {
+            device_info: Arc::new(DeviceInfoCache::new(DEVICE_INFO_TTL)),
             state: Arc::new(Mutex::new(State::default())),
             queue,
         };
@@ -453,10 +462,60 @@ mod tests {
         assert!(validate_host_port("[fe80::1%25wlan0]:37001").is_ok());
     }
 
+    #[test]
+    fn a_fresh_reading_is_reused_and_an_expired_one_is_not() {
+        let cache = DeviceInfoCache::new(Duration::from_secs(15));
+        assert!(cache.fresh("serial").is_none(), "nothing is cached yet");
+
+        cache.store("serial", "{\"model\":\"Pixel\"}".to_string());
+        assert_eq!(cache.fresh("serial").as_deref(), Some("{\"model\":\"Pixel\"}"));
+        // A different device is a different entry.
+        assert!(cache.fresh("other").is_none());
+    }
+
+    #[test]
+    fn an_expired_reading_is_still_available_as_a_fallback() {
+        let cache = DeviceInfoCache::new(Duration::ZERO);
+        cache.store("serial", "{\"battery\":77}".to_string());
+        assert!(
+            cache.fresh("serial").is_none(),
+            "past its lifetime, so it must not be served as fresh"
+        );
+        assert_eq!(
+            cache.stale("serial").as_deref(),
+            Some("{\"battery\":77}"),
+            "but a failing refresh should still fall back to it"
+        );
+    }
+
+    #[test]
+    fn readings_for_phones_that_have_gone_are_dropped() {
+        let cache = DeviceInfoCache::new(Duration::from_secs(15));
+        cache.store("here", "a".to_string());
+        cache.store("gone", "b".to_string());
+
+        cache.forget_missing(&["here".to_string()]);
+
+        assert!(cache.fresh("here").is_some(), "a present device is kept");
+        assert!(
+            cache.stale("gone").is_none(),
+            "a phone that is no longer listed must not linger in the cache"
+        );
+    }
+
+    #[test]
+    fn remembering_a_reading_again_refreshes_its_age() {
+        let cache = DeviceInfoCache::new(Duration::from_secs(60));
+        cache.store("serial", "old".to_string());
+        cache.store("serial", "new".to_string());
+        assert_eq!(cache.fresh("serial").as_deref(), Some("new"));
+    }
+
     #[tokio::test]
     async fn diagnostics_reports_host_facts_as_json() {
         let (queue, _rx) = JobQueue::new(1);
         let manager = ManagerInterface {
+            device_info: Arc::new(DeviceInfoCache::new(DEVICE_INFO_TTL)),
             state: Arc::new(Mutex::new(State {
                 adb_server: "127.0.0.1:5037".into(),
                 mount_base: PathBuf::from("/tmp/adbshare-test"),
@@ -490,6 +549,7 @@ mod tests {
     async fn copy_file_validates_paths_and_requires_connected_device() {
         let (queue, _rx) = JobQueue::new(1);
         let manager = ManagerInterface {
+            device_info: Arc::new(DeviceInfoCache::new(DEVICE_INFO_TTL)),
             state: Arc::new(Mutex::new(State::default())),
             queue,
         };
@@ -664,10 +724,14 @@ async fn main() -> anyhow::Result<()> {
     // D-Bus IPC.
     let conn = ConnectionBuilder::session()?
         .name("org.adbshare.Manager")?
-        .serve_at("/org/adbshare/Manager", ManagerInterface {
-            state: state.clone(),
-            queue: queue.clone(),
-        })?
+        .serve_at(
+            "/org/adbshare/Manager",
+            ManagerInterface {
+                state: state.clone(),
+                queue: queue.clone(),
+                device_info: Arc::new(DeviceInfoCache::new(DEVICE_INFO_TTL)),
+            },
+        )?
         .build()
         .await?;
     info!("D-Bus service ready on org.adbshare.Manager");
@@ -690,6 +754,13 @@ async fn main() -> anyhow::Result<()> {
 /// Timeout for a single file-transfer-sized adb command (e.g. pushing the
 /// proxy binary to the device).
 const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a device metadata reading is reused before it is gathered again.
+///
+/// The GUI polls every three seconds; fifteen seconds turns five sets of three
+/// `adb shell` subprocesses per minute into one, which is still far more often
+/// than a battery percentage or a storage total meaningfully changes.
+const DEVICE_INFO_TTL: Duration = Duration::from_secs(15);
 /// Timeout for quick adb commands (shell one-liners, forward, getprop).
 const ADB_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1241,25 +1312,103 @@ async fn delete_recursive(client: &ProxyClient, path: &str, depth: u32) -> anyho
     client.rmdir(path).await.map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Cached `device_info` payloads, per serial.
+///
+/// The GUI asks for device metadata every three seconds, and each answer costs
+/// three `adb shell` subprocesses on the phone — `getprop` dumps every system
+/// property, `dumpsys battery` is a binder round trip, and `df` stats the
+/// volume. That is a subprocess per second per device, which shows up as
+/// background CPU and battery drain on a phone that is otherwise idle, and it
+/// buys nothing: the model never changes, and the battery percentage moves at
+/// most once in a while.
+///
+/// Entries are refreshed on expiry and the last good value is served if a
+/// refresh fails, so a phone that has gone quiet does not make the sidebar
+/// flicker.
+struct DeviceInfoCache {
+    ttl: Duration,
+    entries: std::sync::Mutex<std::collections::HashMap<String, (Instant, String)>>,
+}
+
+impl DeviceInfoCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The cached payload for `serial`, if it is still fresh.
+    fn fresh(&self, serial: &str) -> Option<String> {
+        let entries = self.entries.lock().ok()?;
+        let (when, json) = entries.get(serial)?;
+        (when.elapsed() < self.ttl).then(|| json.clone())
+    }
+
+    /// The cached payload for `serial` however old it is.
+    fn stale(&self, serial: &str) -> Option<String> {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(serial).map(|(_, json)| json.clone()))
+    }
+
+    fn store(&self, serial: &str, json: String) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(serial.to_string(), (Instant::now(), json));
+        }
+    }
+
+    /// Forget a device that has gone away, so the cache cannot grow without
+    /// bound over a long session with phones coming and going.
+    fn forget_missing(&self, present: &[String]) {
+        let Ok(mut entries) = self.entries.lock() else { return };
+        entries.retain(|serial, _| present.iter().any(|known| known == serial));
+    }
+}
+
 struct ManagerInterface {
     state: Arc<Mutex<State>>,
     queue: Arc<JobQueue>,
+    device_info: Arc<DeviceInfoCache>,
 }
 
 #[interface(name = "org.adbshare.Manager")]
 impl ManagerInterface {
     /// List all devices currently set up (mounted + proxy connected).
     async fn list_devices(&self) -> zbus::fdo::Result<Vec<String>> {
-        let s = self.state.lock();
-        Ok(s.devices.keys().map(|d| d.to_string()).collect())
+        let devices: Vec<String> = {
+            let s = self.state.lock();
+            s.devices.keys().map(|d| d.to_string()).collect()
+        };
+        self.device_info.forget_missing(&devices);
+        Ok(devices)
     }
 
     /// Live device metadata (model, transport, battery, storage) gathered
-    /// over `adb shell`. Returns a JSON `DeviceInfoDto`.
+    /// over `adb shell`. Returns a JSON `DeviceInfoDto`, cached briefly because
+    /// the GUI polls it far more often than the answers change.
     async fn device_info(&self, serial: String) -> zbus::fdo::Result<String> {
-        device_info_json(&serial)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("device_info: {e}")))
+        if let Some(cached) = self.device_info.fresh(&serial) {
+            return Ok(cached);
+        }
+        match device_info_json(&serial).await {
+            Ok(json) => {
+                self.device_info.store(&serial, json.clone());
+                Ok(json)
+            }
+            Err(e) => {
+                // A phone that has gone quiet should not make the sidebar empty
+                // out; the previous reading is better than nothing.
+                match self.device_info.stale(&serial) {
+                    Some(cached) => {
+                        tracing::debug!(%serial, error = %e, "device_info refresh failed; serving the cached reading");
+                        Ok(cached)
+                    }
+                    None => Err(zbus::fdo::Error::Failed(format!("device_info: {e}"))),
+                }
+            }
+        }
     }
 
     /// Version string of the host `adb` server binary (e.g. "1.0.41").
