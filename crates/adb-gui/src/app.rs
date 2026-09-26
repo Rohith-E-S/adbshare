@@ -2977,7 +2977,7 @@ fn device_card(
 /// An icon + label row in the sidebar.
 fn place_row(
     t: &theme::Palette,
-    icon: &str,
+    icon: &'static str,
     label: &str,
     active: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,

@@ -1470,16 +1470,17 @@ fn folder_icon_for(entry: &DirEntry) -> &'static str {
 /// Full-colour artwork for the file types the design has bespoke art for, or
 /// `None` to fall back to a monochrome glyph.
 fn artwork_for(entry: &DirEntry) -> Option<&'static str> {
+    use crate::icons::names::art;
     Some(match entry.ext().as_str() {
-        "apk" => "apk",
-        "zip" | "7z" | "rar" => "zip",
-        "tar" | "gz" | "tgz" | "xz" => "tar",
+        "apk" => art::APK,
+        "zip" | "7z" | "rar" => art::ZIP,
+        "tar" | "gz" | "tgz" | "xz" => art::TAR,
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odg"
-        | "csv" | "epub" => "documents",
-        "mp3" | "flac" | "ogg" | "wav" | "m4a" | "aac" => "podcasts",
-        "txt" | "log" | "json" | "xml" => "txt",
-        "mp4" | "mkv" | "avi" | "webm" | "mov" => "movie",
-        "png" | "jpg" | "jpeg" | "webp" | "gif" => "wallpaper",
+        | "csv" | "epub" => art::DOCUMENTS,
+        "mp3" | "flac" | "ogg" | "wav" | "m4a" | "aac" => art::PODCASTS,
+        "txt" | "log" | "json" | "xml" => art::TXT,
+        "mp4" | "mkv" | "avi" | "webm" | "mov" => art::MOVIE,
+        "png" | "jpg" | "jpeg" | "webp" | "gif" => art::WALLPAPER,
         _ => return None,
     })
 }
@@ -2318,20 +2319,21 @@ mod tests {
 
     #[test]
     fn artwork_covers_the_types_the_design_has_art_for() {
-        for (name, art) in [
-            ("a.apk", "apk"),
-            ("a.zip", "zip"),
-            ("a.7z", "zip"),
-            ("a.tar.gz", "tar"),
-            ("a.pdf", "documents"),
-            ("a.epub", "documents"),
-            ("a.mp3", "podcasts"),
-            ("a.txt", "txt"),
-            ("a.json", "txt"),
-            ("a.mp4", "movie"),
-            ("a.png", "wallpaper"),
+        use crate::icons::names::art;
+        for (name, expected) in [
+            ("a.apk", art::APK),
+            ("a.zip", art::ZIP),
+            ("a.7z", art::ZIP),
+            ("a.tar.gz", art::TAR),
+            ("a.pdf", art::DOCUMENTS),
+            ("a.epub", art::DOCUMENTS),
+            ("a.mp3", art::PODCASTS),
+            ("a.txt", art::TXT),
+            ("a.json", art::TXT),
+            ("a.mp4", art::MOVIE),
+            ("a.png", art::WALLPAPER),
         ] {
-            assert_eq!(artwork_for(&entry(name, false)), Some(art), "{name}");
+            assert_eq!(artwork_for(&entry(name, false)), Some(expected), "{name}");
         }
         assert_eq!(artwork_for(&entry("noextension", false)), None);
         assert_eq!(artwork_for(&entry("a.bin", false)), None);
@@ -2339,7 +2341,10 @@ mod tests {
 
     #[test]
     fn every_referenced_asset_is_embedded() {
-        let mut referenced: Vec<String> = [
+        use crate::icons::names::art;
+        // The icon constants already carry their full asset key, so this is just
+        // the list of what the browser can ask for.
+        let mut referenced: Vec<&str> = vec![
             folder_icon_for(&entry("x", true)),
             names::PHONE,
             names::DRIVE_HARDDISK,
@@ -2350,29 +2355,22 @@ mod tests {
             names::VIDEO_GENERIC,
             names::PACKAGE,
             names::DOCUMENT,
-        ]
-        .into_iter()
-        .map(|name| format!("icons/{name}.svg"))
-        .collect();
-        for art in [
-            "apk",
-            "zip",
-            "tar",
-            "documents",
-            "podcasts",
-            "txt",
-            "movie",
-            "wallpaper",
-        ] {
-            referenced.push(format!("art/{art}.svg"));
-        }
-        referenced.sort();
+            art::APK,
+            art::ZIP,
+            art::TAR,
+            art::DOCUMENTS,
+            art::PODCASTS,
+            art::TXT,
+            art::MOVIE,
+            art::WALLPAPER,
+        ];
+        referenced.sort_unstable();
         referenced.dedup();
 
         for path in referenced {
             assert!(
                 crate::icons::ASSETS.iter().any(|(asset, _)| *asset == path),
-                "{path} is referenced by the browser but not embedded, so it would \\
+                "{path} is referenced by the browser but not embedded, so it would \
                  render as nothing"
             );
         }

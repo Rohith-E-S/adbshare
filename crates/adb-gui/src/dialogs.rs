@@ -603,7 +603,7 @@ fn card(t: &Palette, width: f32, rows: Vec<AnyElement>) -> AnyElement {
 }
 
 /// The icon plus title at the top of a dialog.
-fn header(t: &Palette, icon: &str, accent: gpui::Rgba, title: &str) -> gpui::Div {
+fn header(t: &Palette, icon: &'static str, accent: gpui::Rgba, title: &str) -> gpui::Div {
     div()
         .flex()
         .items_center()
@@ -703,7 +703,8 @@ where
 /// The static parts of a single-field dialog, gathered so [`form`] stays under
 /// clippy's argument limit.
 struct FormSpec<'a> {
-    icon: &'a str,
+    /// An asset key, so `'static`; the rest are borrowed from the call site.
+    icon: &'static str,
     title: &'a str,
     hint: &'a str,
     submit_label: &'static str,

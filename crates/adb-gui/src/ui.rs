@@ -36,7 +36,7 @@ pub fn el_id(text: impl Into<gpui::SharedString>) -> ElementId {
 pub fn icon_button(
     t: &Palette,
     id: impl Into<ElementId>,
-    icon: &str,
+    icon: &'static str,
     size: f32,
     tint: Rgba,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
@@ -60,7 +60,7 @@ pub fn icon_button(
 pub fn icon_button_active(
     t: &Palette,
     id: impl Into<ElementId>,
-    icon: &str,
+    icon: &'static str,
     size: f32,
     active: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
@@ -82,7 +82,7 @@ pub fn icon_button_active(
 
 /// An icon button that is drawn dimmed and ignores clicks, for actions that need
 /// something selected first.
-pub fn icon_button_disabled(t: &Palette, icon: &str, size: f32) -> Div {
+pub fn icon_button_disabled(t: &Palette, icon: &'static str, size: f32) -> Div {
     div()
         .flex()
         .items_center()
@@ -317,7 +317,7 @@ pub fn on_top(content: impl IntoElement) -> impl IntoElement {
 pub fn menu_row(
     t: &Palette,
     id: impl Into<ElementId>,
-    icon: Option<&str>,
+    icon: Option<&'static str>,
     label: &str,
     danger: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
@@ -354,7 +354,7 @@ pub fn menu_separator(t: &Palette) -> Div {
 pub fn menu_check(
     t: &Palette,
     id: impl Into<ElementId>,
-    icon: &str,
+    icon: &'static str,
     label: &str,
     checked: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,

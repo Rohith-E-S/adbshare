@@ -324,7 +324,8 @@ mod tests {
             ToastTone::Warning,
             ToastTone::Error,
         ] {
-            let path = format!("icons/{}.svg", tone.icon());
+            // The icon constants already carry their full asset key.
+            let path = tone.icon();
             assert!(
                 crate::icons::ASSETS.iter().any(|(name, _)| *name == path),
                 "{tone:?} icon {path} is not embedded"
