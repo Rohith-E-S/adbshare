@@ -7,7 +7,9 @@ Browse your Android phone and move files between it and your Linux computer over
 ## What you can do
 
 - Browse phone storage and local folders in grid or list view.
+- Sort by name, size, or modified, ascending or reversed; folders always first.
 - Navigate with breadcrumbs or type a path; filter the current folder by name.
+- Zoom the grid, and keep the sidebar width, layout, and sort across restarts.
 - Send files to your phone and save phone files to your computer.
 - Watch transfer progress, speed, and ETA; pause, resume, or cancel queued work.
 - Create folders, rename items, view properties, and delete items.
@@ -170,20 +172,32 @@ Queued phone transfers use the conflict policy selected in the Transfers popover
 
 ### Keyboard shortcuts
 
+The full list is also in the app, under **Keyboard shortcuts** in the overflow menu.
+
 | Shortcut | Action |
 | --- | --- |
 | `Alt+Left` / `Alt+Right` | Back / forward |
 | `Alt+Up` | Parent folder |
+| `Up` / `Down` | Move between items |
+| `Home` / `End` | First / last item |
+| `Ctrl+A` | Select all |
+| `Shift` or `Ctrl` + click | Extend the selection |
+| `Enter` or double click | Open |
 | `Ctrl+L` | Edit the path |
 | `Ctrl+F` | Search the current folder |
+| `Esc` | Clear the selection |
 | `F5` | Refresh |
 | `F9` | Toggle the sidebar |
 | `Ctrl+U` | Send a file to the phone |
 | `Ctrl+Shift+C` | Save selected phone files to the computer |
 | `Ctrl+C` / `Ctrl+V` | Copy / paste files; see the same-phone limitation below |
+| `Ctrl+N` | New folder |
 | `F2` | Rename |
-| `Alt+Return` | Properties |
-| `Shift+Delete` | Permanent-delete action |
+| `Delete` | Move to Trash (on the disk), or delete from the phone |
+| `Shift+Delete` | Delete permanently, on the disk or the phone |
+| `Alt+T` | Switch between grid and list |
+| `Ctrl+=` / `Ctrl+-` | Zoom the grid |
+| `Alt+Return` | Properties (also in the right-click menu) |
 
 ### Connect over Wi-Fi
 
@@ -195,10 +209,11 @@ Use **Install APK…** in the more-options menu, or the APK context action. Drop
 
 ## Current limitations
 
-- **Phone deletion is permanent.** Only local files offer “Move to Trash”; there is no phone trash/recovery feature.
+- **Phone deletion is permanent.** Only local files offer “Move to Trash”; there is no phone trash/recovery feature. `Shift+Delete` is the explicit permanent-delete action on both.
+- The grid renders only the rows that fit on screen, so a folder with thousands of files scrolls as smoothly as a small one. The list view is likewise virtualised.
 - Same-phone paste copies files and folders without replacing existing destinations (folders copy synchronously; symlinks are skipped). It requires the updated phone helper. If a copy loses its connection or times out, completion is unknown: the destination may be incomplete or still copying. Cross-phone paste is unsupported.
 - The transfer queue is in memory and is lost when the daemon exits. Reconnecting can retry work, but reliable byte-offset resumption is not guaranteed.
-- The Transfers popover offers a session-wide conflict policy (skip, replace, keep both) and optional SHA-256 verification for computer ↔ phone transfers. Automatic folder synchronization is not supported.
+- The Transfers popover offers a session-wide conflict policy (skip, replace, keep both) and optional SHA-256 verification for computer ↔ phone transfers, both set from the popover itself. Automatic folder synchronization is not supported.
 - FUSE enables external file opening and dragging phone files out. Without it, use in-app browsing and queued transfers instead.
 - Custom/remote ADB server support is incomplete: discovery and subprocess ADB commands do not consistently use the same server options.
 - AUR, Flatpak, and `.deb` packaging are experimental. Package layouts and dependencies are not yet consistently wired up; a phone-compatible proxy may need to be supplied separately. There is no working Flatpak USB-portal setup.
@@ -209,6 +224,7 @@ Use **Install APK…** in the more-options menu, or the APK context action. Drop
 | --- | --- |
 | Phone does not appear | Run `adb devices -l`, unlock/authorize the phone, and check USB permissions. Then inspect the daemon log: a device appears only after helper setup succeeds. |
 | Helper missing or fails to start | Check the phone ABI and `ADBSHARE_PROXY_BIN`. An x86-64 host executable will not run on an ARM64 phone. |
+| A setting did not stick | The sidebar width, grid zoom, layout, sort order and hidden-file toggle are saved to `~/.config/adbshare/gui.json` when they change. A file that cannot be read or parsed falls back to the defaults rather than failing, and out-of-range values are clamped. |
 | Build fails on a native library | Check `pkg-config --modversion vulkan xkbcommon wayland-client fontconfig freetype2 fuse3`; installing headers alone does not ensure the versions GPUI needs. |
 | Transfer says skipped | The destination already exists. Save under another name or handle the existing file yourself. |
 | File not visible after upload | Wait for completion and press `F5`. |
