@@ -1210,7 +1210,7 @@ where
                         .justify_center()
                         .size(px(48.0))
                         .rounded(px(14.0))
-                        .bg(t.hover_strong)
+                        .bg(t.hover)
                         .child(icons::icon(names::PHONE, 24.0, t.text_header)),
                 )
                 .child(

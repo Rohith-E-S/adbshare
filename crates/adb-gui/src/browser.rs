@@ -286,6 +286,11 @@ pub struct Browser {
     viewport_width: f32,
     viewport_height: f32,
 
+    /// Tiles built by the last render, so the benchmarks can compare like with
+    /// like.
+    #[cfg(test)]
+    last_built_tiles: usize,
+
     // ── Rubber-band selection ──────────────────────────────────────────────
     drag_anchor: Option<Point<Pixels>>,
     drag_current: Option<Point<Pixels>>,
@@ -330,6 +335,8 @@ impl Browser {
             viewport_y: 0.0,
             viewport_width: 0.0,
             viewport_height: 0.0,
+            #[cfg(test)]
+            last_built_tiles: 0,
             drag_anchor: None,
             drag_current: None,
             drag_extend: false,
@@ -1010,6 +1017,12 @@ impl Browser {
         (self.viewport_height - self.item_area_top()).max(0.0)
     }
 
+    /// How many tiles the grid built this frame, for the benchmarks.
+    #[cfg(test)]
+    pub fn built_tiles(&self) -> usize {
+        self.last_built_tiles
+    }
+
     /// Which grid rows to build this frame, and how many.
     ///
     /// Reads the scroll offset recorded by the last frame's layout, so the
@@ -1259,9 +1272,11 @@ fn context_bar(browser: &Browser, t: &theme::Palette) -> Div {
         .px(px(14.0))
         .py(px(8.0))
         .rounded(px(theme::RADIUS_BAR))
+        // A recessed strip: One Dark's `element.background` sits below the
+        // window background, which is what a context bar is.
         .bg(t.surface_raised)
         .border_1()
-        .border_color(rgba(0xFFFFFF0D))
+        .border_color(t.border_soft)
         .child(icons::icon(icon, 16.0, t.text_header))
         .child(
             div()
@@ -1327,6 +1342,7 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
         .gap(px(10.0))
         .h(px(theme::STATUSBAR_H))
         .px(px(14.0))
+        .bg(t.statusbar)
         .border_t_1()
         .border_color(t.border_soft)
         .child(
@@ -1367,7 +1383,7 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
                     .size(px(22.0))
                     .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|s| s.bg(t.hover_strong))
+                    .hover(|s| s.bg(t.hover))
                     .child(icons::icon(
                         if browser.transfers_paused {
                             names::PLAY
@@ -1397,7 +1413,7 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
                     .size(px(22.0))
                     .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|s| s.bg(t.hover_strong))
+                    .hover(|s| s.bg(t.hover))
                     .child(icons::icon(names::STOP, 12.0, t.text_dim))
                     .on_mouse_down(MouseButton::Left, move |_, _w, cx| {
                         cancel.update(cx, |_b, cx| {
@@ -1551,7 +1567,13 @@ impl Browser {
             .into_any_element(),
         };
 
+        // One div per piece of text rather than a wrapper plus a label: at
+        // ~0.023ms per element, the two wrappers this tile used to spend on the
+        // name and the size were about a third of its layout cost for nothing.
         let label = div()
+            .mt(px(6.0))
+            .w_full()
+            .px(px(2.0))
             .text_size(px(11.5))
             .font_weight(if entry.looks_like_dir() {
                 gpui::FontWeight::MEDIUM
@@ -1566,9 +1588,29 @@ impl Browser {
             .truncate()
             .child(entry.name.clone());
 
-        // A folder has no meaningful size, and an em dash under every folder
-        // was just noise. Only files get the second line.
-        let sub = (!entry.is_dir).then(|| ui::mono(human_size(entry.size), &t).text_size(px(9.5)));
+        // A folder has no meaningful size, and an em dash under every folder was
+        // just noise. Only files get the second line.
+        let sub = (!entry.is_dir).then(|| {
+            div()
+                .mt(px(1.0))
+                .w_full()
+                .font_family(theme::MONO)
+                .text_size(px(9.5))
+                .text_color(t.text_muted)
+                .truncate()
+                .child(human_size(entry.size))
+        });
+
+        // The tile's own background, resolved once rather than by three
+        // overlapping style callbacks.
+        let resting_bg = if selected {
+            Some(t.selected)
+        } else if focused {
+            Some(t.hover)
+        } else {
+            None
+        };
+        let hover_bg = if selected { t.selected_strong } else { t.hover };
 
         Some(
             div()
@@ -1583,9 +1625,8 @@ impl Browser {
                 .pb(px(6.0))
                 .rounded(px(10.0))
                 .cursor_pointer()
-                .when(selected, |d| d.bg(t.hover_strong))
-                .when(focused && !selected, |d| d.bg(t.hover))
-                .hover(|d| d.bg(if selected { t.pressed } else { t.hover }))
+                .when_some(resting_bg, |d, bg| d.bg(bg))
+                .hover(move |d| d.bg(hover_bg))
                 .child(
                     div()
                         .flex()
@@ -1595,8 +1636,8 @@ impl Browser {
                         .w_full()
                         .child(icon_el),
                 )
-                .child(div().mt(px(6.0)).w_full().px(px(2.0)).child(label))
-                .when_some(sub, |d, sub| d.child(div().mt(px(1.0)).child(sub)))
+                .child(label)
+                .when_some(sub, |d, sub| d.child(sub))
                 .on_click(
                     cx.listener(move |this, event, w, cx| this.on_item_click(index, event, w, cx)),
                 )
@@ -1610,7 +1651,6 @@ impl Browser {
         )
     }
 
-    /// One row of the list view.
     /// One row of the list view, with the palette passed in.
     ///
     /// `uniform_list`'s processor runs *during* this entity's own render, so it
@@ -1645,7 +1685,7 @@ impl Browser {
                 .px(px(8.0))
                 .rounded(px(6.0))
                 .cursor_pointer()
-                .when(selected, |d| d.bg(t.hover_strong))
+                .when(selected, |d| d.bg(t.hover))
                 .when(focused && !selected, |d| d.bg(t.hover))
                 .hover(|d| d.bg(if selected { t.pressed } else { t.hover }))
                 .child(icons::icon(
@@ -1750,6 +1790,11 @@ impl Render for Browser {
                     let (first_row, visible_rows) = self.visible_row_range(tile_h);
                     let total_height = rows as f32 * tile_h + GRID_TILE_PAD;
 
+                    #[cfg(test)]
+                    {
+                        self.last_built_tiles =
+                            (visible_rows * self.grid_geometry.columns.max(1)).min(count);
+                    }
                     let windowed: Vec<AnyElement> = (first_row..first_row + visible_rows)
                         .map(|row| {
                             let first = row * columns;
@@ -1852,6 +1897,35 @@ impl Render for Browser {
             .child(status_bar(self, &t, &me))
             .into_any_element()
     }
+}
+
+/// A synthetic Android media listing for the benchmarks.
+///
+/// Outside the test module so the app-level benchmark builds the same fixture the
+/// browser benchmarks use, which keeps the two comparable.
+#[cfg(test)]
+pub fn synthetic_listing(count: usize) -> Vec<DirEntry> {
+    const STEMS: &[&str] = &[
+        "IMG_20240101_120000",
+        "Screenshot_2024-01-03",
+        "video_20240104",
+        "document",
+        "archive",
+        "notes",
+        "podcast_episode",
+    ];
+    const EXTS: &[&str] = &["jpg", "png", "mp4", "pdf", "zip", "txt", "mp3"];
+
+    (0..count)
+        .map(|i| DirEntry {
+            name: format!("{}_{i:04}.{}", STEMS[i % STEMS.len()], EXTS[i % EXTS.len()]),
+            is_dir: i % 25 == 0,
+            is_symlink: false,
+            size: 1_000_000 + (i as u64 * 7919),
+            mode: 0o644,
+            mtime: 1_700_000_000 + i as i64,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2805,31 +2879,6 @@ mod tests {
     // up building an element for every entry: on a phone with a few thousand files
     // in `DCIM` that is thousands of elements per frame. These give a number to
     // optimise against.
-
-    /// A listing with a realistic mix of Android media and app files.
-    fn synthetic_listing(count: usize) -> Vec<DirEntry> {
-        const STEMS: &[&str] = &[
-            "IMG_20240101_120000",
-            "Screenshot_2024-01-03",
-            "video_20240104",
-            "document",
-            "archive",
-            "notes",
-            "podcast_episode",
-        ];
-        const EXTS: &[&str] = &["jpg", "png", "mp4", "pdf", "zip", "txt", "mp3"];
-
-        (0..count)
-            .map(|i| DirEntry {
-                name: format!("{}_{i:04}.{}", STEMS[i % STEMS.len()], EXTS[i % EXTS.len()]),
-                is_dir: i % 25 == 0,
-                is_symlink: false,
-                size: 1_000_000 + (i as u64 * 7919),
-                mode: 0o644,
-                mtime: 1_700_000_000 + i as i64,
-            })
-            .collect()
-    }
 
     /// Best-of-N time for one layout pass, in milliseconds.
     ///

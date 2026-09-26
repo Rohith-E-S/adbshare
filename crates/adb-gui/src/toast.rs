@@ -218,7 +218,7 @@ where
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(t.text_header)
-                    .bg(t.hover_strong)
+                    .bg(t.hover)
                     .cursor_pointer()
                     .hover(|s| s.bg(t.pressed))
                     .child(label.clone())
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn every_tone_has_an_icon_and_a_visible_accent() {
-        let t = Palette::dark();
+        let t = Palette::one_dark();
         for tone in [
             ToastTone::Info,
             ToastTone::Success,

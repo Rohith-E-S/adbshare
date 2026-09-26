@@ -49,7 +49,7 @@ pub fn icon_button(
         .size(px(size))
         .rounded(px(theme::RADIUS_CAPSULE_BTN))
         .cursor_pointer()
-        .hover(|s| s.bg(t.hover_strong))
+        .hover(|s| s.bg(t.hover))
         .active(|s| s.bg(t.pressed))
         .child(icons::icon(icon, size * 0.53, tint))
         .on_click(on_click)
@@ -75,7 +75,7 @@ pub fn icon_button_active(
         .rounded(px(theme::RADIUS_CAPSULE_BTN))
         .cursor_pointer()
         .when(active, |d| d.bg(t.pressed))
-        .hover(|s| s.bg(t.hover_strong))
+        .hover(|s| s.bg(t.hover))
         .child(icons::icon(icon, size * 0.53, tint))
         .on_click(on_click)
 }
@@ -230,7 +230,7 @@ pub fn tone_colors(t: &Palette, tone: StateTone) -> (Rgba, Rgba) {
         StateTone::Neutral => (t.text_dim, rgba(0xFFFFFF14)),
         StateTone::Success => (t.success, rgba(0x22C55E1F)),
         StateTone::Warning => (t.warning, rgba(0xFACC151F)),
-        StateTone::Danger => (t.danger_text, rgba(0xEF44441F)),
+        StateTone::Danger => (t.danger, rgba(0xEF44441F)),
     }
 }
 
@@ -322,11 +322,7 @@ pub fn menu_row(
     danger: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
-    let fg = if danger {
-        t.danger_text
-    } else {
-        t.text_secondary
-    };
+    let fg = if danger { t.danger } else { t.text_secondary };
     div()
         .id(id)
         .flex()
@@ -338,7 +334,7 @@ pub fn menu_row(
         .cursor_pointer()
         .text_sm()
         .text_color(fg)
-        .hover(|s| s.bg(t.hover_strong).text_color(t.text_header))
+        .hover(|s| s.bg(t.hover).text_color(t.text_header))
         .when_some(icon.map(|i| (i, fg)), |d, (icon, color)| {
             d.child(icons::icon(icon, 15.0, color))
         })
@@ -374,7 +370,7 @@ pub fn menu_check(
         .cursor_pointer()
         .text_sm()
         .text_color(t.text_secondary)
-        .hover(|s| s.bg(t.hover_strong).text_color(t.text_header))
+        .hover(|s| s.bg(t.hover).text_color(t.text_header))
         .child(icons::icon(
             icon,
             15.0,
@@ -402,15 +398,91 @@ mod tests {
 
     #[test]
     fn palette_contrast_tokens_are_distinct() {
-        let t = Palette::dark();
+        let t = Palette::one_dark();
         assert_ne!(t.canvas, t.card, "card must lift off the canvas");
         assert_ne!(t.text_header, t.text_muted);
         assert_ne!(t.hover, t.pressed);
     }
 
+    /// The palette is Zed's One Dark, so the tokens that make it recognisable are
+    /// pinned to that theme's values.
+    ///
+    /// Without this the palette could quietly drift back towards adbshare's old
+    /// near-black scheme and nothing would fail.
+    #[test]
+    fn the_palette_is_zed_one_dark() {
+        use gpui::Rgba;
+        let t = Palette::one_dark();
+        let expect = |got: Rgba, want: u32, what: &str| {
+            assert_eq!(u32::from(got), want, "{what} is not Zed One Dark");
+        };
+
+        // surfaces
+        expect(t.canvas, 0x3B414DFF, "background");
+        expect(t.sidebar, 0x2F343EFF, "surface.background");
+        expect(t.card, 0x2F343EFF, "elevated_surface.background");
+        expect(t.surface_raised, 0x2E343EFF, "element.background");
+        expect(t.topbar_raised, 0x282C33FF, "toolbar.background");
+
+        // text
+        expect(t.text_header, 0xDCE0E5FF, "text");
+        expect(t.text_dim, 0xA9AFBCFF, "text.muted");
+        expect(t.text_muted, 0x878A98FF, "text.disabled");
+
+        // strokes
+        expect(t.border, 0x464B57FF, "border");
+        expect(t.border_soft, 0x363C46FF, "border.variant");
+
+        // semantic
+        expect(t.accent, 0x74ADE8FF, "text.accent");
+        expect(t.accent_muted, 0x47679EFF, "border.focused");
+        expect(t.success, 0xA1C181FF, "success");
+        expect(t.warning, 0xDEC184FF, "warning");
+        expect(t.danger, 0xD07277FF, "error");
+    }
+
+    /// Every text token has to be readable on every surface it is drawn over.
+    #[test]
+    fn text_stays_legible_on_every_surface() {
+        use gpui::colors::{Colors, DefaultAppearance};
+        let t = Palette::one_dark();
+        // The surfaces the UI actually paints on.
+        let surfaces = [t.canvas, t.sidebar, t.card, t.surface_raised];
+        let inks = [t.text_header, t.text_primary, t.text_dim, t.text_muted];
+
+        for ink in inks {
+            for surface in surfaces {
+                // Relative luminance, per WCAG. One Dark is a light-ish grey, so
+                // even `text.disabled` has to clear the large-text threshold.
+                let lum = |c: gpui::Rgba| {
+                    let f = |v: f32| {
+                        if v <= 0.03928 {
+                            v / 12.92
+                        } else {
+                            ((v + 0.055) / 1.055).powf(2.4)
+                        }
+                    };
+                    0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+                };
+                let (a, b) = (lum(ink), lum(surface));
+                let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                assert!(
+                    ratio >= 2.0,
+                    "ink {ink:?} on surface {surface:?} is only {ratio:.2}:1"
+                );
+            }
+        }
+        // And the theme GPUI itself would use agrees this is a dark theme.
+        let _ = Colors::dark();
+        assert_eq!(
+            DefaultAppearance::from(gpui::WindowAppearance::Dark),
+            DefaultAppearance::Dark
+        );
+    }
+
     #[test]
     fn tone_colors_cover_every_tone() {
-        let t = Palette::dark();
+        let t = Palette::one_dark();
         for tone in [
             StateTone::Active,
             StateTone::Neutral,

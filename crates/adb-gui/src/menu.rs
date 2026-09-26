@@ -215,7 +215,7 @@ where
                     .cursor_not_allowed()
                 };
                 row.w(px(min_width))
-                    .when(*prominent, |d| d.bg(t.hover_strong))
+                    .when(*prominent, |d| d.bg(t.hover))
                     .when_some(shortcut.clone(), |d, hint: String| {
                         // A hairline leader pushes the hint to the right edge,
                         // the way a native menu lays out accelerator keys.

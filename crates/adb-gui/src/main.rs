@@ -27,6 +27,8 @@ mod ui;
 use clap::Parser;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
 
+use theme::{WINDOW_H, WINDOW_MIN_H, WINDOW_MIN_W, WINDOW_W};
+
 use icons::AdbShareAssets;
 use protocol::TransferPolicy;
 
@@ -35,12 +37,8 @@ use protocol::TransferPolicy;
 #[command(name = "adb-gui", version, about = "GPUI frontend for adbshare")]
 struct Cli {}
 
-/// The initial window size, matching the GTK build.
-const WINDOW_W: f32 = 1000.0;
-const WINDOW_H: f32 = 680.0;
-/// The smallest useful window, also from the GTK build.
-const WINDOW_MIN_W: f32 = 360.0;
-const WINDOW_MIN_H: f32 = 400.0;
+// Window geometry lives in `theme`, so the benchmarks can lay out against the
+// same numbers the app does.
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()

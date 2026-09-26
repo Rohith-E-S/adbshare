@@ -182,7 +182,7 @@ impl AdbShareApp {
     /// Build the root view. Passed straight to `Application::open_window`.
     pub fn build(_window: &mut Window, cx: &mut App) -> Entity<Self> {
         let saved = Preferences::load();
-        let view = cx.new(|cx| Self::new(cx, &saved));
+        let view = Self::new_entity(_window, cx, &saved);
         // The browser's own view preferences live with the rest of them.
         view.update(cx, |this, cx| {
             let view_prefs = saved.view();
@@ -191,6 +191,11 @@ impl AdbShareApp {
         });
         Self::wire_up(&view, cx);
         view
+    }
+
+    /// The same, minus `wire_up`, for tests that drive the view directly.
+    pub fn new_entity(_window: &mut Window, cx: &mut App, saved: &Preferences) -> Entity<Self> {
+        cx.new(|cx| Self::new(cx, saved))
     }
 
     /// Construct the view with the given preferences already applied.
@@ -481,6 +486,13 @@ impl AdbShareApp {
                 .push("The selected phone disconnected", ToastTone::Warning);
             self.selection = None;
             self.browser.update(cx, |b, cx| b.set_idle(cx));
+        }
+        // The list is polled every three seconds and rarely differs. Re-rendering
+        // the whole window on an identical result is pure waste, and it is the
+        // reason the sidebar used to repaint while the user was reading a file
+        // name.
+        if devices == self.devices {
+            return;
         }
         self.devices = devices;
         cx.notify();
@@ -2272,7 +2284,7 @@ impl AdbShareApp {
             .w_full()
             .h(px(theme::TOPBAR_H))
             .px(px(8.0))
-            .bg(t.topbar_top)
+            .bg(t.topbar)
             .border_b_1()
             .border_color(t.border)
             .children(capsules)
@@ -2375,7 +2387,7 @@ impl AdbShareApp {
                     } else {
                         gpui::FontWeight::NORMAL
                     })
-                    .hover(|s| s.bg(t.hover_strong).text_color(t.text_header))
+                    .hover(|s| s.bg(t.hover).text_color(t.text_header))
                     .child(label.clone())
                     .on_click(move |_, _w, cx| {
                         // Navigate carries both the move and the fetch, so a
@@ -2401,9 +2413,11 @@ impl AdbShareApp {
             .min_w_0()
             .px(px(8.0))
             .rounded(px(theme::RADIUS_CAPSULE))
-            .bg(t.capsule_bg)
+            // `toolbar.background`: the darker step Zed uses for its strips,
+            // which is what a path bar is.
+            .bg(t.topbar_raised)
             .border_1()
-            .border_color(t.capsule_border)
+            .border_color(t.border_soft)
             .id("crumbs")
             .overflow_x_scroll()
             .scrollbar_width(px(0.0))
@@ -2437,7 +2451,7 @@ impl AdbShareApp {
             .cursor_pointer()
             .text_sm()
             .text_color(t.text_dim)
-            .hover(|s| s.bg(t.hover_strong).text_color(rgba(0xFFFFFFFF)))
+            .hover(|s| s.bg(t.hover).text_color(rgba(0xFFFFFFFF)))
             .child(icons::icon(names::EMBLEM_SYNC, 15.0, t.text_dim))
             .child("Transfers")
             .when(active > 0, |d| {
@@ -2461,7 +2475,7 @@ impl AdbShareApp {
             .size(px(theme::CAPSULE_H))
             .rounded(px(theme::RADIUS_CAPSULE))
             .cursor_pointer()
-            .hover(|s| s.bg(t.hover_strong))
+            .hover(|s| s.bg(t.hover))
             .child(icons::icon(names::VIEW_MORE, 15.0, t.text_dim))
             .on_click(cx.listener(|this, _e, _w, cx| {
                 this.overflow_open = !this.overflow_open;
@@ -2669,8 +2683,8 @@ impl AdbShareApp {
                             .gap(px(6.0))
                             .text_size(px(12.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(t.danger_text)
-                            .child(icons::icon(names::DIALOG_WARNING, 14.0, t.danger_text))
+                            .text_color(t.danger)
+                            .child(icons::icon(names::DIALOG_WARNING, 14.0, t.danger))
                             .child("Cannot reach adb-daemon"),
                     )
                     .child(
@@ -2690,7 +2704,7 @@ impl AdbShareApp {
                             .text_size(px(11.0))
                             .text_color(t.text_header)
                             .cursor_pointer()
-                            .hover(|s| s.text_color(t.danger_text))
+                            .hover(|s| s.text_color(t.danger))
                             .child(icons::icon(names::DIALOG_INFORMATION, 12.0, t.text_dim))
                             .child("Run connection diagnostics")
                             .on_click(cx.listener(|this, _e, _w, cx| {
@@ -2733,8 +2747,8 @@ impl AdbShareApp {
                 .cursor_pointer()
                 .text_size(px(12.0))
                 .text_color(t.text_dim)
-                .hover(|s| s.bg(t.hover_strong).text_color(rgba(0xFFFFFFFF)))
-                .child(icons::icon(names::WIRELESS, 15.0, t.text_dim))
+                .hover(|s| s.bg(t.hover).text_color(t.accent))
+                .child(icons::icon(names::WIRELESS, 15.0, t.text_muted))
                 .child("Connect via Wi-Fi")
                 .on_click(cx.listener(|this, _e, _w, cx| {
                     this.on_menu_select("connect-wifi", cx);
@@ -2838,9 +2852,11 @@ fn onboarding_card(t: &theme::Palette) -> gpui::Div {
         .px(px(10.0))
         .py(px(10.0))
         .rounded(px(10.0))
-        .bg(t.surface_raised)
+        // One Dark's panel is darker than its background, so a card on the
+        // sidebar has to use the *lighter* background token to read as raised.
+        .bg(t.canvas)
         .border_1()
-        .border_color(t.capsule_border)
+        .border_color(t.border_soft)
         .child(
             div()
                 .text_size(px(12.0))
@@ -2914,7 +2930,7 @@ fn device_card(
         head.push(
             ui::pill(
                 format!("{pct}%"),
-                if low { t.danger_text } else { t.text_dim },
+                if low { t.danger } else { t.text_dim },
                 rgba(0xFFFFFF14),
             )
             .into_any_element(),
@@ -2931,13 +2947,15 @@ fn device_card(
         .py(px(9.0))
         .rounded(px(theme::RADIUS_CARD))
         .cursor_pointer()
-        .bg(if active {
-            t.hover_strong
-        } else {
-            t.surface_raised
-        })
+        // A device card sits on the sidebar, so it takes the lighter surface to
+        // read as raised, and the focused border when it is the current device.
+        .bg(if active { t.selected } else { t.canvas })
         .border_1()
-        .border_color(if active { t.border } else { t.capsule_border })
+        .border_color(if active {
+            t.accent_muted
+        } else {
+            t.border_soft
+        })
         .child(div().flex().items_center().gap(px(7.0)).children(head));
 
     if let Some((used, total)) = device.storage.filter(|(_, total)| *total > 0) {
@@ -2987,11 +3005,7 @@ fn place_row(
         } else {
             rgba(0x00000000)
         })
-        .bg(if active {
-            t.hover_strong
-        } else {
-            rgba(0x00000000)
-        })
+        .bg(if active { t.hover } else { rgba(0x00000000) })
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
         .child(icons::icon(
             icon,
@@ -3111,7 +3125,7 @@ fn conflict_policy_row(
                 .px(px(7.0))
                 .h(px(24.0))
                 .rounded(px(6.0))
-                .bg(t.hover_strong)
+                .bg(t.hover)
                 .cursor_pointer()
                 .text_size(px(11.0))
                 .text_color(t.text_header)
@@ -3144,7 +3158,7 @@ fn conflict_policy_row(
                 .cursor_pointer()
                 .text_size(px(11.0))
                 .text_color(if verify { t.text_header } else { t.text_muted })
-                .hover(|s| s.bg(t.hover_strong))
+                .hover(|s| s.bg(t.hover))
                 .child(icons::icon(
                     names::CHECKBOX_CHECKED,
                     13.0,
@@ -3489,5 +3503,112 @@ mod tests {
             assert!(!this.toasts.is_empty());
             assert!(this.selection.is_none(), "the selection is dropped");
         });
+    }
+}
+
+#[cfg(test)]
+mod whole_window_bench {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Wraps an entity so a test window can render it.
+    ///
+    /// `add_window` needs a `Render`, and in GPUI 0.2.2 an `Entity<V>` is an
+    /// element rather than a `Render`, so the adapter is explicit.
+    struct RootView(Entity<AdbShareApp>);
+
+    impl Render for RootView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.clone()
+        }
+    }
+
+    /// Lay the browser out, so the browser benchmarks are comparable.
+    ///
+    /// `None` leaves the browser on its empty state, which is what isolates the
+    /// chrome's cost from the browser's.
+    fn populate(cx: &mut TestAppContext, view: &Entity<AdbShareApp>, count: Option<usize>) {
+        let Some(count) = count else { return };
+        cx.update(|app| {
+            view.update(app, |this, cx| {
+                this.select_local(std::path::Path::new("/usr/lib"), cx);
+            });
+        });
+        cx.update(|app| {
+            let browser = this_browser(app, view);
+            browser.update(app, |b, cx| {
+                b.install_entries(crate::browser::synthetic_listing(count));
+                cx.notify();
+            });
+        });
+    }
+
+    fn this_browser(app: &mut App, view: &Entity<AdbShareApp>) -> Entity<Browser> {
+        view.read(app).browser.clone()
+    }
+
+    /// Time a full layout pass of the whole window, not just the browser.
+    ///
+    /// The browser benchmarks measure the pane; this measures what the user
+    /// actually waits for, so a regression in the top bar, the sidebar or the
+    /// breadcrumb trail would show up here rather than hiding.
+    fn bench_window(cx: &mut TestAppContext, count: Option<usize>) -> f64 {
+        cx.update(crate::theme::install);
+        cx.update(|app| app.set_global(crate::protocol::TransferPolicy::default()));
+        let handle = cx.add_window(|window, app| {
+            let saved = Preferences::default();
+            RootView(AdbShareApp::new_entity(window, app, &saved))
+        });
+        let root = cx.update(|app| handle.root(app).expect("root view"));
+        let view = cx.update(|app| root.read(app).0.clone());
+        populate(cx, &view, count);
+        let vctx = cx.add_empty_window();
+
+        // Draw into the size the app root actually believes it has. It derives
+        // the browser's viewport from `window.viewport_size()`, so measuring it
+        // against any other box makes the grid build the wrong number of tiles —
+        // 252 instead of about 70 when the draw space was smaller than the test
+        // window, which put the whole-window figure three times out.
+        let space = vctx.update(|window, _| {
+            gpui::size(window.viewport_size().width, window.viewport_size().height)
+        });
+        let mut best = f64::MAX;
+        for _ in 0..12 {
+            let start = std::time::Instant::now();
+            let _ = vctx.draw(gpui::point(px(0.), px(0.)), space, |_w, _cx| view.clone());
+            best = best.min(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        let tiles = cx.update(|app| this_browser(app, &view).read(app).built_tiles());
+        // Printed so the figure can be read: the harness gives the test window
+        // the full test display, so this measures a much larger window than the
+        // app opens at, and the tile count scales with it.
+        let (w, h): (f32, f32) = (space.width.into(), space.height.into());
+        println!("    window {w:.0}x{h:.0}, {tiles} tiles built");
+        best
+    }
+
+    /// The cost of a whole frame, top bar and sidebar included.
+    ///
+    /// The test harness sizes its window to the full test display, which is much
+    /// larger than the 1000x680 the app opens at, so these absolute figures are
+    /// an upper bound rather than what a user sees. The per-tile cost they imply
+    /// is the useful part: it matches the browser-only benchmark, which is the
+    /// evidence that the whole-window figure is just tiles.
+    #[ignore = "benchmark"]
+    #[gpui::test]
+    async fn whole_window_layout_cost(_cx: &mut TestAppContext) {
+        // The chrome alone: no device, so the browser draws its empty state and
+        // everything left is the top bar, the sidebar and the bars.
+        let mut cx = TestAppContext::single();
+        let chrome = bench_window(&mut cx, None);
+        println!("bench window chrome only    {chrome:8.3} ms  (no browser)");
+        for count in [200usize, 1_000, 5_000] {
+            let mut cx = TestAppContext::single();
+            let ms = bench_window(&mut cx, Some(count));
+            println!(
+                "bench window n={count:<6}      {ms:8.3} ms  (+{:.3} for the browser)",
+                ms - chrome
+            );
+        }
     }
 }
