@@ -68,8 +68,15 @@ thread and every daemon call is dispatched onto it.
 The old GTK build needed a 975-line stylesheet. GPUI has no CSS cascade
 and no theme type of its own, so that stylesheet's palette and geometry
 now live in `theme.rs` as tokens, its repeated components as small
-builders in `ui.rs`, and its 48 Adwaita symbolic icons as an embedded
-SVG set in `icons.rs`.
+builders in `ui.rs`, and its icons as an embedded SVG set in `icons.rs`.
+
+The icons are 61 Lucide SVGs on a 24x24 grid with a 2px stroke, vendored
+by `crates/adb-gui/tools/fetch_icons.py` under the GTK build's semantic
+names (`folder-download.svg` is Lucide's `folder-down`), so call sites
+still read as intent. The file chooser goes through `ashpd` — the XDG
+desktop portal — rather than GTK4's `FileChooserNative`, which under
+Wayland was itself a portal client. See `crates/adb-gui/assets/icons/LICENSE`
+for Lucide's ISC notice.
 
 ## Wire protocol summary
 

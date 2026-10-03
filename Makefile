@@ -26,8 +26,12 @@ build:
 	$(CARGO) build --release --workspace
 
 .PHONY: test
+# Under a session bus, so the adb-daemon test that serves a mock
+# org.adbshare.Manager interface over the session D-Bus works when it is
+# enabled with --ignored. The default run passes with or without the wrapper;
+# the wrapper is what makes `make test --ignored` usable.
 test:
-	$(CARGO) test --workspace
+	dbus-run-session -- $(CARGO) test --workspace
 
 .PHONY: clean
 clean:

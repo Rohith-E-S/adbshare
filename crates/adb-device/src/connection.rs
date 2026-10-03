@@ -16,11 +16,11 @@ use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex as PlMutex;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::{mpsc, oneshot, Mutex},
+    sync::{Mutex, mpsc, oneshot},
 };
 
 use crate::error::{AdbError, Result};
-use crate::packet::{Message, Command, MAX_PAYLOAD};
+use crate::packet::{Command, MAX_PAYLOAD, Message};
 
 pub type LocalId = u32;
 pub type RemoteId = u32;
@@ -34,7 +34,11 @@ enum WriteReq {
     /// as-is.
     Frame(Message),
     /// Stream payload to be wrapped in a WRTE frame.
-    Data { local: LocalId, remote: RemoteId, payload: Bytes },
+    Data {
+        local: LocalId,
+        remote: RemoteId,
+        payload: Bytes,
+    },
 }
 
 /// How long to wait for the device's OKAY after sending OPEN.
@@ -121,19 +125,19 @@ impl AsyncWrite for Stream {
                 });
                 Poll::Pending
             }
-            Err(mpsc::error::TrySendError::Closed(())) => {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "connection writer closed",
-                )))
-            }
+            Err(mpsc::error::TrySendError::Closed(())) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "connection writer closed",
+            ))),
         }
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> { Poll::Ready(Ok(())) }
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
@@ -190,7 +194,8 @@ impl AdbConnection {
                         }
                     }
                 }
-                let len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+                let len =
+                    u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
                 if len > MAX_PAYLOAD {
                     // The claimed length is attacker-controlled; honouring it
                     // blindly would let a hostile peer wedge us with a ~4 GiB
@@ -305,7 +310,9 @@ impl AdbConnection {
         })
     }
 
-    pub fn serial(&self) -> &str { &self.serial }
+    pub fn serial(&self) -> &str {
+        &self.serial
+    }
 
     /// Abort an in-flight open: drop the pending reply slot and the
     /// pre-registered data channel for `local`.
@@ -411,20 +418,24 @@ mod tests {
             test();
             tx.send(()).unwrap();
         });
-        rx.recv_timeout(Duration::from_secs(5)).expect("stream read did not complete");
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("stream read did not complete");
         worker.join().unwrap();
     }
 
     fn stream() -> (mpsc::Sender<Bytes>, Stream) {
         let (tx, rx) = mpsc::channel(4);
         let (write_tx, _) = mpsc::channel(1);
-        (tx, Stream {
-            id: StreamId(1, 2),
-            rx,
-            incoming: Arc::new(PlMutex::new(None)),
-            write_tx,
-            close_tx: None,
-        })
+        (
+            tx,
+            Stream {
+                id: StreamId(1, 2),
+                rx,
+                incoming: Arc::new(PlMutex::new(None)),
+                write_tx,
+                close_tx: None,
+            },
+        )
     }
 
     fn read(stream: &mut Stream, bytes: &mut [u8]) -> Poll<usize> {

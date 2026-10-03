@@ -41,7 +41,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc pkgconf-pkg-config \
-            vulkan-loader-devel libxkbcommon-devel \
+            vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel \
             wayland-devel libX11-devel libXext-devel \
             fontconfig-devel freetype-devel \
             fuse3-devel libusbx-devel
@@ -66,18 +66,39 @@ jobs:
         # The GUI's headless tests use gpui's TestAppContext, which supplies a
         # fake platform window and drives layout in software, so no display
         # server and no GPU are needed — the Xvfb + GTK_CAIRO dance the GTK
-        # build required is gone. A session bus is still needed for the
-        # adb-daemon tests that serve a mock interface.
+        # build required is gone.
+        #
+        # dbus-run-session is kept for the adb-daemon test that serves a mock
+        # org.adbshare.Manager interface on the session bus. It is #[ignore]d,
+        # so the suite passes with or without the wrapper; keeping it means
+        # `--ignored` works without a second edit.
         run: |
           dnf install -y --setopt=install_weak_deps=False dbus-daemon
           dbus-run-session -- cargo test --workspace --locked
 
       - name: Smoke test the GUI binary
-        # Launch the real app briefly and let it tear itself down, so a panic
-        # during startup (a Vulkan or asset problem, say) fails the build
-        # rather than shipping. No display is needed for the binary to be
-        # linked, but it does need a Vulkan loader present to get that far.
-        run: ADB_GUI_AUTOCLOSE_MS=1500 ./target/release/adb-gui --version
+        # Launch the real app and let ADB_GUI_AUTOCLOSE_MS tear it down, so a
+        # panic during startup fails the build rather than shipping. This
+        # exercises Application::new(), Vulkan device selection, asset
+        # resolution and window creation — deliberately NOT `--version`, which
+        # exits inside clap's Cli::parse() before any of that runs and so only
+        # proves the binary links.
+        #
+        # Two things are needed for that and neither exists in a stock
+        # fedora:44 container. Xvfb supplies a display, because gpui's
+        # HeadlessClient::open_window bails with "neither DISPLAY nor
+        # WAYLAND_DISPLAY is set" and main.rs .expect()s on it.
+        # mesa-vulkan-drivers supplies lavapipe, because GPUI picks Vulkan
+        # unconditionally; it reports itself as `llvmpipe` with
+        # PHYSICAL_DEVICE_TYPE_CPU, which blade-graphics records as
+        # is_software_emulated rather than rejecting. VK_ICD_FILENAMES is set
+        # so the hardware ICDs, which find no device here, cannot interfere.
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            xorg-x11-server-Xvfb mesa-vulkan-drivers vulkan-tools
+          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          vulkaninfo --summary | grep -q 'llvmpipe'
+          ADB_GUI_AUTOCLOSE_MS=1500 xvfb-run -a ./target/release/adb-gui
 
       - name: Upload release binaries
         uses: actions/upload-artifact@v4
@@ -101,15 +122,20 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc pkgconf-pkg-config \
-            vulkan-loader-devel libxkbcommon-devel \
+            vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel \
             wayland-devel libX11-devel libXext-devel \
             fontconfig-devel freetype-devel \
             fuse3-devel libusbx-devel
 
+      # Matches `rust-toolchain.toml`. Pinned to an exact release rather than
+      # `stable`, so a new lint cannot turn the job red on a tree that passed
+      # locally. This is deliberately not the MSRV: lint sets move between
+      # releases, and holding CI to 1.88's lints would mean churning every
+      # `format!("{}", x)` in the tree for no behaviour change.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy
+          toolchain: '1.98.1'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -117,13 +143,11 @@ jobs:
           shared-key: clippy
           cache-on-failure: true
 
-      # Advisory: the pre-GPUI crates (transfer-engine,
-      # adbshare-proxy-device, test-adbfs) predate lint enforcement and still
-      # carry warnings. `adb-gui` itself is clean under `-D warnings`; a
-      # workspace-wide cleanup is a separate change.
-      - name: Lint (advisory)
+      # Both jobs below used to be `continue-on-error`, so a workspace that had
+      # never been formatted or linted still reported green. The tree is clean
+      # now; keep it that way.
+      - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-        continue-on-error: true
 
   fmt:
     runs-on: ubuntu-latest
@@ -132,16 +156,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Matches `rust-toolchain.toml`: rustfmt's output moves between releases,
+      # so a `stable` here would disagree with every developer's local run.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt
+          toolchain: '1.98.1'
 
-      # Advisory for the same reason as clippy: the other crates have never
-      # been run through rustfmt.
-      - name: Format check (advisory)
+      - name: Format check
         run: cargo fmt --all -- --check
-        continue-on-error: true
+
+  msrv:
+    runs-on: ubuntu-latest
+    # Every other job builds with `stable`, so a `rust-version` regression
+    # below the declared MSRV would go unnoticed. This pins the declared
+    # minimum and type-checks the workspace against it. `check` rather than
+    # `build`: MSRV is about what the compiler accepts, and a full release
+    # build here would triple the job for no extra signal.
+    container: fedora:44
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc pkgconf-pkg-config \
+            vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel \
+            wayland-devel libX11-devel libXext-devel \
+            fontconfig-devel freetype-devel \
+            fuse3-devel libusbx-devel
+
+      - name: Install the declared MSRV
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Keep in sync with `rust-version` in the root Cargo.toml.
+          toolchain: '1.88.0'
+
+      - name: Check the workspace on the MSRV
+        run: cargo check --workspace --locked
 
   audit:
     runs-on: ubuntu-latest

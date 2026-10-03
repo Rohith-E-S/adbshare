@@ -1,0 +1,9 @@
+[toolchain]
+# The toolchain used for building, `cargo fmt` and `cargo clippy` — pinned to an
+# exact release so a formatting or lint change on a newer stable cannot turn CI
+# red on a tree that passed locally. Bump deliberately.
+#
+# This is NOT the MSRV. `rust-version` in the root Cargo.toml is the promise, and
+# the `msrv` CI job is what checks it.
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

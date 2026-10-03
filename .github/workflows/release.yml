@@ -46,7 +46,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc pkgconf-pkg-config file \
-            vulkan-loader-devel libxkbcommon-devel \
+            vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel \
             wayland-devel libX11-devel libXext-devel \
             fontconfig-devel freetype-devel \
             fuse3-devel libusbx-devel
@@ -81,6 +81,12 @@ jobs:
         run: cargo build --release --locked --bin adb-gui --bin adb-daemon --bin adbshare-proxy
 
       - name: Smoke test binaries
+        # `--version` exits inside clap's Cli::parse(), before
+        # Application::new(), so this proves the binaries link and their
+        # argument parsers work — nothing more. The real startup smoke test
+        # (Vulkan, assets, window creation) lives in ci.yml, where a
+        # lavapipe + Xvfb stack can be installed for it.
+        #
         # NOTE: adbshare-proxy takes a port number as $1 (no clap), so never
         # run it with --help here — it would bind 127.0.0.1:31337 and hang
         # the job. Just verify it exists and is an ELF binary.
@@ -97,6 +103,7 @@ jobs:
                    dist/root/usr/share/applications \
                    dist/root/usr/share/icons/hicolor/scalable/apps \
                    dist/root/usr/share/dbus-1/services \
+                   dist/root/usr/share/doc/adbshare \
                    dist/root/usr/lib/systemd/user
           install -Dm755 target/release/adb-gui dist/root/usr/bin/adb-gui
           install -Dm755 target/release/adb-daemon dist/root/usr/bin/adb-daemon
@@ -105,6 +112,10 @@ jobs:
           install -Dm644 assets/org.adbshare.Gui.svg dist/root/usr/share/icons/hicolor/scalable/apps/org.adbshare.Gui.svg
           install -Dm644 packaging/dbus/org.adbshare.Manager.service dist/root/usr/share/dbus-1/services/org.adbshare.Manager.service
           install -Dm644 packaging/systemd/adbshare-daemon.service dist/root/usr/lib/systemd/user/adbshare-daemon.service
+          # The 61 Lucide SVGs are compiled into adb-gui by the asset_table! in
+          # crates/adb-gui/src/icons.rs, so their ISC notice has to travel with
+          # the binary. It is not embedded in the binary itself, so ship it.
+          install -Dm644 crates/adb-gui/assets/icons/LICENSE dist/root/usr/share/doc/adbshare/icons-LICENSE
           tar -czf "dist/adbshare-${{ steps.version.outputs.tag }}-x86_64-linux.tar.gz" -C dist/root .
           (cd dist && sha256sum "adbshare-${{ steps.version.outputs.tag }}-x86_64-linux.tar.gz" > SHA256SUMS-linux.txt)
           echo "${{ steps.version.outputs.tag }}" > dist/TAG

@@ -22,9 +22,9 @@ pub mod packet;
 pub mod transport;
 pub mod watcher;
 
-pub use auth::{generate_key, load_or_create_key, AdbKey};
+pub use auth::{AdbKey, generate_key, load_or_create_key};
 pub use connection::{AdbConnection, StreamId};
 pub use device::{DeviceId, DeviceInfo, DeviceState};
 pub use error::{AdbError, Result};
-pub use transport::{Transport, TransportKind, UsbTransport, TcpTransport};
+pub use transport::{TcpTransport, Transport, TransportKind, UsbTransport};
 pub use watcher::DeviceWatcher;

@@ -9,8 +9,6 @@ stitch_adb_nautilus_file_manager/
 stitch_signal_deck/
 
 # Local tool state
-.zcode/
-.stitch/
 
 # Editor / IDE
 .idea/

@@ -8,14 +8,17 @@
 //! Note: `adbd` (the device side) only accepts RSA SHA-1 signatures, so the
 //! algorithm choice is fixed by the protocol.
 
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use pkcs1::DecodeRsaPrivateKey;
 use rsa::{
+    RsaPrivateKey,
     pkcs1v15::{Signature, SigningKey},
     pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding},
     signature::{RandomizedSigner, SignatureEncoding},
-    RsaPrivateKey,
 };
 use sha1::Sha1;
 use ssh_key::private::PrivateKey as SshPrivateKey;
@@ -34,12 +37,22 @@ pub struct AdbKey {
 impl AdbKey {
     pub fn from_pkcs8_der(pkcs8_der: Vec<u8>, path: PathBuf) -> Result<Self> {
         let ssh_pub = ssh_pub_from_pkcs8(&pkcs8_der)?;
-        Ok(Self { pkcs8_der, ssh_pub, path })
+        Ok(Self {
+            pkcs8_der,
+            ssh_pub,
+            path,
+        })
     }
 
-    pub fn ssh_public(&self) -> &[u8] { &self.ssh_pub }
-    pub fn pkcs8_der(&self) -> &[u8] { &self.pkcs8_der }
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn ssh_public(&self) -> &[u8] {
+        &self.ssh_pub
+    }
+    pub fn pkcs8_der(&self) -> &[u8] {
+        &self.pkcs8_der
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     /// Sign a 20-byte SHA-1 token sent by the device during AUTH.
     pub fn sign(&self, token: &[u8]) -> Result<Vec<u8>> {
@@ -89,7 +102,11 @@ fn store_key(key: RsaPrivateKey, store_path: &Path) -> Result<AdbKey> {
         .as_bytes()
         .to_vec();
     let ssh_pub = ssh_pub_from_pkcs8(&pkcs8_der)?;
-    Ok(AdbKey { pkcs8_der, ssh_pub, path: store_path.to_path_buf() })
+    Ok(AdbKey {
+        pkcs8_der,
+        ssh_pub,
+        path: store_path.to_path_buf(),
+    })
 }
 
 pub fn generate_key(path: &Path) -> Result<AdbKey> {
@@ -105,7 +122,11 @@ pub fn generate_key(path: &Path) -> Result<AdbKey> {
     write_private_file(path, pem.as_bytes())?;
 
     let ssh_pub = ssh_pub_from_pkcs8(&pkcs8_der)?;
-    Ok(AdbKey { pkcs8_der, ssh_pub, path: path.to_path_buf() })
+    Ok(AdbKey {
+        pkcs8_der,
+        ssh_pub,
+        path: path.to_path_buf(),
+    })
 }
 
 pub fn load_or_create_key() -> Result<AdbKey> {
@@ -121,25 +142,25 @@ pub fn load_or_create_key() -> Result<AdbKey> {
         }
     }
 
-    if let Some(android_path) = android_adb_key_path() {
-        if android_path.exists() {
-            // Try OpenSSH first (old adb), then PKCS#8 (new adb since 2017),
-            // then PKCS#1 ("BEGIN RSA PRIVATE KEY", the classic ~/.android/adbkey).
-            const IMPORTERS: [fn(&Path, &Path) -> Result<AdbKey>; 3] =
-                [import_openssh, import_pkcs8_pem, import_pkcs1_pem];
-            for import in IMPORTERS {
-                match import(&android_path, &our_path) {
-                    Ok(k) => return Ok(k),
-                    Err(e) => {
-                        tracing::debug!(?e, path = %android_path.display(), "key import attempt failed");
-                    }
+    if let Some(android_path) = android_adb_key_path()
+        && android_path.exists()
+    {
+        // Try OpenSSH first (old adb), then PKCS#8 (new adb since 2017),
+        // then PKCS#1 ("BEGIN RSA PRIVATE KEY", the classic ~/.android/adbkey).
+        const IMPORTERS: [fn(&Path, &Path) -> Result<AdbKey>; 3] =
+            [import_openssh, import_pkcs8_pem, import_pkcs1_pem];
+        for import in IMPORTERS {
+            match import(&android_path, &our_path) {
+                Ok(k) => return Ok(k),
+                Err(e) => {
+                    tracing::debug!(?e, path = %android_path.display(), "key import attempt failed");
                 }
             }
-            tracing::warn!(
-                path = %android_path.display(),
-                "could not import existing adb key; generating a fresh one"
-            );
         }
+        tracing::warn!(
+            path = %android_path.display(),
+            "could not import existing adb key; generating a fresh one"
+        );
     }
 
     generate_key(&our_path)
@@ -153,8 +174,9 @@ fn load_pkcs8_pem(pem_path: &Path, store_path: &Path) -> Result<AdbKey> {
         Err(e) => {
             // Tolerate a PKCS#1 file that ended up at our store path too.
             tracing::debug!(?e, "not pkcs8 pem; trying pkcs1");
-            RsaPrivateKey::from_pkcs1_pem(&pem_str)
-                .map_err(|e1| AdbError::Other(format!("parse pkcs8 pem: {e}; parse pkcs1 pem: {e1}")))?
+            RsaPrivateKey::from_pkcs1_pem(&pem_str).map_err(|e1| {
+                AdbError::Other(format!("parse pkcs8 pem: {e}; parse pkcs1 pem: {e1}"))
+            })?
         }
     };
     store_key(key, store_path)
@@ -229,7 +251,8 @@ fn current_hostname() -> String {
     // HOSTNAME is set by most shells; fall back to the kernel hostname file
     // (nix's gethostname() is gated behind a feature we can't enable here
     // without adding a dependency feature).
-    std::env::var("HOSTNAME").ok()
+    std::env::var("HOSTNAME")
+        .ok()
         .or_else(|| {
             fs::read_to_string("/proc/sys/kernel/hostname")
                 .or_else(|_| fs::read_to_string("/etc/hostname"))
@@ -252,8 +275,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(TABLE[(n >> 18) as usize & 63] as char);
         out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -271,7 +302,7 @@ fn push_ssh_mpint(out: &mut Vec<u8>, bytes: &[u8]) {
     while v.len() > 1 && v[0] == 0 {
         v = &v[1..];
     }
-    if v.first().map_or(false, |b| *b & 0x80 != 0) {
+    if v.first().is_some_and(|b| *b & 0x80 != 0) {
         out.extend_from_slice(&((v.len() + 1) as u32).to_be_bytes());
         out.push(0);
         out.extend_from_slice(v);

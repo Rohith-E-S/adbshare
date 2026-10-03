@@ -23,9 +23,9 @@ No companion Android app is needed. The daemon automatically deploys a small exe
 
 You need:
 
-- A Linux desktop with a graphical session and user/session D-Bus.
-- Rust and Cargo. The workspace declares Rust 1.85 or newer; current stable is recommended.
-- A **Vulkan** capable GPU and driver, **xkbcommon**, the **Wayland** (or X11) client libraries, FUSE 3, a C build toolchain, and `pkg-config`.
+- A Linux desktop with a graphical session, user/session D-Bus, and an **XDG desktop portal** implementation. The file chooser dialogs go through the portal (`org.freedesktop.portal.FileChooser`), so a session with no portal backend — a bare `tty`, or a container without `xdg-desktop-portal` — can browse and transfer but cannot open a file picker. On GNOME this is `xdg-desktop-portal-gnome`, on KDE `xdg-desktop-portal-kde`.
+- Rust and Cargo. The workspace declares Rust 1.88 or newer; current stable is recommended.
+- A **Vulkan** capable GPU and driver, **xkbcommon** (including the x11 part), the **Wayland** (or X11) client libraries, FUSE 3, a C build toolchain, and `pkg-config`. GPUI has no OpenGL fallback, so a Vulkan driver is mandatory. Without a hardware GPU, install Mesa's **lavapipe** software driver — `mesa-vulkan-drivers` on Fedora and Debian/Ubuntu — and check it with `vulkaninfo --summary`; it reports an `llvmpipe` device and satisfies GPUI the same way a real driver does. Arch ships its Vulkan drivers as separate `vulkan-*` packages, so take the one matching your GPU (or `vulkan-radeon` and friends) rather than the `mesa` package.
 - Android platform tools: the `adb` command must be on your `PATH`.
 - An Android phone with USB debugging or Wireless debugging enabled. A USB cable is optional for Wi-Fi setup.
 - A helper binary built for your **phone's architecture**, as explained below.
@@ -41,7 +41,7 @@ sudo pacman -S --needed base-devel pkgconf vulkan-icd-loader libxkbcommon waylan
 On Fedora (CI currently builds on Fedora 44):
 
 ```sh
-sudo dnf install gcc pkgconf-pkg-config vulkan-loader-devel libxkbcommon-devel wayland-devel libX11-devel libXext-devel fontconfig-devel freetype-devel fuse3-devel libusbx-devel android-tools
+sudo dnf install gcc pkgconf-pkg-config vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel libX11-devel libXext-devel fontconfig-devel freetype-devel fuse3-devel libusbx-devel android-tools
 ```
 
 On Debian/Ubuntu, development packages are named `build-essential`, `pkg-config`, `libvulkan-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libxext-dev`, `libfontconfig1-dev`, `libfuse3-dev`, and `libusb-1.0-0-dev`; also install `adb` and `fuse3`.
@@ -54,7 +54,7 @@ adb version
 pkg-config --modversion vulkan xkbcommon wayland-client fontconfig freetype2 fuse3
 ```
 
-External file opening uses `xdg-open`; local Trash operations use `gio`. Terminal opening requires `gnome-terminal` or `x-terminal-emulator`.
+External file opening uses `xdg-open`. Local Trash is implemented in-process against the XDG Trash specification — files move to `~/.local/share/Trash/files` with a matching `.trashinfo` record in `~/.local/share/Trash/info` so other file managers offer "Restore" — so no `gio` or `trash-cli` is needed; a cross-filesystem move falls back to copy-then-delete. Terminal opening tries `gnome-terminal`, `kgx`, `xfce4-terminal`, `x-terminal-emulator`, `konsole`, `alacritty`, and `kitty`, in that order.
 
 ### Prepare your phone
 
@@ -225,7 +225,9 @@ Use **Install APK…** in the more-options menu, or the APK context action. Drop
 | Phone does not appear | Run `adb devices -l`, unlock/authorize the phone, and check USB permissions. Then inspect the daemon log: a device appears only after helper setup succeeds. |
 | Helper missing or fails to start | Check the phone ABI and `ADBSHARE_PROXY_BIN`. An x86-64 host executable will not run on an ARM64 phone. |
 | A setting did not stick | The sidebar width, grid zoom, layout, sort order and hidden-file toggle are saved to `~/.config/adbshare/gui.json` when they change. A file that cannot be read or parsed falls back to the defaults rather than failing, and out-of-range values are clamped. |
-| Build fails on a native library | Check `pkg-config --modversion vulkan xkbcommon wayland-client fontconfig freetype2 fuse3`; installing headers alone does not ensure the versions GPUI needs. |
+| Build fails on a native library | Check `pkg-config --modversion vulkan xkbcommon wayland-client fontconfig freetype2 fuse3`; installing headers alone does not ensure the versions GPUI needs. On Fedora the xkbcommon x11 half is a separate package, `libxkbcommon-x11-devel`, or the link fails with `unable to find library -lxkbcommon-x11`. |
+| GUI exits at startup, or no window | GPUI needs Vulkan and a display. Check `vulkaninfo --summary` lists a device and that `DISPLAY` or `WAYLAND_DISPLAY` is set. Without a GPU, install `mesa-vulkan-drivers` for lavapipe. |
+| A file picker fails to open | The chooser needs an XDG desktop portal. Check `busctl --user status org.freedesktop.portal.Desktop`, and install `xdg-desktop-portal-gnome` (GNOME) or `xdg-desktop-portal-kde` (KDE) if nothing owns that name. |
 | Transfer says skipped | The destination already exists. Save under another name or handle the existing file yourself. |
 | File not visible after upload | Wait for completion and press `F5`. |
 | External opening or drag-out fails | Check FUSE, `fusermount3`, `/dev/fuse`, and `xdg-open`. In-app browsing may work even when mounting fails. |

@@ -93,7 +93,12 @@ impl Message {
     pub const HEADER_LEN: usize = 24;
 
     pub fn new(command: Command, arg0: u32, arg1: u32, payload: Bytes) -> Self {
-        Self { command, arg0, arg1, payload }
+        Self {
+            command,
+            arg0,
+            arg1,
+            payload,
+        }
     }
 
     pub fn encode(&self) -> BytesMut {
@@ -101,7 +106,8 @@ impl Message {
         // this crate; it now fails loudly instead of silently truncating a
         // payload >4 GiB into a bogus 32-bit length. Prefer `try_encode` for
         // fallible handling.
-        self.try_encode().expect("payload exceeds the 32-bit ADB data_length field")
+        self.try_encode()
+            .expect("payload exceeds the 32-bit ADB data_length field")
     }
 
     /// Like [`Message::encode`], but returns an error instead of panicking
@@ -136,8 +142,9 @@ impl Message {
         let data_crc = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
         let magic = u32::from_le_bytes([h[20], h[21], h[22], h[23]]);
 
-        let command = Command::from_u32(command)
-            .ok_or_else(|| crate::AdbError::InvalidResponse(format!("unknown command 0x{:08x}", command)))?;
+        let command = Command::from_u32(command).ok_or_else(|| {
+            crate::AdbError::InvalidResponse(format!("unknown command 0x{:08x}", command))
+        })?;
 
         if magic != (command.as_u32() ^ 0xFFFF_FFFF) {
             return Err(crate::AdbError::InvalidResponse("magic mismatch".into()));
@@ -157,7 +164,12 @@ impl Message {
             )));
         }
 
-        Ok(Self { command, arg0, arg1, payload })
+        Ok(Self {
+            command,
+            arg0,
+            arg1,
+            payload,
+        })
     }
 }
 

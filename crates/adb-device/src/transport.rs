@@ -17,13 +17,13 @@ use bytes::Bytes;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{mpsc, oneshot, Mutex},
+    sync::{Mutex, mpsc, oneshot},
 };
 
 use crate::{
     connection::AdbConnection,
     error::{AdbError, Result},
-    packet::{Message, ADB_VERSION},
+    packet::{ADB_VERSION, Message},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,7 +69,12 @@ impl std::fmt::Debug for StreamTransport {
 }
 
 impl StreamTransport {
-    pub fn new(kind: TransportKind, serial: String, reader: BoxedReader, writer: BoxedWriter) -> Self {
+    pub fn new(
+        kind: TransportKind,
+        serial: String,
+        reader: BoxedReader,
+        writer: BoxedWriter,
+    ) -> Self {
         Self::with_key(kind, serial, reader, writer, None)
     }
 
@@ -102,7 +107,8 @@ impl StreamTransport {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         }
-        let data_len = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        let data_len =
+            u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
         if data_len > MAX_PAYLOAD {
             return Err(AdbError::InvalidResponse(format!(
                 "ADB payload too large: {data_len}"
@@ -113,10 +119,7 @@ impl StreamTransport {
         Ok(Some(Message::decode(&header, Bytes::from(payload))?))
     }
 
-    async fn write_message(
-        writer: &mut BoxedWriter,
-        msg: &Message,
-    ) -> Result<()> {
+    async fn write_message(writer: &mut BoxedWriter, msg: &Message) -> Result<()> {
         writer.write_all(&msg.encode()).await?;
         writer.flush().await?;
         Ok(())
@@ -125,8 +128,12 @@ impl StreamTransport {
 
 #[async_trait]
 impl Transport for StreamTransport {
-    fn kind(&self) -> TransportKind { self.kind }
-    fn serial(&self) -> &str { &self.serial }
+    fn kind(&self) -> TransportKind {
+        self.kind
+    }
+    fn serial(&self) -> &str {
+        &self.serial
+    }
 
     async fn open(&self) -> Result<AdbConnection> {
         let mut writer = self.writer.lock().await;
@@ -176,7 +183,8 @@ impl Transport for StreamTransport {
                 None => return Err(AdbError::Disconnected),
             };
 
-            if msg.command == crate::packet::Command::Auth && msg.arg0 == crate::packet::AUTH_TOKEN {
+            if msg.command == crate::packet::Command::Auth && msg.arg0 == crate::packet::AUTH_TOKEN
+            {
                 // Signature rejected: send our public key (Android public-key
                 // text format, NUL-terminated) and wait for CNXN.
                 let pk_msg = Message::new(
@@ -202,7 +210,12 @@ impl Transport for StreamTransport {
         }
 
         drop(reader);
-        AdbConnection::from_parts(self.serial.clone(), self.reader.clone(), self.writer.clone()).await
+        AdbConnection::from_parts(
+            self.serial.clone(),
+            self.reader.clone(),
+            self.writer.clone(),
+        )
+        .await
     }
 }
 
@@ -216,8 +229,12 @@ pub struct TcpTransport {
 
 #[async_trait]
 impl Transport for TcpTransport {
-    fn kind(&self) -> TransportKind { TransportKind::Tcp }
-    fn serial(&self) -> &str { &self.serial }
+    fn kind(&self) -> TransportKind {
+        TransportKind::Tcp
+    }
+    fn serial(&self) -> &str {
+        &self.serial
+    }
 
     async fn open(&self) -> Result<AdbConnection> {
         let stream = TcpStream::connect(&self.addr).await?;
@@ -246,8 +263,12 @@ pub struct UsbTransport {
 
 #[async_trait]
 impl Transport for UsbTransport {
-    fn kind(&self) -> TransportKind { TransportKind::Usb }
-    fn serial(&self) -> &str { &self.serial }
+    fn kind(&self) -> TransportKind {
+        TransportKind::Usb
+    }
+    fn serial(&self) -> &str {
+        &self.serial
+    }
 
     async fn open(&self) -> Result<AdbConnection> {
         // Open the device in a blocking context and bridge it through a pump thread.
@@ -262,12 +283,7 @@ impl Transport for UsbTransport {
             let _ = tx.send(result);
         });
         let (reader, writer) = rx.await.map_err(|_| AdbError::Disconnected)??;
-        let inner = StreamTransport::new(
-            TransportKind::Usb,
-            self.serial.clone(),
-            reader,
-            writer,
-        );
+        let inner = StreamTransport::new(TransportKind::Usb, self.serial.clone(), reader, writer);
         inner.open().await
     }
 }
@@ -297,10 +313,10 @@ fn open_usb_pump(
     if handle.set_auto_detach_kernel_driver(true).is_err() {
         // libusb may not support auto-detach on this platform; fall back to
         // a manual detach.
-        if handle.kernel_driver_active(iface).unwrap_or(false) {
-            if let Err(e) = handle.detach_kernel_driver(iface) {
-                tracing::warn!(error = ?e, interface = iface, "failed to detach kernel driver");
-            }
+        if handle.kernel_driver_active(iface).unwrap_or(false)
+            && let Err(e) = handle.detach_kernel_driver(iface)
+        {
+            tracing::warn!(error = ?e, interface = iface, "failed to detach kernel driver");
         }
     }
     handle.claim_interface(iface)?;
@@ -364,7 +380,10 @@ fn open_usb_pump(
         })?;
 
     // Wrap mpsc receivers/senders as AsyncRead/AsyncWrite.
-    let reader = ChannelReader { rx: rx_to_app, pending: None };
+    let reader = ChannelReader {
+        rx: rx_to_app,
+        pending: None,
+    };
     let writer = ChannelWriter { tx: tx_from_app };
     Ok((Box::new(reader), Box::new(writer)))
 }
@@ -437,9 +456,10 @@ impl tokio::io::AsyncWrite for ChannelWriter {
                 });
                 Poll::Pending
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "usb pump closed")))
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "usb pump closed",
+            ))),
         }
     }
 
