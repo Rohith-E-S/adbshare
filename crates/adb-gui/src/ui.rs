@@ -19,6 +19,16 @@ use crate::icons::{self, names};
 use crate::protocol::StateTone;
 use crate::theme::{self, Palette, Themed};
 
+/// The colour a chrome icon wears for its meaning.
+///
+/// Every icon in the UI is asked for by name, so the colour travels with it:
+/// `ui::icon_tint(names::TRASH, t)` is red without the call site saying so. Pass
+/// the result to [`icons::icon`] or [`icons::icon_or_art`], or override it where
+/// a state needs the icon to follow its label instead — a selected row, say.
+pub fn icon_tint(key: &'static str, t: &Palette) -> Rgba {
+    t.hue(icons::hue(key))
+}
+
 /// Build an [`ElementId`] from a runtime string.
 ///
 /// `ElementId` implements `From<SharedString>` but not `From<String>`, so any id
@@ -31,8 +41,8 @@ pub fn el_id(text: impl Into<gpui::SharedString>) -> ElementId {
 
 /// A square, borderless icon button: the building block of every capsule.
 ///
-/// `tint` is the resting icon colour; hover and pressed states come from the
-/// palette.
+/// `tint` is the icon's resting colour; pass [`icon_tint`] for the colour the
+/// icon's meaning calls for. Hover and pressed states come from the palette.
 pub fn icon_button(
     t: &Palette,
     id: impl Into<ElementId>,
@@ -65,7 +75,13 @@ pub fn icon_button_active(
     active: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
-    let tint = if active { t.text_header } else { t.text_dim };
+    // A toggle shows which half is on by giving that half its colour and
+    // leaving the other in body text, so a pair reads as one control.
+    let tint = if active {
+        t.hue(icons::hue(icon))
+    } else {
+        t.text_muted
+    };
     div()
         .id(id)
         .flex()
@@ -82,6 +98,9 @@ pub fn icon_button_active(
 
 /// An icon button that is drawn dimmed and ignores clicks, for actions that need
 /// something selected first.
+///
+/// The icon keeps its own hue and the whole button is faded, so a disabled
+/// delete still reads as delete rather than as an anonymous grey square.
 pub fn icon_button_disabled(t: &Palette, icon: &'static str, size: f32) -> Div {
     div()
         .flex()
@@ -90,7 +109,7 @@ pub fn icon_button_disabled(t: &Palette, icon: &'static str, size: f32) -> Div {
         .size(px(size))
         .rounded(px(theme::RADIUS_CAPSULE_BTN))
         .opacity(0.35)
-        .child(icons::icon(icon, size * 0.53, t.text_muted))
+        .child(icons::icon(icon, size * 0.53, icon_tint(icon, t)))
 }
 
 /// A rounded container that groups 2–4 icon buttons, matching `.pill-capsule`.
@@ -115,6 +134,7 @@ pub fn capsule_separator(t: &Palette) -> Div {
 
 /// The destructive variant of a dialog button.
 pub fn danger_button(
+    t: &Palette,
     id: impl Into<ElementId>,
     label: impl Into<gpui::SharedString>,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
@@ -128,10 +148,10 @@ pub fn danger_button(
         .rounded(px(8.0))
         .text_sm()
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgba(0xFFFFFFFF))
-        .bg(rgba(0xEF4444E6))
+        .text_color(t.text_inverse)
+        .bg(t.danger_border)
         .cursor_pointer()
-        .hover(|s| s.bg(rgba(0xEF4444FF)))
+        .hover(|s| s.bg(t.danger))
         .child(label.into())
         .on_click(on_click)
 }
@@ -148,12 +168,12 @@ pub fn button(
     let idle_bg = if primary {
         t.text_header
     } else {
-        rgba(0xFFFFFF14)
+        t.secondary_bg
     };
     let hover_bg = if primary {
-        rgba(0xFFFFFFFF)
+        t.text_secondary
     } else {
-        rgba(0xFFFFFF26)
+        t.secondary_bg_hover
     };
     div()
         .id(id)
@@ -166,7 +186,7 @@ pub fn button(
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .text_color(if primary {
-            t.text_inverse
+            t.text_on_light
         } else {
             t.text_primary
         })
@@ -223,14 +243,18 @@ pub fn pill(text: impl Into<gpui::SharedString>, fg: Rgba, bg: Rgba) -> Div {
         .child(text.into())
 }
 
-/// Resolve a [`StateTone`] to the pill colours the old `pill-*` classes used.
+/// Resolve a [`StateTone`] to the pill colours.
+///
+/// `Active` is the one filled pill, so it is the one that needs dark ink;
+/// every other tone is a 16% wash of its own hue, which is the step T3 Code
+/// uses for every tone surface.
 pub fn tone_colors(t: &Palette, tone: StateTone) -> (Rgba, Rgba) {
     match tone {
-        StateTone::Active => (t.text_inverse, t.text_header),
-        StateTone::Neutral => (t.text_dim, rgba(0xFFFFFF14)),
-        StateTone::Success => (t.success, rgba(0x22C55E1F)),
-        StateTone::Warning => (t.warning, rgba(0xFACC151F)),
-        StateTone::Danger => (t.danger, rgba(0xEF44441F)),
+        StateTone::Active => (t.text_on_light, t.text_header),
+        StateTone::Neutral => (t.text_dim, t.secondary_bg),
+        StateTone::Success => (t.success, t.success_soft),
+        StateTone::Warning => (t.warning, t.warning_soft),
+        StateTone::Danger => (t.danger, t.danger_soft),
     }
 }
 
@@ -314,6 +338,9 @@ pub fn on_top(content: impl IntoElement) -> impl IntoElement {
 }
 
 /// A menu row for the kebab menu and context menus.
+///
+/// The icon keeps its own colour so a row of them can be scanned by hue, and
+/// only the label follows the row's hover and selection state.
 pub fn menu_row(
     t: &Palette,
     id: impl Into<ElementId>,
@@ -322,7 +349,11 @@ pub fn menu_row(
     danger: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> Stateful<Div> {
-    let fg = if danger { t.danger } else { t.text_secondary };
+    let fg = if danger {
+        t.text_primary
+    } else {
+        t.text_secondary
+    };
     div()
         .id(id)
         .flex()
@@ -333,10 +364,10 @@ pub fn menu_row(
         .py(px(7.0))
         .cursor_pointer()
         .text_sm()
-        .text_color(fg)
+        .text_color(if danger { t.danger } else { fg })
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
-        .when_some(icon.map(|i| (i, fg)), |d, (icon, color)| {
-            d.child(icons::icon_or_art(icon, 15.0, color))
+        .when_some(icon, |d, icon| {
+            d.child(icons::icon_or_art(icon, 15.0, icon_tint(icon, t)))
         })
         .child(label.to_string())
         .on_click(on_click)
@@ -375,7 +406,7 @@ pub fn menu_check(
             icon,
             15.0,
             if checked {
-                t.text_header
+                icon_tint(icon, t)
             } else {
                 rgba(0x00000000)
             },
@@ -386,9 +417,11 @@ pub fn menu_check(
 
 /// A right-pointing chevron for breadcrumb separators.
 pub fn breadcrumb_separator(t: &Palette) -> Div {
-    div()
-        .px(px(2.0))
-        .child(icons::icon(names::GO_NEXT, 11.0, t.text_muted))
+    div().px(px(2.0)).child(icons::icon(
+        names::GO_NEXT,
+        11.0,
+        icon_tint(names::GO_NEXT, t),
+    ))
 }
 
 // ── Tooltips ─────────────────────────────────────────────────────────────────
@@ -477,62 +510,137 @@ mod tests {
 
     #[test]
     fn palette_contrast_tokens_are_distinct() {
-        let t = Palette::one_dark();
+        let t = Palette::t3_dark();
         assert_ne!(t.canvas, t.card, "card must lift off the canvas");
         assert_ne!(t.text_header, t.text_muted);
         assert_ne!(t.hover, t.pressed);
     }
 
-    /// The palette is Zed's One Dark, so the tokens that make it recognisable are
-    /// pinned to that theme's values.
+    /// The palette is T3 Code's dark theme, so the tokens that make it
+    /// recognisable are pinned to that theme's own values.
     ///
-    /// Without this the palette could quietly drift back towards adbshare's old
-    /// near-black scheme and nothing would fail.
+    /// Without this the palette could quietly drift back towards a generic dark
+    /// grey and nothing would fail. These are the numbers T3 Code's stylesheet
+    /// resolves to, with OKLCH greys already converted to sRGB.
     #[test]
-    fn the_palette_is_zed_one_dark() {
+    fn the_palette_is_t3_dark() {
         use gpui::Rgba;
-        let t = Palette::one_dark();
+        let t = Palette::t3_dark();
         let expect = |got: Rgba, want: u32, what: &str| {
-            assert_eq!(u32::from(got), want, "{what} is not Zed One Dark");
+            assert_eq!(u32::from(got), want, "{what} is not T3 Code dark");
         };
 
         // surfaces
-        expect(t.canvas, 0x3B414DFF, "background");
-        expect(t.sidebar, 0x2F343EFF, "surface.background");
-        expect(t.card, 0x2F343EFF, "elevated_surface.background");
-        expect(t.surface_raised, 0x2E343EFF, "element.background");
-        expect(t.topbar_raised, 0x282C33FF, "toolbar.background");
+        expect(t.canvas, 0x0A0A0AFF, "--background");
+        expect(t.sidebar, 0x000000FF, "the sidebar's pure black");
+        expect(t.card, 0x111111FF, "--card");
+        expect(t.surface_raised, 0x111111FF, "--surface-raised");
 
         // text
-        expect(t.text_header, 0xDCE0E5FF, "text");
-        expect(t.text_dim, 0xA9AFBCFF, "text.muted");
-        expect(t.text_muted, 0x878A98FF, "text.disabled");
+        expect(t.text_header, 0xF5F5F5FF, "--foreground");
+        expect(t.text_dim, 0xA3A3A3FF, "the sidebar's muted foreground");
+        expect(t.text_muted, 0x818181FF, "--muted-foreground");
 
         // strokes
-        expect(t.border, 0x464B57FF, "border");
-        expect(t.border_soft, 0x363C46FF, "border.variant");
+        expect(t.border, 0xFFFFFF0F, "--border");
+        expect(t.border_soft, 0xFFFFFF0F, "--border");
 
         // semantic
-        expect(t.accent, 0x74ADE8FF, "text.accent");
-        expect(t.accent_muted, 0x47679EFF, "border.focused");
-        expect(t.success, 0xA1C181FF, "success");
-        expect(t.warning, 0xDEC184FF, "warning");
-        expect(t.danger, 0xD07277FF, "error");
+        expect(t.accent, 0x346BF1FF, "--primary");
+        expect(t.accent_muted, 0x346BF1FF, "--ring");
+        expect(t.success, 0x00D492FF, "--success-foreground");
+        expect(t.warning, 0xFFB900FF, "--warning-foreground");
+        expect(t.danger, 0xFB414AFF, "--error");
+    }
+
+    /// Focus and accent are the same colour in T3 Code, so a control that uses
+    /// one can never end up with the other.
+    #[test]
+    fn focus_and_accent_are_one_colour() {
+        let t = Palette::t3_dark();
+        assert_eq!(t.accent, t.accent_muted);
+    }
+
+    /// The interaction tokens are percentages of white, which only means
+    /// something against a known surface. T3 Code publishes the *composited*
+    /// result of each one alongside its token, so compositing ours over the
+    /// canvas has to land on the same grey.
+    ///
+    /// This is what pins the alphas: any of them could be nudged by a
+    /// percentage point and every colour test above would still pass, because
+    /// they read the alpha straight out of the token rather than the colour the
+    /// user actually sees.
+    #[test]
+    fn translucent_tokens_composite_to_the_theme_greys() {
+        use gpui::Rgba;
+        let t = Palette::t3_dark();
+        let over_canvas = |wash: Rgba| u32::from(t.canvas.blend(wash));
+        let white = |a: u8| rgba(0xFFFFFF00 | a as u32);
+
+        // T3 Code mixes its washes in oklab and GPUI mixes in sRGB, so the two
+        // agree to within a single 8-bit step rather than exactly. Comparing
+        // anything wider than that would stop being a check on the alpha.
+        let near = |got: u32, want: u32, what: &str| {
+            let dr = (got >> 24) as i32 - (want >> 24) as i32;
+            assert!(
+                dr.abs() <= 1,
+                "{what} composites to {got:#010x}, T3 Code publishes {want:#010x}"
+            );
+        };
+
+        // `--border`, `--input` and `--accent-surface`, as T3 Code publishes
+        // them. White 6%, 8% and 4%.
+        near(over_canvas(white(0x0F)), 0x191919FF, "border");
+        near(over_canvas(white(0x14)), 0x1E1E1EFF, "input");
+        near(over_canvas(white(0x0A)), 0x141414FF, "accent surface");
+
+        // The tone surfaces are the hue at 16%, not a wash of white. These are
+        // T3 Code's own `--error-surface` and `--warning-surface`.
+        near(over_canvas(t.danger_soft), 0x301214FF, "error surface");
+        near(over_canvas(t.warning_soft), 0x312108FF, "warning surface");
+
+        // And `--card` is the canvas lifted 3% towards white, which is the step
+        // every raised surface in this theme is built from.
+        assert_eq!(u32::from(t.card), 0x111111FF, "card");
+    }
+
+    /// Every one of the interaction steps has to read differently from the one
+    /// below it, on the canvas and on the pure-black sidebar alike. Listed from
+    /// lightest-wash to heaviest.
+    #[test]
+    fn the_interaction_ladder_is_ordered_on_every_surface() {
+        use gpui::Rgba;
+        let t = Palette::t3_dark();
+        let ladder = [t.hover, t.selected, t.pressed, t.selected_strong];
+        for surface in [t.canvas, t.sidebar, t.card] {
+            let mut last: Option<Rgba> = None;
+            for step in ladder {
+                let seen = surface.blend(step);
+                if let Some(prev) = last {
+                    assert!(
+                        seen.r > prev.r,
+                        "a step is not lighter than the one below it on {surface:?}"
+                    );
+                }
+                last = Some(seen);
+            }
+        }
     }
 
     /// Every text token has to be readable on every surface it is drawn over.
     #[test]
     fn text_stays_legible_on_every_surface() {
         use gpui::colors::{Colors, DefaultAppearance};
-        let t = Palette::one_dark();
+        let t = Palette::t3_dark();
         // The surfaces the UI actually paints on.
         let surfaces = [t.canvas, t.sidebar, t.card, t.surface_raised];
         let inks = [t.text_header, t.text_primary, t.text_dim, t.text_muted];
 
         for ink in inks {
             for surface in surfaces {
-                // Relative luminance, per WCAG. One Dark is a light-ish grey, so
-                // even `text.disabled` has to clear the large-text threshold.
+                // Relative luminance, per WCAG. T3 Code's greys sit far down the
+                // scale, so even `--muted-foreground` has to clear the
+                // large-text threshold against the near-black canvas.
                 let lum = |c: gpui::Rgba| {
                     let f = |v: f32| {
                         if v <= 0.03928 {
@@ -605,7 +713,7 @@ mod tests {
 
     #[test]
     fn tone_colors_cover_every_tone() {
-        let t = Palette::one_dark();
+        let t = Palette::t3_dark();
         for tone in [
             StateTone::Active,
             StateTone::Neutral,

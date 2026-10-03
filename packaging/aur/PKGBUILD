@@ -65,9 +65,11 @@ package() {
         "$pkgdir/usr/share/dbus-1/services/org.adbshare.Manager.service"
     install -Dm644 packaging/systemd/adbshare-daemon.service \
         "$pkgdir/usr/lib/systemd/user/adbshare-daemon.service"
-    # Lucide's ISC notice: the 61 SVGs are compiled into adb-gui by the
-    # asset_table! in crates/adb-gui/src/icons.rs, and ISC requires the notice
-    # to travel with copies of the icons.
+    # Material Symbols are compiled into adb-gui by the asset_table! in
+    # crates/adb-gui/src/icons.rs. Apache-2.0 requires the notice to travel with
+    # copies of the work, and the notice points at the licence.
+    install -Dm644 crates/adb-gui/assets/icons/NOTICE \
+        "$pkgdir/usr/share/doc/adbshare/icons-NOTICE"
     install -Dm644 crates/adb-gui/assets/icons/LICENSE \
         "$pkgdir/usr/share/doc/adbshare/icons-LICENSE"
 }

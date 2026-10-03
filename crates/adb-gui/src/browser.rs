@@ -16,7 +16,7 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
     IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollHandle, Size, Window, actions, div, px, relative, rgba, uniform_list,
+    Point, Render, ScrollHandle, Size, Window, actions, div, px, relative, uniform_list,
 };
 
 use crate::icons::{self, names};
@@ -36,6 +36,11 @@ pub enum ViewMode {
 const ZOOM_STEP: f32 = 12.0;
 /// Padding around a grid tile, on top of the icon.
 const GRID_TILE_PAD: f32 = 14.0;
+
+/// Height of the two lines under a grid tile's icon: the name and, for a file,
+/// its size. Part of the tile's height, so it appears in both the tile and the
+/// row maths and cannot drift between them.
+const GRID_TILE_CAPTION: f32 = 34.0;
 /// Gap between grid tiles.
 const GRID_GAP: f32 = 8.0;
 /// Height of one row in the list view.
@@ -138,14 +143,31 @@ pub const BINDINGS: &[Binding] = &[
     ("secondary-shift-c", || {
         KeyBinding::new("secondary-shift-c", Download, None)
     }),
-    ("secondary-equal", || {
-        KeyBinding::new("secondary-equal", ZoomIn, None)
+    // Zoom, bound to the key names the platform actually reports rather than to
+    // the obvious ones. They are not the X11 keysym names: pressing `-` on this
+    // backend arrives as `key == "-"`, and the numeric keypad's `-` as
+    // `key == "subtract"`; likewise `=` and `add`. So the bindings that read
+    // "secondary-minus" and "secondary-equal" matched nothing at all, and Ctrl+plus
+    // and Ctrl+minus did nothing on any keyboard.
+    //
+    // `secondary--` is not a typo. The binding parser reads a trailing `-` as a
+    // literal `-` key, which is the only way to spell that key at all.
+    ("secondary--", || {
+        KeyBinding::new("secondary--", ZoomOut, None)
     }),
-    ("secondary-plus", || {
-        KeyBinding::new("secondary-plus", ZoomIn, None)
+    ("secondary-subtract", || {
+        KeyBinding::new("secondary-subtract", ZoomOut, None)
     }),
-    ("secondary-minus", || {
-        KeyBinding::new("secondary-minus", ZoomOut, None)
+    ("secondary-=", || {
+        KeyBinding::new("secondary-=", ZoomIn, None)
+    }),
+    ("secondary-add", || {
+        KeyBinding::new("secondary-add", ZoomIn, None)
+    }),
+    // Ctrl+Shift+= is how a US layout types Ctrl+ +, and it arrives as `=` with
+    // shift held. Modifiers have to match exactly, so it needs its own binding.
+    ("secondary-shift-=", || {
+        KeyBinding::new("secondary-shift-=", ZoomIn, None)
     }),
     ("alt-t", || KeyBinding::new("alt-t", ToggleView, None)),
     ("up", || KeyBinding::new("up", FocusPrevious, None)),
@@ -725,6 +747,33 @@ impl Browser {
     /// The current grid icon size.
     pub fn zoom(&self) -> f32 {
         self.zoom
+    }
+
+    /// Whether this view currently holds key focus, and so whether the
+    /// bindings in [`BINDINGS`] can fire at all.
+    ///
+    /// An action is dispatched along the focus path: GPUI starts at whatever
+    /// holds key focus and walks *upwards* through its ancestors. The browser is
+    /// a descendant of the app root, not an ancestor of it, so every binding
+    /// here — zoom, the arrow keys, `Alt+T`, `Ctrl+F` — was registered and
+    /// unreachable. With nothing focused at all, dispatch started at the root, so
+    /// only the app's own handful of shortcuts ever worked.
+    ///
+    /// The fix is to hand the keyboard here rather than to duplicate every
+    /// handler on the root: dispatch then starts here and continues up to the app
+    /// root, so the app's Escape and `F9` still arrive.
+    /// The width one grid tile is laid out at.
+    ///
+    /// The single source of truth for the tile's size: `grid_columns` sizes rows
+    /// with it and `grid_geometry` hit-tests against it, so a test that wants to
+    /// assert a tile came out the right size asks here rather than repeating the
+    /// arithmetic.
+    pub fn tile_width(&self) -> f32 {
+        self.zoom + GRID_TILE_PAD * 2.0
+    }
+
+    pub fn has_key_focus(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
     }
 
     pub fn set_viewport(
@@ -1466,9 +1515,14 @@ pub fn grid_columns(container_w: f32, tile_w: f32, gap: f32) -> usize {
     if tile_w <= 0.0 || container_w <= 0.0 {
         return 1;
     }
-    // The `+ 1.0` accounts for the trailing gap, which the last tile does not
-    // have, so a row that exactly fits is not undercounted.
-    (((container_w + gap) / (tile_w + gap) + 1.0).floor() as usize).max(1)
+    // `n` columns take up `n * tile_w` plus `n - 1` gaps, because the last
+    // column has no gap after it. Solving `n * (tile_w + gap) <= container_w + gap`
+    // for `n` gives the floor of that ratio, and `container_w + gap` is what
+    // already accounts for the missing trailing gap.
+    //
+    // Rounding that floor *up* promised a column that did not fit, which is how
+    // the rightmost column ended up clipped by the window edge.
+    (((container_w + gap) / (tile_w + gap)).floor() as usize).max(1)
 }
 
 /// The half-open range of grid slots touched by `at`.
@@ -1569,12 +1623,12 @@ fn context_bar(browser: &Browser, t: &theme::Palette) -> Div {
         .px(px(14.0))
         .py(px(8.0))
         .rounded(px(theme::RADIUS_BAR))
-        // A recessed strip: One Dark's `element.background` sits below the
-        // window background, which is what a context bar is.
+        // A raised strip: T3 Code's canvas is near-black, so the context bar sits
+        // on the `--surface-raised` step above it rather than below it.
         .bg(t.surface_raised)
         .border_1()
         .border_color(t.border_soft)
-        .child(icons::icon(icon, 16.0, t.text_header))
+        .child(icons::icon(icon, 16.0, ui::icon_tint(icon, t)))
         .child(
             div()
                 .flex()
@@ -1602,7 +1656,11 @@ fn empty_state(t: &theme::Palette) -> Div {
         .justify_center()
         .gap(px(10.0))
         .size_full()
-        .child(icons::icon(names::PHONE, 40.0, t.text_muted))
+        .child(icons::icon(
+            names::PHONE,
+            40.0,
+            ui::icon_tint(names::PHONE, t),
+        ))
         .child(
             div()
                 .text_size(px(19.0))
@@ -1733,7 +1791,14 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
                             names::PAUSE
                         },
                         12.0,
-                        t.text_dim,
+                        ui::icon_tint(
+                            if browser.transfers_paused {
+                                names::PLAY
+                            } else {
+                                names::PAUSE
+                            },
+                            t,
+                        ),
                     ))
                     .on_mouse_down(MouseButton::Left, move |_, _w, cx| {
                         pause.update(cx, |_b, cx| {
@@ -1756,7 +1821,11 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
                     .rounded(px(6.0))
                     .cursor_pointer()
                     .hover(|s| s.bg(t.hover))
-                    .child(icons::icon(names::STOP, 12.0, t.text_dim))
+                    .child(icons::icon(
+                        names::STOP,
+                        12.0,
+                        ui::icon_tint(names::STOP, t),
+                    ))
                     .on_mouse_down(MouseButton::Left, move |_, _w, cx| {
                         cancel.update(cx, |_b, cx| {
                             cx.emit(BrowserEvent::CancelTransfers);
@@ -1781,7 +1850,7 @@ fn rubber_band(browser: &Browser, t: &theme::Palette) -> Option<AnyElement> {
             .h(end.y - start.y)
             .border_1()
             .border_color(t.text_dim)
-            .bg(rgba(0xFFFFFF14))
+            .bg(t.secondary_bg)
             .into_any_element(),
     )
 }
@@ -1970,7 +2039,7 @@ impl Browser {
         let focused = self.focused == Some(index);
         let icon_size = self.zoom;
         let tile_w = icon_size + GRID_TILE_PAD * 2.0;
-        let tile_h = tile_w + 34.0;
+        let tile_h = tile_w + GRID_TILE_CAPTION;
 
         let icon_el: AnyElement = match artwork_for(&entry) {
             Some(art) if !entry.looks_like_dir() => {
@@ -1982,7 +2051,11 @@ impl Browser {
             _ => icons::icon(
                 self.glyph_for(&entry),
                 icon_size * 0.9,
-                if selected { t.text_header } else { t.text_dim },
+                if selected {
+                    t.text_header
+                } else {
+                    ui::icon_tint(self.glyph_for(&entry), &t)
+                },
             )
             .into_any_element(),
         };
@@ -1991,13 +2064,29 @@ impl Browser {
         // ~0.023ms per element, the two wrappers this tile used to spend on the
         // name and the size were about a third of its layout cost for nothing.
         let label = div()
+            // So a test can measure the laid-out box. Note what this does *not*
+            // prove: `debug_bounds` reports the element's box, not the width the
+            // text was laid out in, so it reads a correct width even while every
+            // name renders as an ellipsis. It guards the tile's geometry, not the
+            // text.
+            .debug_selector(move || format!("tile-label-{index}"))
             .mt(px(6.0))
-            .w_full()
+            // An explicit width, not `w_full()`. The tile centres its children,
+            // so a percentage width here resolves against nothing and the box
+            // falls back to sizing itself from its content — with `min_w_0` that
+            // means collapsing to the shortest thing that can be drawn, which is
+            // an ellipsis. Every name read as "...".
+            //
+            // The tile's own 8px of horizontal padding is taken out here, so the
+            // label is exactly as wide as the tile's content box and `truncate()`
+            // has a definite box to ellipsize inside. The size line below already
+            // worked this way, which is why the sizes were readable while the
+            // names were not.
+            .w(px(tile_w - 8.0))
             .px(px(2.0))
-            // The tile centres its children, but the label is a full-width box, so
-            // that centres the box and not the text in it: names were sitting
-            // against the tile's left edge instead of under the icon, and a long
-            // name ellipsized from the wrong side.
+            .min_w_0()
+            // The box is now the full width of the tile, so the text inside it
+            // needs centring or names sit against the tile's left edge.
             .text_center()
             .text_size(px(11.5))
             .font_weight(if entry.looks_like_dir() {
@@ -2018,7 +2107,8 @@ impl Browser {
         let sub = (!entry.is_dir).then(|| {
             div()
                 .mt(px(1.0))
-                .w_full()
+                .w(px(tile_w - 8.0))
+                .min_w_0()
                 .text_center()
                 .font_family(theme::MONO)
                 .text_size(px(9.5))
@@ -2050,6 +2140,17 @@ impl Browser {
             .pb(px(6.0))
             .rounded(px(10.0))
             .cursor_pointer()
+            // A tile is exactly `tile_w` wide by construction, and
+            // `grid_geometry` hit-tests against that width. Left shrinkable, a
+            // row that overflowed its pane squeezed the tiles instead of
+            // clipping, and every measurement downstream was then wrong:
+            // `grid_columns` sizes rows for `tile_w`, hit testing assumed
+            // `tile_w`, and the name label — which is a percentage of the tile —
+            // shrank with it until long names were nothing but an ellipsis.
+            //
+            // Refusing to shrink turns any residual overflow into clipping,
+            // which is visible, rather than silent corruption.
+            .flex_shrink_0()
             .when_some(resting_bg, |d, bg| d.bg(bg))
             .hover(move |d| d.bg(hover_bg))
             .child(
@@ -2121,7 +2222,11 @@ impl Browser {
                 icons::icon(
                     self.glyph_for(&entry),
                     15.0,
-                    if selected { t.text_header } else { t.text_dim },
+                    if selected {
+                        t.text_header
+                    } else {
+                        ui::icon_tint(self.glyph_for(&entry), t)
+                    },
                 )
                 .into_any_element()
             })
@@ -2184,7 +2289,7 @@ impl Render for Browser {
             origin: gpui::point(px(self.viewport_x + GRID_GAP), px(item_top)),
             tile: Size {
                 width: px(tile_w),
-                height: px(tile_w + 34.0),
+                height: px(tile_w + GRID_TILE_CAPTION),
             },
             columns: grid_columns(self.viewport_width, tile_w, GRID_GAP),
         };
@@ -2213,8 +2318,8 @@ impl Render for Browser {
         } else {
             match self.view_mode {
                 ViewMode::Grid => {
-                    let tile_w = self.zoom + GRID_TILE_PAD * 2.0;
-                    let tile_h = tile_w + 34.0 + GRID_GAP;
+                    let tile_w = self.tile_width();
+                    let tile_h = tile_w + GRID_TILE_CAPTION + GRID_GAP;
                     let columns = self.grid_geometry.columns.max(1);
                     let rows = count.div_ceil(columns);
 
@@ -2520,7 +2625,7 @@ mod tests {
         cx.update(|app| {
             let browser = handle.root(app).expect("root view");
             let b = browser.read(app);
-            let tile_h = b.zoom + GRID_TILE_PAD * 2.0 + 34.0 + GRID_GAP;
+            let tile_h = b.tile_width() + GRID_TILE_CAPTION + GRID_GAP;
             let (first, rows) = b.visible_row_range(tile_h);
             let expected_rows = (560.0 / tile_h).ceil() as usize + 3;
             assert_eq!(first, 0, "at rest the window starts at the first row");
@@ -2550,7 +2655,7 @@ mod tests {
         cx.update(|app| {
             let browser = handle.root(app).expect("root view");
             let b = browser.read(app);
-            let tile_h = b.zoom + GRID_TILE_PAD * 2.0 + 34.0 + GRID_GAP;
+            let tile_h = b.tile_width() + GRID_TILE_CAPTION + GRID_GAP;
             let (first, _) = b.visible_row_range(tile_h);
             assert!(
                 first > 20,
@@ -2596,8 +2701,8 @@ mod tests {
                 let b = browser.read(app);
                 let columns = b.grid_geometry.columns.max(1);
                 let rows = b.visible.len().div_ceil(columns);
-                let tile_w = b.zoom + GRID_TILE_PAD * 2.0;
-                let height = rows as f32 * (tile_w + 34.0 + GRID_GAP) + GRID_TILE_PAD;
+                let tile_w = b.tile_width();
+                let height = rows as f32 * (tile_w + GRID_TILE_CAPTION + GRID_GAP) + GRID_TILE_PAD;
                 assert!(
                     height > 0.0,
                     "{count} items must have a positive content height"
@@ -2632,7 +2737,9 @@ mod tests {
 
     #[test]
     fn grid_columns_accounts_for_gaps_and_degenerate_input() {
-        assert_eq!(grid_columns(500.0, 100.0, GRID_GAP), 5);
+        // Four 100px tiles and three 8px gaps is 424px, which fits in 500; a
+        // fifth would need 532 and would be clipped by the edge.
+        assert_eq!(grid_columns(500.0, 100.0, GRID_GAP), 4);
         assert_eq!(
             grid_columns(0.0, 100.0, GRID_GAP),
             1,
@@ -2644,6 +2751,31 @@ mod tests {
             1,
             "a negative container"
         );
+    }
+
+    /// Whatever `grid_columns` promises has to actually fit.
+    ///
+    /// It used to round up, so the last column was laid out past the right edge
+    /// and clipped — a whole column of files the user could not click.
+    #[test]
+    fn the_last_grid_column_is_not_clipped() {
+        for container in [320.0_f32, 500.0, 768.0, 1000.0, 1672.0] {
+            for tile in [40.0_f32, 76.0, 100.0, 148.0] {
+                let columns = grid_columns(container, tile, GRID_GAP);
+                let used = columns as f32 * tile + (columns - 1) as f32 * GRID_GAP;
+                assert!(
+                    used <= container,
+                    "{columns} tiles of {tile}px need {used}px in {container}px"
+                );
+                // ...and it should not be shy either: one more column has to
+                // overflow, or the grid is wasting the space it was given.
+                let one_more = (columns + 1) as f32 * tile + columns as f32 * GRID_GAP;
+                assert!(
+                    one_more > container,
+                    "{container}px holds more than {columns} tiles of {tile}px"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2850,11 +2982,23 @@ mod tests {
         referenced.dedup();
 
         for path in referenced {
-            assert!(
-                crate::icons::ASSETS.iter().any(|(asset, _)| *asset == path),
-                "{path} is referenced by the browser but not embedded, so it would \
-                 render as nothing"
-            );
+            let found = crate::icons::ASSETS
+                .iter()
+                .find(|(asset, _)| *asset == path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{path} is referenced by the browser but not \
+                 embedded, so it would render as nothing"
+                    )
+                });
+            // The artwork is what carries this browser's colour, so it has to be
+            // a PNG: `img()` cannot decode an SVG and would draw nothing.
+            if path.starts_with("art/") {
+                assert!(
+                    found.1.starts_with(b"\x89PNG"),
+                    "{path} is file-type artwork, so it must be a PNG"
+                );
+            }
         }
     }
 
@@ -3643,7 +3787,7 @@ mod tests {
 
             let tile_w = zoom + GRID_TILE_PAD * 2.0;
             let columns = grid_columns(768.0, tile_w, GRID_GAP);
-            let tile_h = tile_w + 34.0 + GRID_GAP;
+            let tile_h = tile_w + GRID_TILE_CAPTION + GRID_GAP;
             let rows = (560.0 / tile_h).ceil() as usize + 3;
             let tiles = (rows * columns).min(5_000);
 

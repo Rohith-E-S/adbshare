@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, IntoElement,
-    KeyBinding, MouseButton, MouseMoveEvent, Pixels, Point, Render, Subscription, Window, actions,
-    div, px, rgba,
+    AnyElement, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable,
+    IntoElement, KeyBinding, MouseButton, MouseMoveEvent, Pixels, Point, Render, Subscription,
+    Window, actions, div, px, rgba,
 };
 
 use crate::browser::{Browser, BrowserEvent, CONTEXT_BAR_H, ViewMode};
@@ -2629,7 +2629,7 @@ impl AdbShareApp {
                         "toggle-sidebar",
                         names::SIDEBAR_SHOW,
                         theme::CAPSULE_BTN,
-                        t.text_dim,
+                        ui::icon_tint(names::SIDEBAR_SHOW, t),
                         cx.listener(|this, _e, _w, cx| {
                             this.sidebar_visible = !this.sidebar_visible;
                             cx.notify();
@@ -2660,7 +2660,7 @@ impl AdbShareApp {
                         "new-folder",
                         names::FOLDER_NEW,
                         theme::CAPSULE_BTN,
-                        t.text_dim,
+                        ui::icon_tint(names::FOLDER_NEW, t),
                         "New folder (Ctrl+N)",
                         cx.listener(|this, _e, _w, cx| {
                             this.on_menu_select("new-folder", cx);
@@ -2676,7 +2676,7 @@ impl AdbShareApp {
                         // mirrored, and a plane is unmistakable at 14px.
                         names::SEND_TO,
                         theme::CAPSULE_BTN,
-                        t.text_dim,
+                        ui::icon_tint(names::SEND_TO, t),
                         "Send to phone (Ctrl+U)",
                         cx.listener(|this, _e, _w, cx| this.on_menu_select("upload", cx)),
                     )
@@ -2686,7 +2686,7 @@ impl AdbShareApp {
                         "download",
                         names::DOWNLOAD,
                         theme::CAPSULE_BTN,
-                        t.text_dim,
+                        ui::icon_tint(names::DOWNLOAD, t),
                         "Save to computer (Ctrl+Shift+C)",
                         cx.listener(|this, _e, _w, cx| this.on_menu_select("download", cx)),
                     )
@@ -2820,7 +2820,7 @@ impl AdbShareApp {
             id,
             icon,
             theme::CAPSULE_BTN,
-            t.text_dim,
+            ui::icon_tint(icon, t),
             label,
             move |_, _window, cx| {
                 // Driven directly rather than by dispatching the action: an
@@ -2932,7 +2932,14 @@ impl AdbShareApp {
                     names::PHONE
                 },
                 14.0,
-                t.text_dim,
+                ui::icon_tint(
+                    if self.browser.read(cx).is_local() {
+                        names::DRIVE_HARDDISK
+                    } else {
+                        names::PHONE
+                    },
+                    t,
+                ),
             ))
             .child(
                 div()
@@ -2955,8 +2962,12 @@ impl AdbShareApp {
             .cursor_pointer()
             .text_sm()
             .text_color(t.text_dim)
-            .hover(|s| s.bg(t.hover).text_color(rgba(0xFFFFFFFF)))
-            .child(icons::icon(names::EMBLEM_SYNC, 15.0, t.text_dim))
+            .hover(|s| s.bg(t.hover).text_color(t.text_header))
+            .child(icons::icon(
+                names::EMBLEM_SYNC,
+                15.0,
+                ui::icon_tint(names::EMBLEM_SYNC, t),
+            ))
             .child("Transfers")
             .when(active > 0, |d| {
                 d.child(div().mx(px(6.0)).child(ui::led(t.success)))
@@ -2981,7 +2992,11 @@ impl AdbShareApp {
             .rounded(px(theme::RADIUS_CAPSULE))
             .cursor_pointer()
             .hover(|s| s.bg(t.hover))
-            .child(icons::icon(names::VIEW_MORE, 15.0, t.text_dim))
+            .child(icons::icon(
+                names::VIEW_MORE,
+                15.0,
+                ui::icon_tint(names::VIEW_MORE, t),
+            ))
             .on_click(cx.listener(|this, _e, _w, cx| {
                 this.overflow_open = !this.overflow_open;
                 this.transfers_open = false;
@@ -3008,7 +3023,11 @@ impl AdbShareApp {
                     .gap(px(8.0))
                     .px(px(18.0))
                     .py(px(28.0))
-                    .child(icons::icon(names::EMBLEM_SYNC, 28.0, t.text_muted))
+                    .child(icons::icon(
+                        names::EMBLEM_SYNC,
+                        28.0,
+                        ui::icon_tint(names::EMBLEM_SYNC, t),
+                    ))
                     .child(
                         div()
                             .text_sm()
@@ -3190,7 +3209,11 @@ impl AdbShareApp {
                             .text_size(px(12.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(t.danger)
-                            .child(icons::icon(names::DIALOG_WARNING, 14.0, t.danger))
+                            .child(icons::icon(
+                                names::DIALOG_WARNING,
+                                14.0,
+                                ui::icon_tint(names::DIALOG_WARNING, t),
+                            ))
                             .child("Cannot reach adb-daemon"),
                     )
                     .child(
@@ -3211,7 +3234,11 @@ impl AdbShareApp {
                             .text_color(t.text_header)
                             .cursor_pointer()
                             .hover(|s| s.text_color(t.danger))
-                            .child(icons::icon(names::DIALOG_INFORMATION, 12.0, t.text_dim))
+                            .child(icons::icon(
+                                names::DIALOG_INFORMATION,
+                                12.0,
+                                ui::icon_tint(names::DIALOG_INFORMATION, t),
+                            ))
                             .child("Run connection diagnostics")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.open_diagnostics(cx);
@@ -3254,7 +3281,11 @@ impl AdbShareApp {
                 .text_size(px(12.0))
                 .text_color(t.text_dim)
                 .hover(|s| s.bg(t.hover).text_color(t.accent))
-                .child(icons::icon(names::WIRELESS, 15.0, t.text_muted))
+                .child(icons::icon(
+                    names::WIRELESS,
+                    15.0,
+                    ui::icon_tint(names::WIRELESS, t),
+                ))
                 .child("Connect via Wi-Fi")
                 .on_click(cx.listener(|this, _e, _w, cx| {
                     this.on_menu_select("connect-wifi", cx);
@@ -3359,9 +3390,9 @@ fn onboarding_card(t: &theme::Palette) -> gpui::Div {
         .px(px(10.0))
         .py(px(10.0))
         .rounded(px(10.0))
-        // One Dark's panel is darker than its background, so a card on the
-        // sidebar has to use the *lighter* background token to read as raised.
-        .bg(t.canvas)
+        // The sidebar is pure black, one step below the canvas, so a card on it
+        // has to use the raised step to read as sitting above the pane.
+        .bg(t.card)
         .border_1()
         .border_color(t.border_soft)
         .child(
@@ -3401,7 +3432,11 @@ fn device_card(
         icons::icon(
             names::PHONE,
             16.0,
-            if active { t.text_header } else { t.text_muted },
+            if active {
+                t.text_header
+            } else {
+                ui::icon_tint(names::PHONE, t)
+            },
         )
         .into_any_element(),
     ];
@@ -3423,11 +3458,11 @@ fn device_card(
     head.push(
         ui::pill(
             device.transport_label(),
-            if active { t.text_inverse } else { t.text_dim },
+            if active { t.text_on_light } else { t.text_dim },
             if active {
                 t.text_header
             } else {
-                rgba(0xFFFFFF14)
+                t.secondary_bg
             },
         )
         .into_any_element(),
@@ -3438,7 +3473,7 @@ fn device_card(
             ui::pill(
                 format!("{pct}%"),
                 if low { t.danger } else { t.text_dim },
-                rgba(0xFFFFFF14),
+                t.secondary_bg,
             )
             .into_any_element(),
         );
@@ -3508,7 +3543,7 @@ fn place_row(
         })
         .border_1()
         .border_color(if active {
-            rgba(0xFFFFFF14)
+            t.secondary_bg
         } else {
             rgba(0x00000000)
         })
@@ -3517,7 +3552,11 @@ fn place_row(
         .child(icons::icon_or_art(
             icon,
             16.0,
-            if active { t.text_header } else { t.text_muted },
+            if active {
+                t.text_header
+            } else {
+                ui::icon_tint(icon, t)
+            },
         ))
         .child(div().flex_1().min_w_0().truncate().child(label.to_string()))
         .on_click(on_click)
@@ -3736,6 +3775,23 @@ impl Render for AdbShareApp {
                 FieldFocus::Search => self.search_field.read(cx).focus_handle(),
                 FieldFocus::Path => self.path_field.read(cx).focus_handle(),
             };
+            window.focus(&handle);
+        }
+
+        // Otherwise the keyboard belongs to the file pane, which owns most of the
+        // shortcuts — zoom, the arrow keys, Alt+T, Ctrl+F — and cannot receive
+        // them while this root holds focus, because an action travels *up* the
+        // focus path and the browser is below us. See `Browser::has_key_focus`.
+        //
+        // Skipped whenever a text field is on screen: the field claims the
+        // keyboard itself, and taking it here would pull the caret straight back
+        // out of the search box on the next frame.
+        if matches!(self.dialog, Dialog::None)
+            && !self.search_field.read(cx).focus_handle().is_focused(window)
+            && !self.path_field.read(cx).focus_handle().is_focused(window)
+            && !self.browser.read(cx).has_key_focus(window)
+        {
+            let handle = self.browser.read(cx).focus_handle(cx);
             window.focus(&handle);
         }
 
@@ -4093,7 +4149,7 @@ mod tests {
 #[cfg(test)]
 mod whole_window_bench {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
 
     /// Wraps an entity so a test window can render it.
     ///
@@ -4129,6 +4185,147 @@ mod whole_window_bench {
 
     fn this_browser(app: &mut App, view: &Entity<AdbShareApp>) -> Entity<Browser> {
         view.read(app).browser.clone()
+    }
+
+    /// Draw the window once and read the grid zoom back out.
+    ///
+    /// The draw is what runs the root's render, which is where the keyboard is
+    /// handed to the browser, so a test that skips it would pass without the fix.
+    fn draw_and_zoom(
+        vctx: &mut VisualTestContext,
+        view: &Entity<AdbShareApp>,
+        space: gpui::Size<gpui::Pixels>,
+    ) -> f32 {
+        let _ = vctx.draw(gpui::point(px(0.), px(0.)), space, |_w, _cx| view.clone());
+        vctx.update(|_, cx| this_browser(cx, view).read(cx).zoom())
+    }
+
+    /// A grid tile is exactly as wide as the grid maths says, whatever the pane
+    /// does.
+    ///
+    /// `grid_columns` sizes a row for `tile_w` and the browser hit-tests clicks
+    /// against that same `tile_w`, so a tile that shrinks silently desyncs
+    /// clicking from what is drawn.
+    ///
+    /// This is measured on the whole window rather than on the browser alone,
+    /// because the squeeze only happens once something narrower than the claimed
+    /// viewport is holding the browser: the sidebar. Drawn on its own, the
+    /// browser's item area is a scroll container and passes the squeeze along to
+    /// the scrollbar instead, which is why this went unnoticed.
+    ///
+    /// It measures the tile's box, not its text — `debug_bounds` reports the
+    /// element bounds, so it cannot see a label whose text is laid out too
+    /// narrow to show. The width is a real invariant worth pinning; the
+    /// ellipsised names that hid behind it are not something this can catch.
+    #[gpui::test]
+    async fn a_grid_tile_keeps_its_width_in_the_real_window(cx: &mut TestAppContext) {
+        cx.update(crate::theme::install);
+        cx.update(|app| app.set_global(crate::protocol::TransferPolicy::default()));
+        let handle = cx.add_window(|window, app| {
+            let saved = Preferences::default();
+            RootView(AdbShareApp::new_entity(window, app, &saved))
+        });
+        let root = cx.update(|app| handle.root(app).expect("root view"));
+        let view = cx.update(|app| root.read(app).0.clone());
+        populate(cx, &view, Some(40));
+        let vctx = cx.add_empty_window();
+
+        // The app derives the browser's viewport from the window, so this is the
+        // width the grid is entitled to lay out for; the sidebar then makes the
+        // pane narrower than that, which is the whole situation.
+        let _ = vctx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(1920.), px(1000.)),
+            |_w, _cx| view.clone(),
+        );
+
+        let tile_w = vctx.update(|_, cx| this_browser(cx, &view).read(cx).tile_width());
+        for i in 0..3 {
+            let label = vctx
+                .debug_bounds(Box::leak(format!("tile-label-{i}").into_boxed_str()))
+                .unwrap_or_else(|| panic!("tile {i}'s name was laid out"));
+            let width: f32 = label.size.width.into();
+            assert!(
+                // Sub-pixel, because the invariant is exact: a tile is `tile_w`
+                // wide or something is squeezing it. One pixel of slack was
+                // enough for this to pass while the tiles were visibly
+                // shrinking.
+                (width - (tile_w - 8.0)).abs() < 0.5,
+                "tile {i} came out {width}px wide, expected {}px: a tile that \
+                 shrinks desyncs the hit testing and swallows the name",
+                tile_w - 8.0
+            );
+        }
+    }
+
+    /// Ctrl+plus and Ctrl+minus have to reach the file pane, as keystrokes.
+    ///
+    /// An action is dispatched from whatever holds key focus *upwards* through
+    /// its ancestors, and the browser is a descendant of this root — so every one
+    /// of `browser::BINDINGS` was registered and unreachable. Zoom was the
+    /// clearest symptom: nothing happened at all, and no test of the browser's
+    /// own handlers could have shown it, because they were fine.
+    ///
+    /// This sends real keystrokes through the real bindings on purpose. An earlier
+    /// version of it dispatched `ZoomIn` directly, which proved only that the
+    /// handler works — it skipped the two things that were actually broken, the
+    /// binding never matching a key and the keyboard never reaching the pane.
+    #[gpui::test]
+    async fn the_file_pane_receives_the_keyboard(cx: &mut TestAppContext) {
+        cx.update(crate::theme::install);
+        cx.update(|app| app.set_global(crate::protocol::TransferPolicy::default()));
+        // The bindings live on the application, so nothing is reachable until they
+        // are installed — which is what `main` does and a test has to do itself.
+        cx.update(crate::app::install_key_bindings);
+        cx.update(crate::browser::install_key_bindings);
+
+        let handle = cx.add_window(|window, app| {
+            let saved = Preferences::default();
+            RootView(AdbShareApp::new_entity(window, app, &saved))
+        });
+        let root = cx.update(|app| handle.root(app).expect("root view"));
+        let view = cx.update(|app| root.read(app).0.clone());
+        populate(cx, &view, Some(24));
+        let vctx = cx.add_empty_window();
+        let space = vctx.update(|window, _| {
+            gpui::size(window.viewport_size().width, window.viewport_size().height)
+        });
+
+        let start = draw_and_zoom(vctx, &view, space);
+
+        // Spelled the way the platform spells them, not the way the bindings are
+        // written. These four are what this app's Linux backend actually sends:
+        // `-` and `=` on the main block, `subtract` and `add` on the keypad.
+        // Binding `minus` and `equal` instead — the X11 keysym names — looks
+        // right and matches nothing, which is why both of these once did nothing.
+        for (keys, up) in [
+            ("secondary--", false),
+            ("secondary-subtract", false),
+            ("secondary-=", true),
+            ("secondary-add", true),
+            ("secondary-shift-=", true),
+        ] {
+            vctx.simulate_keystrokes(keys);
+            let zoomed = draw_and_zoom(vctx, &view, space);
+            if up {
+                assert!(
+                    zoomed > start,
+                    "{keys} did not zoom in: it stayed at {start}"
+                );
+            } else {
+                assert!(
+                    zoomed < start,
+                    "{keys} did not zoom out: it stayed at {start}"
+                );
+            }
+            // Put it back, so each case starts from the same place.
+            vctx.simulate_keystrokes(if up { "secondary--" } else { "secondary-=" });
+            assert_eq!(
+                draw_and_zoom(vctx, &view, space),
+                start,
+                "the zoom did not go back to {start}"
+            );
+        }
     }
 
     /// Time a full layout pass of the whole window, not just the browser.

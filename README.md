@@ -1,6 +1,6 @@
 # adbshare
 
-Browse your Android phone and move files between it and your Linux computer over USB or Wi-Fi using ADB. adbshare has a GPU-rendered interface built on GPUI (the framework behind Zed), styled with Zed's One Dark theme and Lucide icons, a transfer queue, and optional FUSE mounts for opening phone files in other desktop applications.
+Browse your Android phone and move files between it and your Linux computer over USB or Wi-Fi using ADB. adbshare has a GPU-rendered interface built on GPUI (the framework behind Zed), styled with T3 Code's dark theme and Material Symbols, a transfer queue, and optional FUSE mounts for opening phone files in other desktop applications.
 
 **Status: pre-alpha.** Keep backups of important files. Some operations are incomplete; read [Current limitations](#current-limitations) before moving or deleting data.
 

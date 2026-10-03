@@ -4,32 +4,43 @@
 //! system lives here as tokens, installed as an [`gpui::Global`] that views read
 //! without threading it through every call.
 //!
-//! The palette is Zed's **One Dark**, the default theme of the editor this
-//! frontend is now visually a sibling of. The values below are that theme's own
-//! tokens, read from `zed-industries/zed` at `assets/themes/one/one.json`, so the
-//! two applications agree on what a surface, a border or a warning looks like:
+//! # The palette is T3 Code's dark theme
+//!
+//! adbshare is styled as a sibling of the **T3 Code** desktop app, so its theme
+//! is copied from that app rather than invented. The values below were read out
+//! of T3 Code's own stylesheet, `apps/server/dist/client/assets/main-*.css`
+//! inside its Electron `app.asar`, by resolving the CSS custom properties its
+//! dark mode declares. T3 Code is itself built on Vercel's design system —
+//! Tailwind v4's `neutral`/`zinc` greys on near-black, one blue accent, and
+//! every interaction expressed as a percentage of white — so this is also
+//! simply what "the Vercel theme" looks like as an application.
+//!
+//! The source declares its greys in OKLCH. Those are converted to sRGB here
+//! (GPUI has no OKLCH) and the results are checked against the stylesheet's own
+//! hex fallbacks, which agree exactly:
 //!
 //! ```text
-//! background            #3b414d   text                #dce0e5
-//! surface.background    #2f343e   text.muted          #a9afbc
-//! element.background    #2e343e   text.disabled       #878a98
-//! element.hover         #363c46   text.accent         #74ade8
-//! element.active        #454a56   border              #464b57
-//! border.variant        #363c46   border.focused      #47679e
-//! error                 #d07277   success             #a1c181
-//! warning               #dec184
+//! --background   neutral-950  #0a0a0a     --foreground     neutral-100  #f5f5f5
+//! --card         bg + 3% wht  #111111     --popover        card          #111111
+//! --primary      oklch 57% .21 264  #346bf1  --muted          white 3%
+//! --accent       white 4%               --border         white 6%
+//! --input        white 8%               --error          red-500 + 10% white #fb414a
 //! ```
+//!
+//! Two places T3 Code overrides the shared tokens. Its sidebar is *purer* black
+//! than the canvas (`#000` against `#0a0a0a`) and carries its own text greys,
+//! and that is reproduced in [`Palette::sidebar`] and [`Palette::text_dim`]
+//! rather than lost to the root values.
 //!
 //! One token is deliberately absent: `scrollbar.thumb.background`. GPUI 0.2.2
 //! has no scrollbar colour API at all, so a palette entry for it would be a
 //! value nothing could read.
 //!
-//! Zed steps between *opaque* surface colours rather than layering translucent
-//! white. Those steps are used directly for the surfaces. For hover and
-//! selection, which have to work on top of three different surfaces, the
-//! equivalent translucent step is used instead: the numbers reproduce Zed's own
-//! ladder, and unlike a fixed opaque value they stay legible on whichever
-//! surface happens to be underneath.
+//! Surfaces are the theme's own *opaque* steps, because near-black greys a
+//! browser cannot round-trip would band. For hover, selection and every other
+//! interaction, which have to work on top of four different surfaces, the
+//! theme's translucent white percentages are used instead: unlike a fixed
+//! opaque value those stay legible on whichever surface is underneath.
 //!
 //! Dark only, as the previous GTK build was. A light palette is one more
 //! constructor here plus a branch in [`install`].
@@ -38,140 +49,206 @@ use gpui::{App, Global, Rgba, rgba};
 
 /// The full set of colour tokens used across the UI.
 ///
-/// Every field carries the Zed token it came from, so the mapping is auditable
-/// rather than a matter of taste.
+/// Every field carries the T3 Code token it came from, so the mapping is
+/// auditable rather than a matter of taste.
 #[derive(Clone, Copy)]
 pub struct Palette {
     // ── Surfaces ───────────────────────────────────────────────────────────
-    /// `background`. The file area, and the window behind everything.
+    /// `--background`. The file area, and the window behind everything.
     pub canvas: Rgba,
-    /// `title_bar.background`, same as `background` in One Dark.
+    /// `--toolbar-background`, which the theme points back at `background`.
     pub topbar: Rgba,
-    /// `toolbar.background`: the darker step Zed uses for its tool strips.
+    /// `--popover`: the raised step every control and strip on the toolbar
+    /// sits on.
     pub topbar_raised: Rgba,
-    /// `status_bar.background`.
+    /// The chrome behind the bottom status strip, `background`.
     pub statusbar: Rgba,
-    /// `surface.background`. The sidebar.
+    /// The sidebar pane, which T3 Code pins to pure black.
     pub sidebar: Rgba,
-    /// `elevated_surface.background`. Cards, popovers and dialogs.
+    /// `--card`. Dialogs, popovers and the panels inside them.
     pub card: Rgba,
-    /// `element.background`. A resting row or tile.
+    /// `--surface-raised`. A resting row or tile.
     pub surface_raised: Rgba,
 
     // ── Interaction ────────────────────────────────────────────────────────
-    // Translucent equivalents of Zed's `element.hover` and `element.active`
-    // steps, so they work over the canvas, the sidebar and a card alike.
-    /// A resting element under the pointer, `element.hover`.
+    // Percentages of white rather than fixed greys, so one value works over
+    // the canvas, the pure-black sidebar and a card alike.
+    /// A resting element under the pointer, `--accent`.
     pub hover: Rgba,
-    /// A selected element, `element.active`.
+    /// A selected element, `--sidebar-row-active`.
     pub selected: Rgba,
-    /// A selected element under the pointer, one step past `element.active`.
+    /// A selected element under the pointer, one step past `--accent`.
     pub selected_strong: Rgba,
     /// A pressed element.
     pub pressed: Rgba,
-    /// A group of icon buttons, `ghost_element.background`.
+    /// A group of icon buttons: `--toolbar-control`.
     pub capsule_bg: Rgba,
-    /// `border.variant`, used for the outline around a capsule.
+    /// `--input`, the outline around a capsule.
     pub capsule_border: Rgba,
-    /// The groove behind a progress bar.
+    /// A resting raised control: a secondary button, a neutral badge. The same
+    /// `--input` step a capsule is outlined with.
+    pub secondary_bg: Rgba,
+    /// One step past `secondary_bg`, for that control under the pointer.
+    pub secondary_bg_hover: Rgba,
+    /// The groove behind a progress bar, `--input`.
     pub track: Rgba,
     /// The fill of a progress bar.
     pub fill_soft: Rgba,
 
     // ── Text ───────────────────────────────────────────────────────────────
-    /// `text`. Headlines and anything that should read as emphasised.
+    /// `--foreground`. Headlines and anything that should read as emphasised.
     pub text_header: Rgba,
-    /// `text`. Body copy.
+    /// `--foreground`. Body copy.
     pub text_primary: Rgba,
-    /// `text`, at the weight a label uses rather than a heading.
+    /// `--foreground`, at the weight a label uses rather than a heading.
     pub text_secondary: Rgba,
-    /// `text.muted`. Secondary labels and paths.
+    /// The sidebar's own `--muted-foreground`. Secondary labels and paths.
     pub text_dim: Rgba,
-    /// `text.disabled`. Placeholders and dimmed icons.
+    /// `--muted-foreground`. Placeholders and dimmed icons.
     pub text_muted: Rgba,
-    /// For text drawn on an accent fill.
+    /// `--primary-foreground`: text drawn on an accent fill.
     pub text_inverse: Rgba,
+    /// Ink for a `--foreground` *fill*: a filled badge or a primary button.
+    /// The canvas colour, because that is what the theme puts on its own
+    /// foreground — which is the one fill light enough to need dark text.
+    pub text_on_light: Rgba,
 
     // ── Strokes ─────────────────────────────────────────────────────────────
-    /// `border`.
+    /// `--border`.
     pub border: Rgba,
-    /// `border.variant`. Hairlines and dividers.
+    /// `--border`. Hairlines and dividers; the theme defines only this step.
     pub border_soft: Rgba,
 
     // ── Semantic ───────────────────────────────────────────────────────────
-    /// `text.accent`.
+    /// `--primary`. Accent text and icons.
     pub accent: Rgba,
-    /// `border.focused`. A focused or active outline.
+    /// `--ring`, which the theme points at `--primary`: a focused outline.
     pub accent_muted: Rgba,
-    /// `success`.
+    /// `--success-foreground`.
     pub success: Rgba,
-    /// `warning`.
+    /// `--warning-foreground`.
     pub warning: Rgba,
-    /// `error`.
+    /// `--error`.
     pub danger: Rgba,
-    /// `error` at low opacity, for a warning panel.
+    /// `--success` at 16%, the badge fill the theme builds for success.
+    pub success_soft: Rgba,
+    /// `--warning-surface`: the warning at 16%.
+    pub warning_soft: Rgba,
+    /// `--error-surface`: the error at 16%, for a warning panel.
     pub danger_soft: Rgba,
-    /// `error` at medium opacity, for that panel's border.
+    /// The same error, denser, for that panel's border.
     pub danger_border: Rgba,
 
-    /// A tooltip is an overlay, so it sits above every surface: One Dark's
-    /// `overlay.background`, with `text` on top.
+    /// A tooltip is an overlay, so it sits above every surface: above the
+    /// raised step rather than on it, with `--foreground` on top.
     pub tooltip: Rgba,
     pub tooltip_text: Rgba,
-    /// The border around a tooltip, `border`.
+    /// The border around a tooltip, `--input`.
     pub tooltip_border: Rgba,
 }
 
 impl Palette {
-    /// Zed's One Dark, the editor's default dark theme.
-    pub fn one_dark() -> Self {
-        Self {
-            // Surfaces, straight from the theme file.
-            canvas: rgba(0x3B414DFF),
-            topbar: rgba(0x3B414DFF),
-            topbar_raised: rgba(0x282C33FF),
-            statusbar: rgba(0x3B414DFF),
-            sidebar: rgba(0x2F343EFF),
-            card: rgba(0x2F343EFF),
-            surface_raised: rgba(0x2E343EFF),
+    /// The colour an icon of this hue wears.
+    ///
+    /// Four of the six families already exist in the palette as its semantic
+    /// colours, so a red icon and a red error are the same red. `Violet` and
+    /// `Cyan` have no semantic token — nothing in the UI is a violet warning —
+    /// and come from the app theme's own accent families, at the same lightness
+    /// as the rest so a row of icons reads as one set.
+    ///
+    /// `Neutral` is body text rather than a hue: the direction and editing verbs
+    /// are grey because a coloured back-arrow would be noise, not because grey
+    /// is a colour they chose.
+    pub fn hue(&self, hue: crate::icons::IconHue) -> Rgba {
+        use crate::icons::IconHue;
+        match hue {
+            IconHue::Accent => self.accent,
+            IconHue::Success => self.success,
+            IconHue::Warning => self.warning,
+            IconHue::Danger => self.danger,
+            IconHue::Violet => rgba(0x8063C4FF),
+            IconHue::Cyan => rgba(0x4288ACFF),
+            IconHue::Neutral => self.text_dim,
+        }
+    }
 
-            // Interaction. Each is the translucent form of the opaque step Zed
-            // uses: #ffffff at 6% lifts `element.background` (#2e343e) to about
-            // #3c4049, and at 11% to about #454a56, which is exactly
-            // `element.active`.
+    /// T3 Code's dark theme: Vercel's greys on near-black, one blue accent.
+    pub fn t3_dark() -> Self {
+        Self {
+            // Surfaces. T3 Code's canvas is `neutral-950`, and every raised
+            // surface is that same colour mixed 3% towards white — so the
+            // ladder is 7 levels of 255 wide rather than a set of greys.
+            canvas: rgba(0x0A0A0AFF),
+            topbar: rgba(0x0A0A0AFF),
+            topbar_raised: rgba(0x111111FF),
+            statusbar: rgba(0x0A0A0AFF),
+            // The sidebar is the one surface T3 Code overrides to pure black,
+            // which is what makes it read as a distinct pane on a near-black
+            // canvas rather than blending into it.
+            sidebar: rgba(0x000000FF),
+            card: rgba(0x111111FF),
+            surface_raised: rgba(0x111111FF),
+
+            // Interaction, as the theme's own percentages of white. `--accent`
+            // is white 4% and `--sidebar-row-active` white 11%, so hover sits
+            // at 6% to clear both while staying under the selection step.
             hover: rgba(0xFFFFFF0F),
             selected: rgba(0xFFFFFF1C),
-            selected_strong: rgba(0xFFFFFF28),
-            pressed: rgba(0x0000002E),
-            capsule_bg: rgba(0x00000026),
-            capsule_border: rgba(0xFFFFFF1A),
-            track: rgba(0x00000040),
-            fill_soft: rgba(0xFFFFFFB3),
+            selected_strong: rgba(0xFFFFFF29),
+            pressed: rgba(0xFFFFFF24),
+            // A capsule is a `--toolbar-control`, and T3 Code points that at
+            // `--popover`; it is outlined with `--input`, white 8%.
+            capsule_bg: rgba(0x111111FF),
+            capsule_border: rgba(0xFFFFFF14),
+            // A resting control, and one step denser under the pointer, so a
+            // secondary button tracks the same ladder a hovered row does.
+            secondary_bg: rgba(0xFFFFFF14),
+            secondary_bg_hover: rgba(0xFFFFFF26),
+            track: rgba(0xFFFFFF14),
+            fill_soft: rgba(0xFFFFFFD9),
 
-            // Text.
-            text_header: rgba(0xDCE0E5FF),
-            text_primary: rgba(0xDCE0E5FF),
-            text_secondary: rgba(0xDCE0E5FF),
-            text_dim: rgba(0xA9AFBCFF),
-            text_muted: rgba(0x878A98FF),
-            text_inverse: rgba(0x1B1F26FF),
+            // Text. `--foreground` is `neutral-100`. The two greys below it are
+            // the theme's own pair: `#a3a3a3` from the sidebar, `#818181` from
+            // `neutral-500` mixed 10% towards white.
+            text_header: rgba(0xF5F5F5FF),
+            text_primary: rgba(0xF5F5F5FF),
+            text_secondary: rgba(0xF5F5F5FF),
+            text_dim: rgba(0xA3A3A3FF),
+            text_muted: rgba(0x818181FF),
+            // T3 Code draws accent-filled labels in white, not in a dark ink.
+            text_inverse: rgba(0xFFFFFFFF),
+            // ...and puts the canvas colour back on its own foreground fill.
+            text_on_light: rgba(0x0A0A0AFF),
 
-            // Strokes.
-            border: rgba(0x464B57FF),
-            border_soft: rgba(0x363C46FF),
+            // Strokes. `--border` is white 6%; the soft variant is the same
+            // step, which is the only hairline the theme defines.
+            border: rgba(0xFFFFFF0F),
+            border_soft: rgba(0xFFFFFF0F),
 
-            // Semantic.
-            accent: rgba(0x74ADE8FF),
-            accent_muted: rgba(0x47679EFF),
-            success: rgba(0xA1C181FF),
-            warning: rgba(0xDEC184FF),
-            danger: rgba(0xD07277FF),
-            danger_soft: rgba(0xD0727726),
-            danger_border: rgba(0xD0727773),
+            // Semantic. `--primary` and `--ring` are the same blue, so focus and
+            // accent cannot disagree. The three status hues are the theme's
+            // `*-400` foregrounds, which are what it uses for status text on a
+            // dark surface; `--error` is `red-500` lifted 10% towards white.
+            accent: rgba(0x346BF1FF),
+            accent_muted: rgba(0x346BF1FF),
+            success: rgba(0x00D492FF),
+            warning: rgba(0xFFB900FF),
+            danger: rgba(0xFB414AFF),
+            // Every tone surface in T3 Code is its hue at 16%, so a badge of any
+            // tone carries the same weight against the same dark background.
+            success_soft: rgba(0x00D49229),
+            warning_soft: rgba(0xFFB90029),
+            danger_soft: rgba(0xFB414A29),
+            // The panel border is one step denser than its fill, so a warning
+            // panel keeps a visible edge.
+            danger_border: rgba(0xFB414A73),
 
-            tooltip: rgba(0x1B1F26F2),
-            tooltip_text: rgba(0xDCE0E5FF),
-            tooltip_border: rgba(0x464B57FF),
+            // A tooltip is an overlay, so it sits above every surface: above
+            // `#111111` rather than on it, and opaque enough to read against
+            // whatever it hovers.
+            tooltip: rgba(0x171717F2),
+            tooltip_text: rgba(0xF5F5F5FF),
+            tooltip_border: rgba(0xFFFFFF14),
         }
     }
 }
@@ -194,7 +271,7 @@ impl Themed for App {
 
 /// Install the palette as the app-wide theme. Called once from `main`.
 pub fn install(app: &mut App) {
-    app.set_global(Theme(Palette::one_dark()));
+    app.set_global(Theme(Palette::t3_dark()));
 }
 
 // ── Geometry tokens ──────────────────────────────────────────────────────────

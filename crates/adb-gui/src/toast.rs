@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn every_tone_has_an_icon_and_a_visible_accent() {
-        let t = Palette::one_dark();
+        let t = Palette::t3_dark();
         for tone in [
             ToastTone::Info,
             ToastTone::Success,

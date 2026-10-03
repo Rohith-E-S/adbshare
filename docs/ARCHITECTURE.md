@@ -70,9 +70,13 @@ and no theme type of its own, so that stylesheet's palette and geometry
 now live in `theme.rs` as tokens, its repeated components as small
 builders in `ui.rs`, and its icons as an embedded SVG set in `icons.rs`.
 
-The icons are Lucide SVGs on a 24x24 grid with a 2px stroke, vendored
-by `crates/adb-gui/tools/fetch_icons.py` under the GTK build's semantic
-names, so call sites still read as intent. The file chooser goes through
+The chrome icons are Google's Material Symbols in the Outlined style —
+one path per glyph on a 24x24 grid — fetched by
+`crates/adb-gui/tools/fetch_icons.py` under the GTK build's semantic
+names, so call sites still read as intent. They are tinted per call site,
+and `icons::hue` is what decides which colour each one wears. The
+full-colour artwork (Yaru folders, Adwaita file types) is PNG, because
+`gpui::img` cannot decode an SVG at all. The file chooser goes through
 `ashpd` — the XDG desktop portal — rather than GTK4's `FileChooserNative`,
 which under Wayland was itself a portal client.
 
@@ -86,10 +90,10 @@ between the two so no call site can hand a PNG to the SVG path and get a
 blank square.
 
 Two sets of third-party assets therefore travel with the binary, under
-different licences. See `assets/icons/LICENSE` for Lucide's ISC notice and
-`assets/folders/` for the Yaru notice; the Yaru icons are CC-BY-SA-4.0,
-aggregated alongside the code rather than merged into it, and attributed in
-the About dialog.
+different licences. `assets/icons/` holds Material Symbols under Apache-2.0,
+whose notice is compiled into the binary and shown by the About dialog, and
+`assets/folders/` the Yaru notice for the CC-BY-SA-4.0 folder icons. Both are
+aggregated alongside the code rather than merged into it.
 
 ## Wire protocol summary
 

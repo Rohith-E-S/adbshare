@@ -595,6 +595,10 @@ impl Element for TextRunElement {
 
         let x_for = |index: usize| bounds.left() + line.x_for_index(index);
         let full_height = bounds.bottom() - bounds.top();
+        // The selection is a wash of the accent rather than a solid fill, so
+        // the text underneath stays readable through it.
+        let accent = cx.theme().accent;
+        let selection_color = gpui::Rgba { a: 0.35, ..accent };
         let (selection, cursor) = if !selected_range.is_empty() {
             (
                 Some(fill(
@@ -602,7 +606,7 @@ impl Element for TextRunElement {
                         point(x_for(selected_range.start), bounds.top()),
                         point(x_for(selected_range.end), bounds.bottom()),
                     ),
-                    rgba(0x3340A0FF),
+                    selection_color,
                 )),
                 None,
             )

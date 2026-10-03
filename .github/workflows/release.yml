@@ -112,9 +112,11 @@ jobs:
           install -Dm644 assets/org.adbshare.Gui.svg dist/root/usr/share/icons/hicolor/scalable/apps/org.adbshare.Gui.svg
           install -Dm644 packaging/dbus/org.adbshare.Manager.service dist/root/usr/share/dbus-1/services/org.adbshare.Manager.service
           install -Dm644 packaging/systemd/adbshare-daemon.service dist/root/usr/lib/systemd/user/adbshare-daemon.service
-          # The 61 Lucide SVGs are compiled into adb-gui by the asset_table! in
-          # crates/adb-gui/src/icons.rs, so their ISC notice has to travel with
-          # the binary. It is not embedded in the binary itself, so ship it.
+          # The Material Symbols are compiled into adb-gui by the asset_table!
+          # in crates/adb-gui/src/icons.rs, so their Apache-2.0 notice and
+          # licence have to travel with the binary. The notice is compiled in and
+          # shown by the About dialog; these two files are the shipped copies.
+          install -Dm644 crates/adb-gui/assets/icons/NOTICE dist/root/usr/share/doc/adbshare/icons-NOTICE
           install -Dm644 crates/adb-gui/assets/icons/LICENSE dist/root/usr/share/doc/adbshare/icons-LICENSE
           tar -czf "dist/adbshare-${{ steps.version.outputs.tag }}-x86_64-linux.tar.gz" -C dist/root .
           (cd dist && sha256sum "adbshare-${{ steps.version.outputs.tag }}-x86_64-linux.tar.gz" > SHA256SUMS-linux.txt)

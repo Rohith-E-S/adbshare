@@ -423,7 +423,13 @@ where
             t,
             CARD_W,
             vec![
-                header(t, names::SOFTWARE_INSTALL, t.text_dim, "Install this APK?").into_any_element(),
+                header(
+                    t,
+                    names::SOFTWARE_INSTALL,
+                    ui::icon_tint(names::SOFTWARE_INSTALL, t),
+                    "Install this APK?",
+                )
+                .into_any_element(),
                 body_text(
                     t,
                     &format!(
@@ -655,7 +661,7 @@ where
                     .into_any_element()
                 }
                 Button::Danger { id, label, result } => {
-                    ui::danger_button(ui::el_id(format!("{id}-{index}")), label, {
+                    ui::danger_button(t, ui::el_id(format!("{id}-{index}")), label, {
                         let on_result = on_result.clone();
                         move |_, w, cx| on_result(result.clone(), w, cx)
                     })
@@ -747,7 +753,7 @@ where
         t,
         CARD_W,
         vec![
-            header(t, icon, t.text_dim, title).into_any_element(),
+            header(t, icon, ui::icon_tint(icon, t), title).into_any_element(),
             div()
                 .px(px(18.0))
                 .pb(px(12.0))
@@ -881,7 +887,13 @@ where
         t,
         WIDE_W,
         vec![
-            header(t, names::DIALOG_INFORMATION, t.text_dim, "Properties").into_any_element(),
+            header(
+                t,
+                names::DIALOG_INFORMATION,
+                ui::icon_tint(names::DIALOG_INFORMATION, t),
+                "Properties",
+            )
+            .into_any_element(),
             detail_table(t, rows, 96.0),
             buttons(
                 t,
@@ -1148,7 +1160,7 @@ where
             header(
                 t,
                 names::DIALOG_INFORMATION,
-                t.text_dim,
+                ui::icon_tint(names::DIALOG_INFORMATION, t),
                 "Keyboard shortcuts",
             )
             .into_any_element(),
@@ -1179,7 +1191,13 @@ where
         t,
         WIDE_W,
         vec![
-            header(t, names::IMAGE_GENERIC, t.text_dim, name).into_any_element(),
+            header(
+                t,
+                names::IMAGE_GENERIC,
+                ui::icon_tint(names::IMAGE_GENERIC, t),
+                name,
+            )
+            .into_any_element(),
             div()
                 .flex()
                 .items_center()
@@ -1222,9 +1240,9 @@ where
             "Licence",
             "GPL-3.0-or-later. The transfer queue lives in memory and is lost on exit.".to_string(),
         ),
-        // The Lucide SVGs are embedded in this binary under the ISC licence,
+        // The Material Symbols are embedded in this binary under Apache-2.0,
         // which requires the notice to travel with them.
-        ("Icons", "Lucide (ISC)".to_string()),
+        ("Icons", "Material Symbols (Apache-2.0)".to_string()),
     ];
 
     card(
@@ -1247,7 +1265,11 @@ where
                         .size(px(48.0))
                         .rounded(px(14.0))
                         .bg(t.hover)
-                        .child(icons::icon(names::PHONE, 24.0, t.text_header)),
+                        .child(icons::icon(
+                            names::PHONE,
+                            24.0,
+                            ui::icon_tint(names::PHONE, t),
+                        )),
                 )
                 .child(
                     div()
@@ -1264,11 +1286,11 @@ where
                 )
                 .into_any_element(),
             detail_table(t, rows, 76.0),
-            // The ISC notice for the embedded Lucide icons, rendered rather than
-            // just named: the licence requires the notice to accompany the
-            // work, and a binary that embeds 61 SVGs is a copy of them. The
-            // Yaru folders are CC-BY-SA-4.0, which asks for the credit; the
-            // licence text itself is 400-odd lines and stays in the repo.
+            // The Apache-2.0 notice for the embedded Material Symbols, rendered
+            // rather than just named: §4 of the licence requires the notice to
+            // accompany the work, and a binary that embeds 53 SVGs is a copy of
+            // them. The Yaru folders are CC-BY-SA-4.0, which asks for the
+            // credit; both licence texts stay in the repo.
             div()
                 .px(px(18.0))
                 .pb(px(12.0))
@@ -1277,7 +1299,7 @@ where
                 .text_color(t.text_muted)
                 .child(icons::YARU_ATTRIBUTION)
                 .child("\n\n")
-                .child(icons::LUCIDE_LICENSE.trim())
+                .child(icons::MATERIAL_ATTRIBUTION.trim())
                 .into_any_element(),
             buttons(
                 t,
@@ -1454,8 +1476,17 @@ mod tests {
                         "alt" | "option" => out.push_str("alt-"),
                         "shift" => out.push_str("shift-"),
                         "ctrlcmd" => out.push_str("secondary-"),
+                        // A few keys are not spelled the way anyone would guess,
+                        // because this is the name the platform reports. `-`
+                        // arrives as `-` and the keypad's as `subtract`; `=` and
+                        // `add` likewise. Without this the shortcut could be
+                        // listed and still be dead.
                         key => {
-                            out.push_str(key);
+                            out.push_str(match key {
+                                "minus" | "subtract" => "-",
+                                "plus" | "add" | "equal" => "=",
+                                other => other,
+                            });
                             return out;
                         }
                     }
