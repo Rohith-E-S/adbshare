@@ -18,19 +18,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adb_device::{DeviceId, DeviceWatcher};
-use adb_proxy::{ops::DirEntry, ProxyClient, DEFAULT_PROXY_PORT, PROXY_BIN_PATH};
-use adbfs;
+use adb_proxy::{DEFAULT_PROXY_PORT, PROXY_BIN_PATH, ProxyClient, ops::DirEntry};
 use clap::Parser;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{error, info, warn};
-use zbus::{interface, ConnectionBuilder};
+use zbus::{ConnectionBuilder, interface};
 
 use transfer_engine::{Direction, Job, JobOptions, JobQueue, Worker};
 
 #[derive(Parser, Debug)]
-#[command(name = "adb-daemon", version, about = "Background service for adbshare")]
+#[command(
+    name = "adb-daemon",
+    version,
+    about = "Background service for adbshare"
+)]
 struct Cli {
     /// Mount base directory.
     #[arg(long, env = "ADBSHARE_MOUNT_BASE")]
@@ -84,7 +87,10 @@ fn mountpoint_for(mount_base: &std::path::Path, serial: &str, no_fuse: bool) -> 
     match sanitize_mount_name(serial) {
         Some(name) => Some(mount_base.join(name)),
         None => {
-            warn!(serial, "serial is not usable as a mount directory; skipping FUSE mount");
+            warn!(
+                serial,
+                "serial is not usable as a mount directory; skipping FUSE mount"
+            );
             None
         }
     }
@@ -94,14 +100,14 @@ fn mountpoint_for(mount_base: &std::path::Path, serial: &str, no_fuse: bool) -> 
 /// like `[::1]:5037`, which a naive `split(':')` would shred. Falls back to
 /// the adb default port 5037 when no (valid) port is present.
 fn parse_adb_server(spec: &str) -> (String, u16) {
-    if let Some(rest) = spec.strip_prefix('[') {
-        if let Some((host, after)) = rest.split_once(']') {
-            let port = after
-                .strip_prefix(':')
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(5037);
-            return (host.to_string(), port);
-        }
+    if let Some(rest) = spec.strip_prefix('[')
+        && let Some((host, after)) = rest.split_once(']')
+    {
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(5037);
+        return (host.to_string(), port);
     }
     match spec.rsplit_once(':') {
         Some((host, port)) => (host.to_string(), port.parse().unwrap_or(5037)),
@@ -123,7 +129,10 @@ mod tests {
             let dir = std::env::temp_dir().join(format!(
                 "adbshare-dbus-copy-{}-{}",
                 std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
             ));
             std::fs::create_dir(&dir).unwrap();
             Self { dir, child: None }
@@ -145,26 +154,39 @@ mod tests {
     async fn copy_file_over_dbus_with_device_helper() {
         use tokio::io::AsyncReadExt;
 
-        let binary = PathBuf::from(std::env::var_os("ADBSHARE_TEST_PROXY_BIN")
-            .expect("set ADBSHARE_TEST_PROXY_BIN to the host-built adbshare-proxy binary"));
-        assert!(binary.is_absolute() && binary.is_file(), "ADBSHARE_TEST_PROXY_BIN must be an absolute path to a host-built helper");
+        let binary = PathBuf::from(
+            std::env::var_os("ADBSHARE_TEST_PROXY_BIN")
+                .expect("set ADBSHARE_TEST_PROXY_BIN to the host-built adbshare-proxy binary"),
+        );
+        assert!(
+            binary.is_absolute() && binary.is_file(),
+            "ADBSHARE_TEST_PROXY_BIN must be an absolute path to a host-built helper"
+        );
         std::env::var_os("DBUS_SESSION_BUS_ADDRESS").expect("run this test under dbus-run-session");
         let mut helper = TestHelper::new();
         let port = allocate_host_port().unwrap();
-        helper.child = Some(std::process::Command::new(binary)
-            .arg(port.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn().expect("start host-built device helper"));
+        helper.child = Some(
+            std::process::Command::new(binary)
+                .arg(port.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("start host-built device helper"),
+        );
         let client = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                assert!(helper.child.as_mut().unwrap().try_wait().unwrap().is_none(), "helper exited before becoming ready");
+                assert!(
+                    helper.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                    "helper exited before becoming ready"
+                );
                 if let Ok(client) = ProxyClient::connect(format!("127.0.0.1:{port}"), 1).await {
                     return client;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.expect("helper did not start within 5 seconds");
+        })
+        .await
+        .expect("helper did not start within 5 seconds");
         assert_eq!(client.max_conns(), 1);
 
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -264,18 +286,26 @@ mod tests {
         }
     }
 
-    async fn mock_tree_server(entries: std::collections::HashMap<String, Vec<(String, adb_proxy::Stat)>>) -> (String, tokio::task::JoinHandle<()>) {
+    async fn mock_tree_server(
+        entries: std::collections::HashMap<String, Vec<(String, adb_proxy::Stat)>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let handle = tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             loop {
                 let mut header = [0u8; 5];
-                if stream.read_exact(&mut header).await.is_err() { return; }
+                if stream.read_exact(&mut header).await.is_err() {
+                    return;
+                }
                 let len = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
                 let mut args = vec![0u8; len];
-                if stream.read_exact(&mut args).await.is_err() { return; }
+                if stream.read_exact(&mut args).await.is_err() {
+                    return;
+                }
                 let response = match header[0] {
                     0x07 | 0x12 => vec![0u8],
                     0x06 => {
@@ -296,13 +326,17 @@ mod tests {
                         body.extend_from_slice(b"unsupported");
                         let mut framed = (body.len() as u32).to_le_bytes().to_vec();
                         framed.extend_from_slice(&body);
-                        if stream.write_all(&framed).await.is_err() { return; }
+                        if stream.write_all(&framed).await.is_err() {
+                            return;
+                        }
                         continue;
                     }
                 };
                 let mut framed = (response.len() as u32).to_le_bytes().to_vec();
                 framed.extend_from_slice(&response);
-                if stream.write_all(&framed).await.is_err() { return; }
+                if stream.write_all(&framed).await.is_err() {
+                    return;
+                }
             }
         });
         (addr, handle)
@@ -313,7 +347,12 @@ mod tests {
         let state = Arc::new(Mutex::new(State::default()));
         state.lock().devices.insert(
             DeviceId("mock".into()),
-            DeviceSlot { mountpoint: None, client: Arc::new(client), host_port: 0, setup_ok: true },
+            DeviceSlot {
+                mountpoint: None,
+                client: Arc::new(client),
+                host_port: 0,
+                setup_ok: true,
+            },
         );
         ManagerInterface {
             state,
@@ -325,25 +364,43 @@ mod tests {
     #[tokio::test]
     async fn tree_pull_enqueues_files_skips_symlinks_and_creates_dirs() {
         let mut entries = std::collections::HashMap::new();
-        entries.insert("/".to_string(), vec![
-            ("sub".to_string(), tree_stat(0o040755, 0)),
-            ("a.txt".to_string(), tree_stat(0o100644, 10)),
-            ("link".to_string(), tree_stat(0o120777, 0)),
-        ]);
-        entries.insert("/sub".to_string(), vec![
-            ("b.txt".to_string(), tree_stat(0o100644, 20)),
-            ("empty".to_string(), tree_stat(0o040755, 0)),
-        ]);
+        entries.insert(
+            "/".to_string(),
+            vec![
+                ("sub".to_string(), tree_stat(0o040755, 0)),
+                ("a.txt".to_string(), tree_stat(0o100644, 10)),
+                ("link".to_string(), tree_stat(0o120777, 0)),
+            ],
+        );
+        entries.insert(
+            "/sub".to_string(),
+            vec![
+                ("b.txt".to_string(), tree_stat(0o100644, 20)),
+                ("empty".to_string(), tree_stat(0o040755, 0)),
+            ],
+        );
         entries.insert("/sub/empty".to_string(), vec![]);
         let (addr, server) = mock_tree_server(entries).await;
         let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(addr, 1))
-            .await.expect("connect").unwrap();
+            .await
+            .expect("connect")
+            .unwrap();
         let manager = tree_test_manager(client);
         let base = std::env::temp_dir().join(format!(
-            "adbshare-tree-pull-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let json = tokio::time::timeout(Duration::from_secs(15), manager.enqueue_tree_pull(
-            "mock", "/", base.to_str().unwrap(), "skip", false)).await.expect("timeout").unwrap();
+            "adbshare-tree-pull-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let json = tokio::time::timeout(
+            Duration::from_secs(15),
+            manager.enqueue_tree_pull("mock", "/", base.to_str().unwrap(), "skip", false),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
         let result: TreeEnqueueResult = serde_json::from_str(&json).unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(result.enqueued.len(), 2);
@@ -361,26 +418,44 @@ mod tests {
     async fn tree_push_walks_local_tree_and_enqueues_push_jobs() {
         let (addr, server) = mock_tree_server(std::collections::HashMap::new()).await;
         let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(addr, 1))
-            .await.expect("connect").unwrap();
+            .await
+            .expect("connect")
+            .unwrap();
         let manager = tree_test_manager(client);
         let base = std::env::temp_dir().join(format!(
-            "adbshare-tree-push-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            "adbshare-tree-push-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(base.join("sub")).unwrap();
         std::fs::write(base.join("a.txt"), b"a").unwrap();
         std::fs::write(base.join("sub").join("b.txt"), b"b").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("a.txt", base.join("link")).unwrap();
-        let json = tokio::time::timeout(Duration::from_secs(15), manager.enqueue_tree_push(
-            "mock", base.to_str().unwrap(), "/dst", "keep-both", true)).await.expect("timeout").unwrap();
+        let json = tokio::time::timeout(
+            Duration::from_secs(15),
+            manager.enqueue_tree_push("mock", base.to_str().unwrap(), "/dst", "keep-both", true),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
         let result: TreeEnqueueResult = serde_json::from_str(&json).unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(result.enqueued.len(), 2);
         let jobs = manager.queue.jobs_snapshot();
         assert_eq!(jobs.len(), 2);
         for job in &jobs {
-            assert!(matches!(job.options.overwrite, transfer_engine::job::OverwriteMode::Rename));
-            assert!(matches!(job.options.verify, transfer_engine::job::VerifyMode::On));
+            assert!(matches!(
+                job.options.overwrite,
+                transfer_engine::job::OverwriteMode::Rename
+            ));
+            assert!(matches!(
+                job.options.verify,
+                transfer_engine::job::VerifyMode::On
+            ));
             assert!(job.destination.to_string_lossy().starts_with("/dst"));
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -390,20 +465,31 @@ mod tests {
     #[tokio::test]
     async fn copy_tree_recurses_and_skips_symlinks() {
         let mut entries = std::collections::HashMap::new();
-        entries.insert("/src".to_string(), vec![
-            ("sub".to_string(), tree_stat(0o040755, 0)),
-            ("a.txt".to_string(), tree_stat(0o100644, 5)),
-            ("link".to_string(), tree_stat(0o120777, 0)),
-        ]);
-        entries.insert("/src/sub".to_string(), vec![
-            ("b.txt".to_string(), tree_stat(0o100644, 6)),
-        ]);
+        entries.insert(
+            "/src".to_string(),
+            vec![
+                ("sub".to_string(), tree_stat(0o040755, 0)),
+                ("a.txt".to_string(), tree_stat(0o100644, 5)),
+                ("link".to_string(), tree_stat(0o120777, 0)),
+            ],
+        );
+        entries.insert(
+            "/src/sub".to_string(),
+            vec![("b.txt".to_string(), tree_stat(0o100644, 6))],
+        );
         let (addr, server) = mock_tree_server(entries).await;
         let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(addr, 1))
-            .await.expect("connect").unwrap();
+            .await
+            .expect("connect")
+            .unwrap();
         let manager = tree_test_manager(client);
-        let json = tokio::time::timeout(Duration::from_secs(15),
-            manager.copy_tree("mock", "/src", "/dst")).await.expect("timeout").unwrap();
+        let json = tokio::time::timeout(
+            Duration::from_secs(15),
+            manager.copy_tree("mock", "/src", "/dst"),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
         let result: TreeEnqueueResult = serde_json::from_str(&json).unwrap();
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(result.enqueued.len(), 2);
@@ -468,7 +554,10 @@ mod tests {
         assert!(cache.fresh("serial").is_none(), "nothing is cached yet");
 
         cache.store("serial", "{\"model\":\"Pixel\"}".to_string());
-        assert_eq!(cache.fresh("serial").as_deref(), Some("{\"model\":\"Pixel\"}"));
+        assert_eq!(
+            cache.fresh("serial").as_deref(),
+            Some("{\"model\":\"Pixel\"}")
+        );
         // A different device is a different entry.
         assert!(cache.fresh("other").is_none());
     }
@@ -511,6 +600,35 @@ mod tests {
         assert_eq!(cache.fresh("serial").as_deref(), Some("new"));
     }
 
+    /// A panic in one caller must not switch the cache off for everyone else.
+    ///
+    /// This is the failure the `std::sync::Mutex` version could not survive: the
+    /// lock was poisoned, every read returned `None`, and `device_info` went back
+    /// to shelling out three times a poll with nothing in the logs to say why.
+    #[test]
+    fn a_panicking_caller_cannot_switch_the_cache_off() {
+        let cache = std::sync::Arc::new(DeviceInfoCache::new(Duration::from_secs(15)));
+        let reader = {
+            let cache = std::sync::Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache.store("serial", "{\"model\":\"Pixel\"}".to_string());
+                panic!("a caller gave up mid-request");
+            })
+        };
+        assert!(reader.join().is_err(), "the thread really did panic");
+        // A reader on another thread must still see the stored value: the lock
+        // is never held across the panic, so nothing is poisoned.
+        let reader2 = {
+            let cache = std::sync::Arc::clone(&cache);
+            std::thread::spawn(move || cache.fresh("serial"))
+        };
+        assert_eq!(
+            reader2.join().unwrap().as_deref(),
+            Some("{\"model\":\"Pixel\"}"),
+            "the cached reading survives a panic elsewhere"
+        );
+    }
+
     #[tokio::test]
     async fn diagnostics_reports_host_facts_as_json() {
         let (queue, _rx) = JobQueue::new(1);
@@ -535,13 +653,25 @@ mod tests {
     #[test]
     fn job_options_parse_skip_replace_keep_both_and_verify() {
         let skip = parse_job_options("skip", false).unwrap();
-        assert!(matches!(skip.overwrite, transfer_engine::job::OverwriteMode::SkipExisting));
+        assert!(matches!(
+            skip.overwrite,
+            transfer_engine::job::OverwriteMode::SkipExisting
+        ));
         assert!(matches!(skip.verify, transfer_engine::job::VerifyMode::Off));
         let replace = parse_job_options("replace", true).unwrap();
-        assert!(matches!(replace.overwrite, transfer_engine::job::OverwriteMode::Always));
-        assert!(matches!(replace.verify, transfer_engine::job::VerifyMode::On));
+        assert!(matches!(
+            replace.overwrite,
+            transfer_engine::job::OverwriteMode::Always
+        ));
+        assert!(matches!(
+            replace.verify,
+            transfer_engine::job::VerifyMode::On
+        ));
         let keep = parse_job_options("keep-both", false).unwrap();
-        assert!(matches!(keep.overwrite, transfer_engine::job::OverwriteMode::Rename));
+        assert!(matches!(
+            keep.overwrite,
+            transfer_engine::job::OverwriteMode::Rename
+        ));
         assert!(parse_job_options("overwrite", false).is_err());
     }
 
@@ -555,20 +685,35 @@ mod tests {
         };
         for path in ["", "relative", "/nul\0hidden", &"/".repeat(4097)] {
             for (src, dst) in [(path, "/destination"), ("/source", path)] {
-                assert!(matches!(manager.copy_file("missing", src, dst).await,
-                    Err(zbus::fdo::Error::InvalidArgs(_))));
+                assert!(matches!(
+                    manager.copy_file("missing", src, dst).await,
+                    Err(zbus::fdo::Error::InvalidArgs(_))
+                ));
             }
         }
-        assert!(matches!(manager.copy_file("missing", "/source", "/destination").await,
-            Err(zbus::fdo::Error::ServiceUnknown(_))));
+        assert!(matches!(
+            manager
+                .copy_file("missing", "/source", "/destination")
+                .await,
+            Err(zbus::fdo::Error::ServiceUnknown(_))
+        ));
     }
 
     #[test]
     fn adb_server_parses_ipv4_and_default() {
-        assert_eq!(parse_adb_server("127.0.0.1:5037"), ("127.0.0.1".into(), 5037));
-        assert_eq!(parse_adb_server("127.0.0.1:5555"), ("127.0.0.1".into(), 5555));
+        assert_eq!(
+            parse_adb_server("127.0.0.1:5037"),
+            ("127.0.0.1".into(), 5037)
+        );
+        assert_eq!(
+            parse_adb_server("127.0.0.1:5555"),
+            ("127.0.0.1".into(), 5555)
+        );
         assert_eq!(parse_adb_server("localhost"), ("localhost".into(), 5037));
-        assert_eq!(parse_adb_server("localhost:abc"), ("localhost".into(), 5037));
+        assert_eq!(
+            parse_adb_server("localhost:abc"),
+            ("localhost".into(), 5037)
+        );
     }
 
     #[test]
@@ -580,7 +725,10 @@ mod tests {
 
     #[test]
     fn sanitize_keeps_safe_characters() {
-        assert_eq!(sanitize_mount_name("abc-123_XY.09"), Some("abc-123_XY.09".into()));
+        assert_eq!(
+            sanitize_mount_name("abc-123_XY.09"),
+            Some("abc-123_XY.09".into())
+        );
     }
 
     #[test]
@@ -608,8 +756,9 @@ mod tests {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,adbfs=debug,transfer_engine=debug"))
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,adbfs=debug,transfer_engine=debug")
+            }),
         )
         .init();
 
@@ -658,8 +807,15 @@ async fn main() -> anyhow::Result<()> {
             match ev {
                 adb_device::watcher::WatchEvent::Added(id) => {
                     info!(?id, "device added");
-                    ensure_device_ready(&state_clone, &queue_for_setup, &id, &mount_base_clone, no_fuse, proxy_conns)
-                        .await;
+                    ensure_device_ready(
+                        &state_clone,
+                        &queue_for_setup,
+                        &id,
+                        &mount_base_clone,
+                        no_fuse,
+                        proxy_conns,
+                    )
+                    .await;
                 }
                 adb_device::watcher::WatchEvent::Removed(id) => {
                     info!(?id, "device removed");
@@ -670,7 +826,10 @@ async fn main() -> anyhow::Result<()> {
                         teardown_device(id.as_str(), slot.host_port).await;
                         if let Some(mp) = slot.mountpoint {
                             let mp_str = mp.to_string_lossy().into_owned();
-                            let _ = Command::new("fusermount3").args(["-u", "-z", &mp_str]).status().await;
+                            let _ = Command::new("fusermount3")
+                                .args(["-u", "-z", &mp_str])
+                                .status()
+                                .await;
                         }
                     }
                 }
@@ -682,8 +841,15 @@ async fn main() -> anyhow::Result<()> {
                     // re-runs setup when the existing setup is actually broken
                     // (a healthy setup is just health-checked, so active
                     // transfers aren't killed by a re-add/Changed event).
-                    ensure_device_ready(&state_clone, &queue_for_setup, &id, &mount_base_clone, no_fuse, proxy_conns)
-                        .await;
+                    ensure_device_ready(
+                        &state_clone,
+                        &queue_for_setup,
+                        &id,
+                        &mount_base_clone,
+                        no_fuse,
+                        proxy_conns,
+                    )
+                    .await;
                 }
             }
         }
@@ -699,7 +865,9 @@ async fn main() -> anyhow::Result<()> {
                 let serial = job.device.clone().unwrap_or_default();
                 let client = {
                     let s = state_for_workers.lock();
-                    s.devices.get(&DeviceId(serial.clone())).map(|slot| slot.client.clone())
+                    s.devices
+                        .get(&DeviceId(serial.clone()))
+                        .map(|slot| slot.client.clone())
                 };
                 let Some(client) = client else {
                     warn!(?serial, "no client for device; failing job");
@@ -739,12 +907,18 @@ async fn main() -> anyhow::Result<()> {
     // Idle loop.
     tokio::signal::ctrl_c().await?;
     info!("shutting down");
-    for (id, slot) in state.lock().devices.drain().collect::<Vec<_>>() {
+    // Drain first: holding the state lock across `await` would block every
+    // device_info reader for the length of the teardown.
+    let devices = std::mem::take(&mut state.lock().devices);
+    for (id, slot) in devices {
         // Kill the on-device proxy and drop our host-side forward.
         teardown_device(id.as_str(), slot.host_port).await;
         if let Some(mp) = slot.mountpoint {
             let mp_str = mp.to_string_lossy().into_owned();
-            let _ = Command::new("fusermount3").args(["-u", "-z", &mp_str]).status().await;
+            let _ = Command::new("fusermount3")
+                .args(["-u", "-z", &mp_str])
+                .status()
+                .await;
         }
     }
     drop(conn);
@@ -767,18 +941,24 @@ const ADB_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Run `adb <args>` with a hard timeout so a hung device or adb server can't
 /// stall the single watcher task. Returns the command's exit status.
 async fn adb_run(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
-    tokio::time::timeout(timeout, Command::new("adb").args(args).kill_on_drop(true).status())
-        .await
-        .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
-        .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
+    tokio::time::timeout(
+        timeout,
+        Command::new("adb").args(args).kill_on_drop(true).status(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
+    .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
 }
 
 /// `adb_run` variant that captures stdout/stderr.
 async fn adb_run_output(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::Output> {
-    tokio::time::timeout(timeout, Command::new("adb").args(args).kill_on_drop(true).output())
-        .await
-        .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
-        .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
+    tokio::time::timeout(
+        timeout,
+        Command::new("adb").args(args).kill_on_drop(true).output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
+    .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
 }
 
 /// True if the pooled client can still serve requests (proxy reachable).
@@ -824,16 +1004,19 @@ async fn ensure_device_ready(
     }
 
     let mp = mountpoint_for(mount_base, id.as_str(), no_fuse);
-    if let Some(ref p) = mp {
-        if let Err(_e) = std::fs::create_dir_all(p) {
-            // Probably a stale mount from a previous run — try to clear it.
-            let p_str = p.to_string_lossy().into_owned();
-            let _ = Command::new("fusermount3").args(["-u", "-z", &p_str]).status().await;
-            let _ = Command::new("umount").args(["-l", &p_str]).status().await;
-            if let Err(e2) = std::fs::create_dir_all(p) {
-                error!(?e2, "create mountpoint");
-                return;
-            }
+    if let Some(ref p) = mp
+        && let Err(_e) = std::fs::create_dir_all(p)
+    {
+        // Probably a stale mount from a previous run — try to clear it.
+        let p_str = p.to_string_lossy().into_owned();
+        let _ = Command::new("fusermount3")
+            .args(["-u", "-z", &p_str])
+            .status()
+            .await;
+        let _ = Command::new("umount").args(["-l", &p_str]).status().await;
+        if let Err(e2) = std::fs::create_dir_all(p) {
+            error!(?e2, "create mountpoint");
+            return;
         }
     }
     match setup(id.clone(), mp.clone(), proxy_conns).await {
@@ -877,7 +1060,13 @@ async fn setup(
     let mut push_err: Option<String> = None;
     for attempt in 0..15 {
         match adb_run(
-            &["-s", device.as_str(), "push", &proxy_src_str, PROXY_BIN_PATH],
+            &[
+                "-s",
+                device.as_str(),
+                "push",
+                &proxy_src_str,
+                PROXY_BIN_PATH,
+            ],
             ADB_PUSH_TIMEOUT,
         )
         .await
@@ -907,7 +1096,14 @@ async fn setup(
         anyhow::bail!("adb push failed: {status}");
     }
     if let Err(e) = adb_run(
-        &["-s", device.as_str(), "shell", "chmod", "755", PROXY_BIN_PATH],
+        &[
+            "-s",
+            device.as_str(),
+            "shell",
+            "chmod",
+            "755",
+            PROXY_BIN_PATH,
+        ],
         ADB_CMD_TIMEOUT,
     )
     .await
@@ -936,7 +1132,14 @@ async fn setup(
     }
 
     let _ = adb_run(
-        &["-s", device.as_str(), "shell", "pkill", "-f", PROXY_BIN_PATH],
+        &[
+            "-s",
+            device.as_str(),
+            "shell",
+            "pkill",
+            "-f",
+            PROXY_BIN_PATH,
+        ],
         ADB_CMD_TIMEOUT,
     )
     .await
@@ -958,7 +1161,7 @@ async fn setup(
             .status(),
     )
     .await;
-    if let Err(_) = launch {
+    if launch.is_err() {
         warn!("proxy launch timed out (continuing; health check will decide)");
     }
 
@@ -992,7 +1195,13 @@ async fn setup(
     }
     if let Some(e) = last_err {
         let log = adb_run_output(
-            &["-s", device.as_str(), "shell", "cat", "/data/local/tmp/adbshare-proxy.log"],
+            &[
+                "-s",
+                device.as_str(),
+                "shell",
+                "cat",
+                "/data/local/tmp/adbshare-proxy.log",
+            ],
             ADB_CMD_TIMEOUT,
         )
         .await
@@ -1002,9 +1211,12 @@ async fn setup(
         anyhow::bail!("proxy never came up: {e}. Device log: {log}");
     }
 
-    let client = tokio::time::timeout(Duration::from_secs(5), ProxyClient::connect(&addr, proxy_conns))
-        .await
-        .map_err(|_| anyhow::anyhow!("proxy connect timed out"))??;
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        ProxyClient::connect(&addr, proxy_conns),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("proxy connect timed out"))??;
 
     if let Some(mp) = mountpoint {
         let device_for_thread = device.clone();
@@ -1033,22 +1245,31 @@ fn allocate_host_port() -> anyhow::Result<u16> {
 }
 
 fn is_x86_binary(path: &std::path::Path) -> bool {
-    if let Ok(bytes) = std::fs::read(path) {
-        if bytes.len() >= 20 && &bytes[0..4] == b"\x7fELF" {
-            let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-            return machine == 0x3E || machine == 0x03;
-        }
+    if let Ok(bytes) = std::fs::read(path)
+        && bytes.len() >= 20
+        && &bytes[0..4] == b"\x7fELF"
+    {
+        let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        return machine == 0x3E || machine == 0x03;
     }
     false
 }
 
 async fn locate_proxy_binary(device: &DeviceId) -> anyhow::Result<PathBuf> {
-    if let Some(env_path) = std::env::var_os("ADBSHARE_PROXY_BIN").map(PathBuf::from) {
-        if env_path.exists() { return Ok(env_path); }
+    if let Some(env_path) = std::env::var_os("ADBSHARE_PROXY_BIN").map(PathBuf::from)
+        && env_path.exists()
+    {
+        return Ok(env_path);
     }
 
     let abi_output = adb_run_output(
-        &["-s", device.as_str(), "shell", "getprop", "ro.product.cpu.abi"],
+        &[
+            "-s",
+            device.as_str(),
+            "shell",
+            "getprop",
+            "ro.product.cpu.abi",
+        ],
         ADB_CMD_TIMEOUT,
     )
     .await
@@ -1063,8 +1284,12 @@ async fn locate_proxy_binary(device: &DeviceId) -> anyhow::Result<PathBuf> {
 
     let mut candidates = Vec::new();
     if is_arm {
-        candidates.push(PathBuf::from("target/aarch64-unknown-linux-musl/release/adbshare-proxy"));
-        candidates.push(PathBuf::from("target/aarch64-linux-android/release/adbshare-proxy"));
+        candidates.push(PathBuf::from(
+            "target/aarch64-unknown-linux-musl/release/adbshare-proxy",
+        ));
+        candidates.push(PathBuf::from(
+            "target/aarch64-linux-android/release/adbshare-proxy",
+        ));
         candidates.push(exe_dir.join("../aarch64-unknown-linux-musl/release/adbshare-proxy"));
         candidates.push(exe_dir.join("../aarch64-linux-android/release/adbshare-proxy"));
     }
@@ -1084,13 +1309,15 @@ async fn locate_proxy_binary(device: &DeviceId) -> anyhow::Result<PathBuf> {
         }
     }
 
-    if let Ok(p) = which_("adbshare-proxy") {
-        if !(is_arm && is_x86_binary(&p)) {
-            return Ok(p);
-        }
+    if let Ok(p) = which_("adbshare-proxy")
+        && !(is_arm && is_x86_binary(&p))
+    {
+        return Ok(p);
     }
 
-    anyhow::bail!("adbshare-proxy binary not found for device ABI '{abi}'. Build with `cargo build --release --target aarch64-unknown-linux-musl --bin adbshare-proxy` or set ADBSHARE_PROXY_BIN.")
+    anyhow::bail!(
+        "adbshare-proxy binary not found for device ABI '{abi}'. Build with `cargo build --release --target aarch64-unknown-linux-musl --bin adbshare-proxy` or set ADBSHARE_PROXY_BIN."
+    )
 }
 
 /// Best-effort cleanup for a device that is going away (or being torn down):
@@ -1104,7 +1331,13 @@ async fn teardown_device(serial: &str, host_port: u16) {
         Err(e) => tracing::debug!(serial, host_port, %e, "pkill proxy (best-effort) failed"),
     }
     if let Err(e) = adb_run(
-        &["-s", serial, "forward", "--remove", &format!("tcp:{host_port}")],
+        &[
+            "-s",
+            serial,
+            "forward",
+            "--remove",
+            &format!("tcp:{host_port}"),
+        ],
         ADB_CMD_TIMEOUT,
     )
     .await
@@ -1156,7 +1389,10 @@ async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
     .await
     .map_err(|_| anyhow::anyhow!("adb shell timed out"))??;
     if !out.status.success() {
-        anyhow::bail!("adb shell '{cmd}' failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "adb shell '{cmd}' failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -1187,7 +1423,11 @@ struct DeviceInfoDto {
 }
 
 async fn device_info_json(serial: &str) -> anyhow::Result<String> {
-    let transport = if is_wireless_serial(serial) { "wifi" } else { "usb" };
+    let transport = if is_wireless_serial(serial) {
+        "wifi"
+    } else {
+        "usb"
+    };
 
     let (props_raw, battery_raw, df_raw) = tokio::join!(
         adb_shell(serial, "getprop"),
@@ -1206,7 +1446,10 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
                 .cloned();
             (
                 model,
-                props.get("ro.build.version.release").filter(|s| !s.is_empty()).cloned(),
+                props
+                    .get("ro.build.version.release")
+                    .filter(|s| !s.is_empty())
+                    .cloned(),
             )
         }
         Err(e) => {
@@ -1218,7 +1461,10 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
     let battery_pct = battery_raw.ok().and_then(|raw| {
         for line in raw.lines() {
             let line = line.trim();
-            if let Some(v) = line.strip_prefix("level:").and_then(|v| v.trim().parse::<u8>().ok()) {
+            if let Some(v) = line
+                .strip_prefix("level:")
+                .and_then(|v| v.trim().parse::<u8>().ok())
+            {
                 return Some(v.min(100));
             }
         }
@@ -1227,7 +1473,7 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
 
     // toybox `df -k` last line: Filesystem 1K-blocks Used Available Use% Mounted
     let (storage_used, storage_total) = match df_raw {
-        Ok(raw) => match raw.lines().filter(|l| !l.trim().is_empty()).last() {
+        Ok(raw) => match raw.lines().rfind(|l| !l.trim().is_empty()) {
             Some(line) => {
                 let cols: Vec<&str> = line.split_whitespace().collect();
                 if cols.len() >= 3 {
@@ -1265,7 +1511,10 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
 async fn adb_version() -> anyhow::Result<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        Command::new("adb").arg("version").kill_on_drop(true).output(),
+        Command::new("adb")
+            .arg("version")
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("adb version timed out"))??;
@@ -1283,9 +1532,14 @@ async fn adb_version() -> anyhow::Result<String> {
     Ok(ver)
 }
 
-fn client_for(state: &Arc<Mutex<State>>, device: &str) -> Result<Arc<ProxyClient>, zbus::fdo::Error> {
-    state.lock()
-        .devices.get(&DeviceId(device.to_string()))
+fn client_for(
+    state: &Arc<Mutex<State>>,
+    device: &str,
+) -> Result<Arc<ProxyClient>, zbus::fdo::Error> {
+    state
+        .lock()
+        .devices
+        .get(&DeviceId(device.to_string()))
         .map(|slot| slot.client.clone())
         .ok_or_else(|| zbus::fdo::Error::ServiceUnknown("device not connected".into()))
 }
@@ -1303,7 +1557,10 @@ async fn delete_recursive(client: &ProxyClient, path: &str, depth: u32) -> anyho
     }
     let st = client.lstat(path).await?;
     if st.mode.is_symlink() || !st.mode.is_dir() {
-        return client.unlink(path).await.map_err(|e| anyhow::anyhow!("{e}"));
+        return client
+            .unlink(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"));
     }
     for entry in client.listdir(path).await? {
         let child = format!("{}/{}", path.trim_end_matches('/'), entry.name);
@@ -1327,20 +1584,26 @@ async fn delete_recursive(client: &ProxyClient, path: &str, depth: u32) -> anyho
 /// flicker.
 struct DeviceInfoCache {
     ttl: Duration,
-    entries: std::sync::Mutex<std::collections::HashMap<String, (Instant, String)>>,
+    /// `parking_lot` rather than `std::sync::Mutex` on purpose: a panic while the
+    /// guard is held poisons a std mutex, and these methods used to swallow that
+    /// with `.ok()`, which left the cache permanently dead and silently put back
+    /// the three `adb shell` subprocesses per poll this cache exists to avoid.
+    /// A parking_lot lock is never poisoned, so the worst case is one lost
+    /// update.
+    entries: Mutex<std::collections::HashMap<String, (Instant, String)>>,
 }
 
 impl DeviceInfoCache {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            entries: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     /// The cached payload for `serial`, if it is still fresh.
     fn fresh(&self, serial: &str) -> Option<String> {
-        let entries = self.entries.lock().ok()?;
+        let entries = self.entries.lock();
         let (when, json) = entries.get(serial)?;
         (when.elapsed() < self.ttl).then(|| json.clone())
     }
@@ -1349,21 +1612,22 @@ impl DeviceInfoCache {
     fn stale(&self, serial: &str) -> Option<String> {
         self.entries
             .lock()
-            .ok()
-            .and_then(|entries| entries.get(serial).map(|(_, json)| json.clone()))
+            .get(serial)
+            .map(|(_, json)| json.clone())
     }
 
     fn store(&self, serial: &str, json: String) {
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.insert(serial.to_string(), (Instant::now(), json));
-        }
+        self.entries
+            .lock()
+            .insert(serial.to_string(), (Instant::now(), json));
     }
 
     /// Forget a device that has gone away, so the cache cannot grow without
     /// bound over a long session with phones coming and going.
     fn forget_missing(&self, present: &[String]) {
-        let Ok(mut entries) = self.entries.lock() else { return };
-        entries.retain(|serial, _| present.iter().any(|known| known == serial));
+        self.entries
+            .lock()
+            .retain(|serial, _| present.iter().any(|known| known == serial));
     }
 }
 
@@ -1421,13 +1685,16 @@ impl ManagerInterface {
     /// FUSE mountpoint for a device, if mounted.
     async fn mountpoint_for(&self, device: &str) -> zbus::fdo::Result<String> {
         let s = self.state.lock();
-        s.devices.get(&DeviceId(device.to_string()))
+        s.devices
+            .get(&DeviceId(device.to_string()))
             .and_then(|slot| slot.mountpoint.as_ref())
             .map(|p| p.to_string_lossy().into_owned())
             .ok_or_else(|| zbus::fdo::Error::ServiceUnknown("device not mounted".into()))
     }
 
-    async fn version(&self) -> zbus::fdo::Result<String> { Ok(env!("CARGO_PKG_VERSION").into()) }
+    async fn version(&self) -> zbus::fdo::Result<String> {
+        Ok(env!("CARGO_PKG_VERSION").into())
+    }
 
     /// List a directory on a device. Returns a JSON array of entries so we
     /// don't have to plumb zvariant types through.
@@ -1435,10 +1702,14 @@ impl ManagerInterface {
         tracing::info!(%device, %path, "list_dir called");
         let client = {
             let s = self.state.lock();
-            s.devices.get(&DeviceId(device.to_string())).map(|slot| slot.client.clone())
+            s.devices
+                .get(&DeviceId(device.to_string()))
+                .map(|slot| slot.client.clone())
                 .ok_or_else(|| zbus::fdo::Error::ServiceUnknown("device not connected".into()))?
         };
-        let entries = client.listdir(path).await
+        let entries = client
+            .listdir(path)
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("listdir: {e}")))?;
         tracing::info!(%device, %path, n = entries.len(), "list_dir done");
         let mut dtos: Vec<DirEntryDto> = Vec::with_capacity(entries.len());
@@ -1450,10 +1721,10 @@ impl ManagerInterface {
                 } else {
                     format!("{}/{}", path.trim_end_matches('/'), dto.name)
                 };
-                if let Ok(st) = client.stat(&full).await {
-                    if st.mode.is_dir() {
-                        dto.is_dir = true;
-                    }
+                if let Ok(st) = client.stat(&full).await
+                    && st.mode.is_dir()
+                {
+                    dto.is_dir = true;
                 }
             }
             dtos.push(dto);
@@ -1469,19 +1740,29 @@ impl ManagerInterface {
     /// recursive totals).
     async fn du(&self, device: &str, path: &str) -> zbus::fdo::Result<String> {
         let client = client_for(&self.state, device)?;
-        let usage = client.disk_usage(path).await
+        let usage = client
+            .disk_usage(path)
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("du: {e}")))?;
         let entries = match client.listdir(path).await {
             Ok(list) => list
                 .into_iter()
-                .map(|e| DuEntry { name: e.name, size: e.stat.size })
+                .map(|e| DuEntry {
+                    name: e.name,
+                    size: e.stat.size,
+                })
                 .collect(),
             Err(_) => {
                 // `path` may be a file: report it as a single entry.
-                let st = client.stat(path).await
+                let st = client
+                    .stat(path)
+                    .await
                     .map_err(|e| zbus::fdo::Error::Failed(format!("du: {e}")))?;
                 let name = path.rsplit('/').next().unwrap_or(path).to_string();
-                vec![DuEntry { name, size: st.size }]
+                vec![DuEntry {
+                    name,
+                    size: st.size,
+                }]
             }
         };
         let out = DuResult {
@@ -1490,8 +1771,7 @@ impl ManagerInterface {
             total_bytes: usage.total_bytes,
             entries,
         };
-        serde_json::to_string(&out)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
     /// Enqueue a push (local file -> device). `local_path` is on the host;
@@ -1594,22 +1874,24 @@ impl ManagerInterface {
         let mut stack = vec![(local_base.clone(), device_base.clone(), 0u32)];
         while let Some((local, remote, depth)) = stack.pop() {
             if depth > 32 {
-                out.errors.push(format!("{}: directory nesting too deep", local.display()));
+                out.errors
+                    .push(format!("{}: directory nesting too deep", local.display()));
                 continue;
             }
             let read = std::fs::read_dir(&local)
                 .map_err(|e| zbus::fdo::Error::Failed(format!("read {}: {e}", local.display())))?;
             for entry in read {
-                let entry = entry
-                    .map_err(|e| zbus::fdo::Error::Failed(format!("read {}: {e}", local.display())))?;
+                let entry = entry.map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("read {}: {e}", local.display()))
+                })?;
                 if out.enqueued.len() > 10_000 {
                     out.errors.push("too many files (limit 10000)".into());
                     return serde_json::to_string(&out)
                         .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")));
                 }
-                let file_type = entry
-                    .file_type()
-                    .map_err(|e| zbus::fdo::Error::Failed(format!("stat {}: {e}", entry.path().display())))?;
+                let file_type = entry.file_type().map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("stat {}: {e}", entry.path().display()))
+                })?;
                 if file_type.is_symlink() {
                     continue;
                 }
@@ -1631,8 +1913,7 @@ impl ManagerInterface {
                 }
             }
         }
-        serde_json::to_string(&out)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
     async fn enqueue_tree_pull(
@@ -1650,17 +1931,21 @@ impl ManagerInterface {
             ));
         }
         let local_base = PathBuf::from(local_dir);
-        std::fs::create_dir_all(&local_base)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("mkdir {}: {e}", local_base.display())))?;
+        std::fs::create_dir_all(&local_base).map_err(|e| {
+            zbus::fdo::Error::Failed(format!("mkdir {}: {e}", local_base.display()))
+        })?;
         let client = client_for(&self.state, device)?;
         let mut out = TreeEnqueueResult::default();
         let mut stack = vec![(device_dir.to_string(), local_base, 0u32)];
         while let Some((remote, local, depth)) = stack.pop() {
             if depth > 32 {
-                out.errors.push(format!("{remote}: directory nesting too deep"));
+                out.errors
+                    .push(format!("{remote}: directory nesting too deep"));
                 continue;
             }
-            let entries = client.listdir(&remote).await
+            let entries = client
+                .listdir(&remote)
+                .await
                 .map_err(|e| zbus::fdo::Error::Failed(format!("list {remote}: {e}")))?;
             for entry in entries {
                 if out.enqueued.len() > 10_000 {
@@ -1674,8 +1959,9 @@ impl ManagerInterface {
                 let remote_child = format!("{}/{}", remote.trim_end_matches('/'), entry.name);
                 let local_child = local.join(&entry.name);
                 if entry.stat.mode.is_dir() {
-                    std::fs::create_dir_all(&local_child)
-                        .map_err(|e| zbus::fdo::Error::Failed(format!("mkdir {}: {e}", local_child.display())))?;
+                    std::fs::create_dir_all(&local_child).map_err(|e| {
+                        zbus::fdo::Error::Failed(format!("mkdir {}: {e}", local_child.display()))
+                    })?;
                     stack.push((remote_child, local_child, depth + 1));
                 } else {
                     let job = Job::with_device(
@@ -1690,11 +1976,15 @@ impl ManagerInterface {
                 }
             }
         }
-        serde_json::to_string(&out)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
-    async fn copy_tree(&self, device: &str, src_dir: &str, dst_dir: &str) -> zbus::fdo::Result<String> {
+    async fn copy_tree(
+        &self,
+        device: &str,
+        src_dir: &str,
+        dst_dir: &str,
+    ) -> zbus::fdo::Result<String> {
         for path in [src_dir, dst_dir] {
             if !path.starts_with('/') || path.contains('\0') || path.len() > 4096 {
                 return Err(zbus::fdo::Error::InvalidArgs(
@@ -1703,14 +1993,17 @@ impl ManagerInterface {
             }
         }
         if src_dir == dst_dir {
-            return Err(zbus::fdo::Error::InvalidArgs("source and destination are the same".into()));
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "source and destination are the same".into(),
+            ));
         }
         let client = client_for(&self.state, device)?;
         let mut out = TreeEnqueueResult::default();
         let mut stack = vec![(src_dir.to_string(), dst_dir.to_string(), 0u32)];
         while let Some((src, dst, depth)) = stack.pop() {
             if depth > 32 {
-                out.errors.push(format!("{src}: directory nesting too deep"));
+                out.errors
+                    .push(format!("{src}: directory nesting too deep"));
                 continue;
             }
             if out.enqueued.len() > 10_000 {
@@ -1718,7 +2011,9 @@ impl ManagerInterface {
                 break;
             }
             let _ = client.mkdir(&dst, 0o755).await;
-            let entries = client.listdir(&src).await
+            let entries = client
+                .listdir(&src)
+                .await
                 .map_err(|e| zbus::fdo::Error::Failed(format!("list {src}: {e}")))?;
             for entry in entries {
                 if entry.stat.mode.is_symlink() {
@@ -1736,8 +2031,7 @@ impl ManagerInterface {
                 }
             }
         }
-        serde_json::to_string(&out)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
     /// Photo import (backend only; no GUI button yet). Lists `src_dirs`
@@ -1758,15 +2052,9 @@ impl ManagerInterface {
             ));
         }
         let client = client_for(&self.state, device)?;
-        let result = transfer_engine::import_photos(
-            &client,
-            &self.queue,
-            device,
-            &src_dirs,
-            &dest,
-        )
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(format!("import_photos: {e}")))?;
+        let result = transfer_engine::import_photos(&client, &self.queue, device, &src_dirs, &dest)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("import_photos: {e}")))?;
         serde_json::to_string(&result)
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -1777,35 +2065,56 @@ impl ManagerInterface {
     /// enqueue push/pull jobs via `enqueue_push`/`enqueue_pull`.
     async fn mirror_diff(&self, device: &str, remote_path: &str) -> zbus::fdo::Result<String> {
         let client = client_for(&self.state, device)?;
-        let entries = client.listdir(remote_path).await
+        let entries = client
+            .listdir(remote_path)
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("mirror_diff: {e}")))?;
         let out: Vec<transfer_engine::MirrorEntry> = entries
             .into_iter()
             .filter(|e| !e.stat.mode.is_dir())
-            .map(|e| transfer_engine::MirrorEntry { name: e.name, size: e.stat.size })
+            .map(|e| transfer_engine::MirrorEntry {
+                name: e.name,
+                size: e.stat.size,
+            })
             .collect();
-        serde_json::to_string(&out)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
     async fn diagnostics(&self) -> zbus::fdo::Result<String> {
         let (devices, adb_server, mount_base, proxy_conns, no_fuse) = {
             let state = self.state.lock();
-            let devices = state.devices.iter().map(|(id, slot)| DeviceDiag {
-                serial: id.0.clone(),
-                setup_ok: slot.setup_ok,
-                mounted: slot.mountpoint.is_some(),
-            }).collect();
-            (devices, state.adb_server.clone(), state.mount_base.clone(), state.proxy_conns, state.no_fuse)
+            let devices = state
+                .devices
+                .iter()
+                .map(|(id, slot)| DeviceDiag {
+                    serial: id.0.clone(),
+                    setup_ok: slot.setup_ok,
+                    mounted: slot.mountpoint.is_some(),
+                })
+                .collect();
+            (
+                devices,
+                state.adb_server.clone(),
+                state.mount_base.clone(),
+                state.proxy_conns,
+                state.no_fuse,
+            )
         };
         let adb_output = tokio::time::timeout(
             Duration::from_secs(5),
-            Command::new("adb").arg("version").kill_on_drop(true).output(),
-        ).await;
+            Command::new("adb")
+                .arg("version")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
         let (adb_ok, adb_version) = match adb_output {
             Ok(Ok(out)) if out.status.success() => {
                 let first_line = String::from_utf8_lossy(&out.stdout)
-                    .lines().next().unwrap_or("").to_string();
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
                 (true, first_line)
             }
             _ => (false, String::new()),
@@ -1828,7 +2137,12 @@ impl ManagerInterface {
 
     /// Snapshot of every job currently tracked by the queue (JSON).
     async fn list_jobs(&self) -> zbus::fdo::Result<String> {
-        let dtos: Vec<JobDto> = self.queue.jobs_snapshot().into_iter().map(JobDto::from).collect();
+        let dtos: Vec<JobDto> = self
+            .queue
+            .jobs_snapshot()
+            .into_iter()
+            .map(JobDto::from)
+            .collect();
         serde_json::to_string(&dtos)
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
@@ -1861,13 +2175,17 @@ impl ManagerInterface {
 
     async fn mkdir(&self, device: &str, path: &str) -> zbus::fdo::Result<()> {
         let client = client_for(&self.state, device)?;
-        client.mkdir(path, 0o755).await
+        client
+            .mkdir(path, 0o755)
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("mkdir: {e}")))
     }
 
     async fn rename(&self, device: &str, src: &str, dst: &str) -> zbus::fdo::Result<()> {
         let client = client_for(&self.state, device)?;
-        client.rename(src, dst).await
+        client
+            .rename(src, dst)
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("rename: {e}")))
     }
 
@@ -1880,7 +2198,9 @@ impl ManagerInterface {
             }
         }
         let client = client_for(&self.state, device)?;
-        client.copy_file(src, dst).await
+        client
+            .copy_file(src, dst)
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("copy_file: {e}")))
     }
 
@@ -1898,7 +2218,8 @@ impl ManagerInterface {
             ));
         }
         let client = client_for(&self.state, device)?;
-        delete_recursive(&client, path, 0).await
+        delete_recursive(&client, path, 0)
+            .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("delete: {e}")))
     }
 
@@ -1966,7 +2287,9 @@ impl ManagerInterface {
     /// and device-local paths (e.g. `/sdcard/...` or `/storage/...`).
     async fn install_apk(&self, device: &str, path: &str) -> zbus::fdo::Result<String> {
         if device.is_empty() || path.is_empty() {
-            return Err(zbus::fdo::Error::InvalidArgs("device and path are required".into()));
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "device and path are required".into(),
+            ));
         }
 
         let is_device_path = path.starts_with("/sdcard/")
@@ -1978,7 +2301,12 @@ impl ManagerInterface {
             if path.starts_with("/data/local/tmp/") {
                 let escaped_path = path.replace('\'', "'\\''");
                 Command::new("adb")
-                    .args(["-s", device, "shell", &format!("pm install -r '{escaped_path}'")])
+                    .args([
+                        "-s",
+                        device,
+                        "shell",
+                        &format!("pm install -r '{escaped_path}'"),
+                    ])
                     .kill_on_drop(true)
                     .output()
             } else {
@@ -2043,9 +2371,14 @@ fn which_(name: &str) -> std::result::Result<PathBuf, std::io::Error> {
     let path = std::env::var_os("PATH").ok_or_else(|| std::io::Error::other("no PATH"))?;
     for dir in std::env::split_paths(&path) {
         let p = dir.join(name);
-        if p.is_file() { return Ok(p); }
+        if p.is_file() {
+            return Ok(p);
+        }
     }
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "not found"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "not found",
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

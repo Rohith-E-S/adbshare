@@ -46,12 +46,17 @@ struct Helper(Child);
 static START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Helper {
+    // The guard deliberately spans the readiness await below: the port has to
+    // stay claimed from the bind until the helper is answering on it.
+    #[allow(clippy::await_holding_lock)]
     async fn start() -> (Self, ProxyClient) {
         // Serialized: picking an ephemeral port then handing it to the
         // helper is racy when tests start helpers in parallel — a sibling
         // test's helper can bind the just-released port first, and its
         // teardown then closes our connection mid-test.
-        let _startup = START_LOCK.lock().unwrap();
+        // Take the lock even if a previous helper poisoned it on its way out,
+        // so one failure does not cascade into eight PoisonErrors.
+        let _startup = START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -116,9 +121,10 @@ fn assert_metadata(stat: Stat, metadata: fs::Metadata) {
 /// A read must return exactly the bytes at the offset asked for, whatever was
 /// in the read buffer before.
 ///
-/// The device side reuses one scratch buffer across reads, so a bug there would
-/// show up as a short read padded with the previous chunk's contents. Reading
-/// large-then-small is the case that catches it.
+/// Reads are length-prefixed and the host asks for less than a chunk whenever
+/// it feels like it, so a read that answered with a stale buffer or with zeros
+/// past the end of the file would be invisible on a large chunk and obvious on
+/// a small one. Reading large-then-small is the case that catches it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_small_read_after_a_large_one_returns_only_its_own_bytes() {
     let dir = TestDir::new();
@@ -132,7 +138,9 @@ async fn a_small_read_after_a_large_one_returns_only_its_own_bytes() {
     bounded(file.write_at(0, &payload)).await.unwrap();
 
     // A full-size read, then progressively smaller ones at other offsets.
-    let whole = bounded(file.read_at(0, payload.len() as u32)).await.unwrap();
+    let whole = bounded(file.read_at(0, payload.len() as u32))
+        .await
+        .unwrap();
     assert_eq!(whole.len(), payload.len(), "the first read is chunk-sized");
     assert_eq!(whole[..], payload[..]);
 
@@ -152,8 +160,14 @@ async fn a_small_read_after_a_large_one_returns_only_its_own_bytes() {
     }
 
     // And a read that runs off the end returns only what exists.
-    let tail = bounded(file.read_at(payload.len() as u64 - 4, 64)).await.unwrap();
-    assert_eq!(tail.len(), 4, "a read past the end is truncated, not padded");
+    let tail = bounded(file.read_at(payload.len() as u64 - 4, 64))
+        .await
+        .unwrap();
+    assert_eq!(
+        tail.len(),
+        4,
+        "a read past the end is truncated, not padded"
+    );
     assert_eq!(tail[..], payload[payload.len() - 4..]);
 
     bounded(file.close()).await.unwrap();

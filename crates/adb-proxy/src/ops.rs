@@ -80,8 +80,12 @@ impl OpenFlags {
     /// produced no READ flag at all.
     pub fn from_octal(mode: u32) -> OpenFlags {
         let mut f = OpenFlags::empty();
-        if mode & 0o444 != 0 { f |= OpenFlags::READ; }
-        if mode & 0o222 != 0 { f |= OpenFlags::WRITE; }
+        if mode & 0o444 != 0 {
+            f |= OpenFlags::READ;
+        }
+        if mode & 0o222 != 0 {
+            f |= OpenFlags::WRITE;
+        }
         f
     }
 }
@@ -92,7 +96,10 @@ mod openflags_tests {
 
     #[test]
     fn owner_class_bits() {
-        assert_eq!(OpenFlags::from_octal(0o600), OpenFlags::READ | OpenFlags::WRITE);
+        assert_eq!(
+            OpenFlags::from_octal(0o600),
+            OpenFlags::READ | OpenFlags::WRITE
+        );
         assert_eq!(OpenFlags::from_octal(0o400), OpenFlags::READ);
         assert_eq!(OpenFlags::from_octal(0o200), OpenFlags::WRITE);
     }
@@ -121,10 +128,18 @@ impl FileMode {
     pub const S_IFDIR: u32 = 0o040000;
     pub const S_IFLNK: u32 = 0o120000;
 
-    pub fn is_dir(self) -> bool { self.0 & Self::S_IFMT == Self::S_IFDIR }
-    pub fn is_reg(self) -> bool { self.0 & Self::S_IFMT == Self::S_IFREG }
-    pub fn is_symlink(self) -> bool { self.0 & Self::S_IFMT == Self::S_IFLNK }
-    pub fn permissions(self) -> u32 { self.0 & 0o7777 }
+    pub fn is_dir(self) -> bool {
+        self.0 & Self::S_IFMT == Self::S_IFDIR
+    }
+    pub fn is_reg(self) -> bool {
+        self.0 & Self::S_IFMT == Self::S_IFREG
+    }
+    pub fn is_symlink(self) -> bool {
+        self.0 & Self::S_IFMT == Self::S_IFLNK
+    }
+    pub fn permissions(self) -> u32 {
+        self.0 & 0o7777
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,7 +174,9 @@ impl Stat {
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 60 { return None; }
+        if bytes.len() < 60 {
+            return None;
+        }
         Some(Self {
             mode: FileMode(u32::from_le_bytes(bytes[0..4].try_into().ok()?)),
             size: u64::from_le_bytes(bytes[4..12].try_into().ok()?),

@@ -47,7 +47,11 @@ impl ProgressTracker {
             }
             None => 0.0,
         };
-        let sample = SpeedSample { at: now, bytes_done, bps };
+        let sample = SpeedSample {
+            at: now,
+            bytes_done,
+            bps,
+        };
         self.last_sample = Some((now, bytes_done));
         self.history.push_back(sample);
         while self.history.len() > self.max_history {
@@ -81,7 +85,9 @@ impl ProgressTracker {
 }
 
 impl Default for ProgressTracker {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -98,7 +104,11 @@ mod tests {
         let snap = tracker.snapshot(1000);
         assert_eq!(snap.bytes_done, 250);
         // elapsed is slightly over 1s, so avg must be slightly under 250.
-        assert!(snap.avg_bps < 250.0 && snap.avg_bps > 240.0, "avg_bps = {}", snap.avg_bps);
+        assert!(
+            snap.avg_bps < 250.0 && snap.avg_bps > 240.0,
+            "avg_bps = {}",
+            snap.avg_bps
+        );
     }
 
     #[test]

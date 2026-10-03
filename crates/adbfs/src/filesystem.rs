@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -20,7 +21,7 @@ use fuser::{
 use parking_lot::Mutex;
 use thiserror::Error;
 
-use adb_proxy::{FileMode, OpenFlags, ProxyClient, ProxyError, ProxyFile, Stat, Status};
+use adb_proxy::{DirEntry, FileMode, OpenFlags, ProxyClient, ProxyError, ProxyFile, Stat, Status};
 
 use crate::cache::{DirCache, StatCache};
 
@@ -97,7 +98,7 @@ type Reply<T> = std::sync::mpsc::Sender<std::result::Result<T, ProxyError>>;
 
 enum ProxyRequest {
     Stat(String, Reply<Stat>),
-    ListDir(String, Reply<Vec<adb_proxy::ops::DirEntry>>),
+    ListDir(String, Reply<Vec<DirEntry>>),
     Open(String, OpenFlags, u32, Reply<ProxyFile>),
     ReadAt(ProxyFile, u64, u32, Reply<bytes::Bytes>),
     WriteAt(ProxyFile, u64, Vec<u8>, Reply<()>),
@@ -222,10 +223,7 @@ impl SyncProxy {
     fn stat(&self, path: &str) -> std::result::Result<Stat, ProxyError> {
         self.call(|tx| ProxyRequest::Stat(path.to_string(), tx))
     }
-    fn listdir(
-        &self,
-        path: &str,
-    ) -> std::result::Result<Vec<adb_proxy::ops::DirEntry>, ProxyError> {
+    fn listdir(&self, path: &str) -> std::result::Result<Vec<DirEntry>, ProxyError> {
         self.call(|tx| ProxyRequest::ListDir(path.to_string(), tx))
     }
     fn open(
@@ -277,7 +275,10 @@ impl Adbfs {
     /// thread that owns a tokio runtime; the FUSE callbacks stay
     /// synchronous and issue blocking requests through the SyncProxy.
     pub fn new(client: ProxyClient) -> Self {
-        let proxy = SyncProxy::start(client);
+        Self::with_proxy(SyncProxy::start(client))
+    }
+
+    fn with_proxy(proxy: SyncProxy) -> Self {
         let mut ino_to_path = HashMap::new();
         let mut path_to_ino = HashMap::new();
         ino_to_path.insert(FUSE_ROOT_ID, PathBuf::from("/"));
@@ -301,6 +302,29 @@ impl Adbfs {
     fn invalidate_parent_listing(&self, path: &Path) {
         if let Some(parent) = path.parent() {
             self.dir_cache.invalidate(parent);
+            // The parent gained or lost an entry, so its own size, mtime and
+            // link count are stale too.
+            self.cache.invalidate(parent);
+        }
+    }
+
+    /// Drop the caches a completed rename left lying.
+    ///
+    /// Both sides lose an entry from the directory that holds them, whether or
+    /// not what moved was a directory, so both parents' listings go. The stats
+    /// for the two paths are stale either way; if a directory moved, everything
+    /// under it moved with it.
+    fn invalidate_after_rename(&self, src: &Path, dst: &Path, is_dir: bool) {
+        self.invalidate_parent_listing(src);
+        self.invalidate_parent_listing(dst);
+        if is_dir {
+            self.cache.invalidate_prefix(src);
+            self.cache.invalidate_prefix(dst);
+            self.dir_cache.invalidate_prefix(src);
+            self.dir_cache.invalidate_prefix(dst);
+        } else {
+            self.cache.invalidate(src);
+            self.cache.invalidate(dst);
         }
     }
 
@@ -354,6 +378,22 @@ impl Adbfs {
         let mut p = parent_path;
         p.push(name);
         Some(p)
+    }
+
+    /// Give one entry of a listing its inode and return it.
+    ///
+    /// `fresh` says whether the listing was just fetched over the proxy. Only
+    /// then are its stats worth caching: the snapshot a cache hit serves is
+    /// already up to a TTL old, and re-stamping it would keep answering with
+    /// it for another TTL on top of that.
+    fn adopt_listing_entry(&self, parent: &Path, entry: &DirEntry, fresh: bool) -> u64 {
+        let mut child_path = parent.to_path_buf();
+        child_path.push(OsStr::from_bytes(entry.name.as_bytes()));
+        let ino = self.ino_for(child_path.clone());
+        if fresh {
+            self.cache.put(child_path, entry.stat);
+        }
+        ino
     }
 
     fn proxy_to_errno(e: ProxyError) -> i32 {
@@ -451,18 +491,23 @@ impl Filesystem for Adbfs {
         // needs, each with a continuation offset. Listing the whole thing over
         // ADB every time made a large directory quadratic in round trips, so a
         // recent listing is reused.
-        let entries = match self.dir_cache.get(&path) {
-            Some(cached) => cached,
-            None => match self.proxy.listdir(&path_str) {
-                Ok(fresh) => {
-                    self.dir_cache.put(path.clone(), fresh.clone());
-                    fresh
+        let (entries, fresh) = match self.dir_cache.get(&path) {
+            Some(cached) => (cached, false),
+            None => {
+                let epoch = self.dir_cache.epoch();
+                match self.proxy.listdir(&path_str) {
+                    Ok(entries) => {
+                        let entries = Arc::new(entries);
+                        self.dir_cache
+                            .put(path.clone(), Arc::clone(&entries), epoch);
+                        (entries, true)
+                    }
+                    Err(e) => {
+                        reply.error(Self::proxy_to_errno(e));
+                        return;
+                    }
                 }
-                Err(e) => {
-                    reply.error(Self::proxy_to_errno(e));
-                    return;
-                }
-            },
+            }
         };
         let mut cur = offset.max(0) as usize;
         if cur == 0 {
@@ -477,16 +522,10 @@ impl Filesystem for Adbfs {
             let _ = reply.add(FUSE_ROOT_ID, 2, FileType::Directory, "..");
             cur = 2;
         }
-        for (n, entry) in entries.into_iter().enumerate().skip(cur.saturating_sub(2)) {
-            let child_path = {
-                let mut p = path.clone();
-                p.push(OsStr::from_bytes(entry.name.as_bytes()));
-                p
-            };
-            let child_ino = self.ino_for(child_path.clone());
-            self.cache.put(child_path, entry.stat);
+        for (n, entry) in entries.iter().enumerate().skip(cur.saturating_sub(2)) {
+            let child_ino = self.adopt_listing_entry(&path, entry, fresh);
             let kind = Self::kind_from_mode(&entry.stat.mode);
-            let _ = reply.add(child_ino, (n as i64) + 3, kind, entry.name);
+            let _ = reply.add(child_ino, (n as i64) + 3, kind, &entry.name);
         }
         reply.ok();
     }
@@ -579,17 +618,14 @@ impl Filesystem for Adbfs {
             }
         };
         let res = self.proxy.write_at(file, offset as u64, data.to_vec());
-        // A write changes the mtime the parent listing shows, so the cached
-        // listing is stale even though the set of entries is not.
-        if res.is_ok()
-            && let Some(path) = self.ino_to_path.lock().get(&ino).cloned()
-        {
-            self.invalidate_parent_listing(&path);
-        }
         match res {
             Ok(()) => {
                 if let Some(path) = self.ino_to_path.lock().get(&ino) {
                     self.cache.invalidate(path);
+                    // A write changes the mtime the parent listing shows, so
+                    // the cached listing is stale even though the set of
+                    // entries is not.
+                    self.invalidate_parent_listing(path);
                 }
                 reply.written(data.len() as u32);
             }
@@ -794,22 +830,22 @@ impl Filesystem for Adbfs {
             reply.error(libc::EINVAL);
             return;
         };
+        // Was src a directory? Ask *before* the rename, while src still exists;
+        // afterwards a fallback stat can only ever come back NotFound, and a
+        // directory rename would then skip invalidating its own subtree.
+        let is_dir = self
+            .cache
+            .get(&src)
+            .map(|s| s.mode.is_dir())
+            .unwrap_or_else(|| {
+                self.proxy
+                    .stat(&src_str)
+                    .ok()
+                    .map(|s| s.mode.is_dir())
+                    .unwrap_or(false)
+            });
         match self.proxy.rename(&src_str, &dst_str) {
             Ok(()) => {
-                // Was src a directory? Prefer the cached stat, fall back to
-                // a fresh one; if neither is available assume a plain file.
-                let is_dir = self
-                    .cache
-                    .get(&src)
-                    .map(|s| s.mode.is_dir())
-                    .unwrap_or_else(|| {
-                        self.proxy
-                            .stat(&src_str)
-                            .ok()
-                            .map(|s| s.mode.is_dir())
-                            .unwrap_or(false)
-                    });
-
                 // Move the inode mappings from src to dst so existing inode
                 // numbers (and therefore the kernel's cached nodeids) stay
                 // valid across the rename. For a directory rename, rewrite
@@ -848,18 +884,9 @@ impl Filesystem for Adbfs {
                     }
                 }
 
-                // Drop cached stats for the old location (and, for a
-                // directory rename, its whole subtree) and for the
-                // destination, which may have been overwritten.
-                if is_dir {
-                    self.cache.invalidate_prefix(&src);
-                    self.cache.invalidate_prefix(&dst);
-                    self.dir_cache.invalidate_prefix(&src);
-                    self.dir_cache.invalidate_prefix(&dst);
-                } else {
-                    self.cache.invalidate(&src);
-                    self.cache.invalidate(&dst);
-                }
+                // Both parents' listings are stale too: one is where the
+                // entry went from, the other where it arrived.
+                self.invalidate_after_rename(&src, &dst, is_dir);
                 reply.ok();
             }
             Err(e) => reply.error(Self::proxy_to_errno(e)),
@@ -939,6 +966,210 @@ impl Filesystem for Adbfs {
             BLOCK_SIZE,
             256,
             4096,
+        );
+    }
+}
+
+/// The callbacks cannot be driven without a real mount — fuser's `Reply`
+/// types have no public constructors — so these cover the cache bookkeeping
+/// they are built on.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat_of(size: u64) -> Stat {
+        Stat {
+            mode: FileMode::file(),
+            size,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            uid: ADB_UID,
+            gid: ADB_GID,
+            nlink: 1,
+            blksize: 4096,
+            blocks: 0,
+        }
+    }
+
+    fn listing(names: &[&str]) -> Arc<Vec<DirEntry>> {
+        Arc::new(
+            names
+                .iter()
+                .map(|name| DirEntry {
+                    name: (*name).to_string(),
+                    stat: stat_of(0),
+                })
+                .collect(),
+        )
+    }
+
+    /// An `Adbfs` with no proxy behind it: the bookkeeping under test never
+    /// issues a request, and a real client would need a device to talk to.
+    /// A closed receiver is what answers one.
+    fn detached() -> Adbfs {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProxyRequest>();
+        drop(rx);
+        Adbfs::with_proxy(SyncProxy { tx })
+    }
+
+    #[test]
+    fn renaming_a_file_drops_both_parents_listings() {
+        let fs = detached();
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard"),
+            listing(&["old.bin"]),
+            fs.dir_cache.epoch(),
+        );
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard/DCIM"),
+            listing(&["keep"]),
+            fs.dir_cache.epoch(),
+        );
+        fs.dir_cache.put(
+            PathBuf::from("/data"),
+            listing(&["other"]),
+            fs.dir_cache.epoch(),
+        );
+
+        fs.invalidate_after_rename(
+            Path::new("/sdcard/old.bin"),
+            Path::new("/sdcard/new.bin"),
+            false,
+        );
+
+        // readdir on the parent has to go back to the device: the entry it
+        // would serve is gone, and one it never saw is missing.
+        assert!(fs.dir_cache.get(Path::new("/sdcard")).is_none());
+        assert!(
+            fs.dir_cache.get(Path::new("/sdcard/DCIM")).is_some(),
+            "a directory that was only walked through is untouched"
+        );
+        assert!(
+            fs.dir_cache.get(Path::new("/data")).is_some(),
+            "a directory the rename did not touch is untouched"
+        );
+    }
+
+    #[test]
+    fn renaming_a_file_into_another_directory_drops_both_parents() {
+        let fs = detached();
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard"),
+            listing(&["a.bin"]),
+            fs.dir_cache.epoch(),
+        );
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard/Movies"),
+            listing(&[]),
+            fs.dir_cache.epoch(),
+        );
+
+        fs.invalidate_after_rename(
+            Path::new("/sdcard/a.bin"),
+            Path::new("/sdcard/Movies/a.bin"),
+            false,
+        );
+
+        assert!(fs.dir_cache.get(Path::new("/sdcard")).is_none());
+        assert!(fs.dir_cache.get(Path::new("/sdcard/Movies")).is_none());
+    }
+
+    #[test]
+    fn renaming_a_directory_drops_both_subtrees() {
+        let fs = detached();
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard/DCIM"),
+            listing(&["old"]),
+            fs.dir_cache.epoch(),
+        );
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard/DCIM/2024"),
+            listing(&["kept"]),
+            fs.dir_cache.epoch(),
+        );
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard/Movies"),
+            listing(&[]),
+            fs.dir_cache.epoch(),
+        );
+
+        fs.invalidate_after_rename(
+            Path::new("/sdcard/DCIM"),
+            Path::new("/sdcard/Movies/DCIM"),
+            true,
+        );
+
+        assert!(fs.dir_cache.get(Path::new("/sdcard/DCIM")).is_none());
+        assert!(fs.dir_cache.get(Path::new("/sdcard/DCIM/2024")).is_none());
+        assert!(fs.dir_cache.get(Path::new("/sdcard/Movies")).is_none());
+    }
+
+    #[test]
+    fn renaming_drops_the_stats_of_both_paths() {
+        let fs = detached();
+        fs.cache.put(PathBuf::from("/sdcard/old.bin"), stat_of(7));
+        fs.cache.put(PathBuf::from("/sdcard/new.bin"), stat_of(7));
+
+        fs.invalidate_after_rename(
+            Path::new("/sdcard/old.bin"),
+            Path::new("/sdcard/new.bin"),
+            false,
+        );
+
+        assert!(fs.cache.get(Path::new("/sdcard/old.bin")).is_none());
+        assert!(
+            fs.cache.get(Path::new("/sdcard/new.bin")).is_none(),
+            "the destination may have been overwritten"
+        );
+    }
+
+    #[test]
+    fn a_listing_served_from_the_cache_does_not_refresh_the_stats() {
+        let fs = detached();
+        let snapshot = listing(&["a.bin"]);
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard"),
+            Arc::clone(&snapshot),
+            fs.dir_cache.epoch(),
+        );
+        // What a later lookup of the child found on the device.
+        fs.cache.put(PathBuf::from("/sdcard/a.bin"), stat_of(4096));
+
+        // A continued readdir off the cached snapshot: the entries are up to a
+        // DIR_TTL old already, so their stats must not be cached afresh.
+        fs.adopt_listing_entry(Path::new("/sdcard"), &snapshot[0], false);
+
+        assert_eq!(
+            fs.cache.get(Path::new("/sdcard/a.bin")).map(|s| s.size),
+            Some(4096),
+            "the stat cache kept the newer reading"
+        );
+    }
+
+    #[test]
+    fn a_freshly_listed_entry_is_cached_for_the_attributes_that_follow() {
+        let fs = detached();
+        let fresh = listing(&["a.bin"]);
+        fs.dir_cache.put(
+            PathBuf::from("/sdcard"),
+            Arc::clone(&fresh),
+            fs.dir_cache.epoch(),
+        );
+
+        let ino = fs.adopt_listing_entry(Path::new("/sdcard"), &fresh[0], true);
+
+        assert!(
+            ino > FUSE_ROOT_ID,
+            "the entry was given an inode of its own"
+        );
+        assert_eq!(
+            fs.cache.get(Path::new("/sdcard/a.bin")).map(|s| s.size),
+            Some(0)
+        );
+        assert_eq!(
+            fs.ino_to_path.lock().get(&ino),
+            Some(&PathBuf::from("/sdcard/a.bin"))
         );
     }
 }

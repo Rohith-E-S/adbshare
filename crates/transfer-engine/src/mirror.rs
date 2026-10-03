@@ -51,7 +51,10 @@ pub fn plan_mirror(local_dir: &Path, remote: &[MirrorEntry]) -> (Vec<String>, Ve
 }
 
 /// Map-based core of [`plan_mirror`] (separated for testability).
-fn plan_mirror_maps(local: &HashMap<String, u64>, remote: &[MirrorEntry]) -> (Vec<String>, Vec<String>) {
+fn plan_mirror_maps(
+    local: &HashMap<String, u64>,
+    remote: &[MirrorEntry],
+) -> (Vec<String>, Vec<String>) {
     let remote_map: HashMap<&str, u64> = remote.iter().map(|e| (e.name.as_str(), e.size)).collect();
     let mut to_push = Vec::new();
     let mut to_pull = Vec::new();
@@ -86,8 +89,14 @@ mod tests {
     fn in_sync_files_are_listed_nowhere() {
         let local = local_map(&[("a.jpg", 10), ("b.jpg", 20)]);
         let remote = vec![
-            MirrorEntry { name: "a.jpg".into(), size: 10 },
-            MirrorEntry { name: "b.jpg".into(), size: 20 },
+            MirrorEntry {
+                name: "a.jpg".into(),
+                size: 10,
+            },
+            MirrorEntry {
+                name: "b.jpg".into(),
+                size: 20,
+            },
         ];
         assert_eq!(plan_mirror_maps(&local, &remote), (vec![], vec![]));
     }
@@ -95,7 +104,10 @@ mod tests {
     #[test]
     fn missing_sides_land_in_push_or_pull() {
         let local = local_map(&[("only-local", 1)]);
-        let remote = vec![MirrorEntry { name: "only-remote".into(), size: 2 }];
+        let remote = vec![MirrorEntry {
+            name: "only-remote".into(),
+            size: 2,
+        }];
         let (push, pull) = plan_mirror_maps(&local, &remote);
         assert_eq!(push, vec!["only-local".to_string()]);
         assert_eq!(pull, vec!["only-remote".to_string()]);
@@ -104,7 +116,10 @@ mod tests {
     #[test]
     fn size_mismatch_is_a_conflict_in_both() {
         let local = local_map(&[("same-name", 1)]);
-        let remote = vec![MirrorEntry { name: "same-name".into(), size: 2 }];
+        let remote = vec![MirrorEntry {
+            name: "same-name".into(),
+            size: 2,
+        }];
         let (push, pull) = plan_mirror_maps(&local, &remote);
         assert_eq!(push, vec!["same-name".to_string()]);
         assert_eq!(pull, vec!["same-name".to_string()]);
@@ -114,7 +129,10 @@ mod tests {
     fn unreadable_local_dir_treats_everything_as_to_pull() {
         let (push, pull) = plan_mirror(
             Path::new("/definitely/not/a/real/adbshare-mirror-test-dir"),
-            &[MirrorEntry { name: "r".into(), size: 1 }],
+            &[MirrorEntry {
+                name: "r".into(),
+                size: 1,
+            }],
         );
         assert!(push.is_empty());
         assert_eq!(pull, vec!["r".to_string()]);
@@ -133,7 +151,10 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("keep"), b"12345").unwrap();
         std::fs::write(base.join("new-local"), b"xy").unwrap();
-        let remote = vec![MirrorEntry { name: "keep".into(), size: 5 }];
+        let remote = vec![MirrorEntry {
+            name: "keep".into(),
+            size: 5,
+        }];
         let (push, pull) = plan_mirror(&base, &remote);
         assert_eq!(push, vec!["new-local".to_string()]);
         assert!(pull.is_empty());

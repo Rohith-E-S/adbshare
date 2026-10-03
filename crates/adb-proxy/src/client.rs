@@ -12,12 +12,10 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{mpsc, OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
 };
 
-use crate::ops::{
-    DirEntry, FileMode, OpenFlags, Op, Stat, Status,
-};
+use crate::ops::{DirEntry, FileMode, Op, OpenFlags, Stat, Status};
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -106,8 +104,12 @@ impl ProxyConn {
         // Writer task: drains write_tx into the TCP socket.
         tokio::spawn(async move {
             while let Some(msg) = write_rx.recv().await {
-                if write_half.write_all(&msg).await.is_err() { break; }
-                if write_half.flush().await.is_err() { break; }
+                if write_half.write_all(&msg).await.is_err() {
+                    break;
+                }
+                if write_half.flush().await.is_err() {
+                    break;
+                }
             }
             *closed_w.lock() = true;
         });
@@ -121,9 +123,15 @@ impl ProxyConn {
                 // Need at least 4 bytes for the length prefix.
                 while buf.len() < 4 {
                     match read_half.read_buf(&mut buf).await {
-                        Ok(0) => { *closed_r.lock() = true; return; }
+                        Ok(0) => {
+                            *closed_r.lock() = true;
+                            return;
+                        }
                         Ok(_) => {}
-                        Err(_) => { *closed_r.lock() = true; return; }
+                        Err(_) => {
+                            *closed_r.lock() = true;
+                            return;
+                        }
                     }
                 }
                 let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -133,14 +141,22 @@ impl ProxyConn {
                 }
                 while buf.len() < 4 + len {
                     match read_half.read_buf(&mut buf).await {
-                        Ok(0) => { *closed_r.lock() = true; return; }
+                        Ok(0) => {
+                            *closed_r.lock() = true;
+                            return;
+                        }
                         Ok(_) => {}
-                        Err(_) => { *closed_r.lock() = true; return; }
+                        Err(_) => {
+                            *closed_r.lock() = true;
+                            return;
+                        }
                     }
                 }
                 let _len_bytes = buf.split_to(4);
                 let body = buf.split_to(len).freeze();
-                if resp_tx.send(body).await.is_err() { return; }
+                if resp_tx.send(body).await.is_err() {
+                    return;
+                }
             }
         });
 
@@ -159,16 +175,25 @@ impl ProxyConn {
     /// The response, if any, is never consumed — callers must not reuse the
     /// connection afterwards.
     fn try_send_frame(&self, frame: Bytes) -> Result<()> {
-        self.inner.write_tx.try_send(frame).map_err(|_| ProxyError::Closed)
+        self.inner
+            .write_tx
+            .try_send(frame)
+            .map_err(|_| ProxyError::Closed)
     }
 
     /// Send a pre-built frame and wait for its response. Used by Drop so the
     /// connection stays synchronized after a best-effort close.
     async fn send_frame_and_await(&self, frame: Bytes) -> Result<Bytes> {
-        if self.is_closed() || self.is_poisoned() { return Err(ProxyError::Closed); }
+        if self.is_closed() || self.is_poisoned() {
+            return Err(ProxyError::Closed);
+        }
         let _guard = self.inner.req_lock.lock().await;
         let recv = async {
-            self.inner.write_tx.send(frame).await.map_err(|_| ProxyError::Closed)?;
+            self.inner
+                .write_tx
+                .send(frame)
+                .await
+                .map_err(|_| ProxyError::Closed)?;
             let mut rx = self.inner.read_rx.lock().await;
             rx.recv().await.ok_or(ProxyError::Closed)
         };
@@ -195,7 +220,9 @@ impl ProxyConn {
     /// Issue a request and wait for the response. The request payload is
     /// the `args` part; the response payload is the data section.
     async fn request(&self, op: Op, args: &[u8]) -> Result<Bytes> {
-        if self.is_closed() || self.is_poisoned() { return Err(ProxyError::Closed); }
+        if self.is_closed() || self.is_poisoned() {
+            return Err(ProxyError::Closed);
+        }
         // Serialize requests on this connection: lock held for the duration
         // of the request + response, so no two requests interleave.
         let _guard = self.inner.req_lock.lock().await;
@@ -210,7 +237,10 @@ impl ProxyConn {
         // order. Because the connection is serialized by `req_lock`, the
         // next frame is ours.
         let recv = async {
-            self.inner.write_tx.send(frame.freeze()).await
+            self.inner
+                .write_tx
+                .send(frame.freeze())
+                .await
                 .map_err(|_| ProxyError::Closed)?;
             let mut rx = self.inner.read_rx.lock().await;
             rx.recv().await.ok_or(ProxyError::Closed)
@@ -252,8 +282,12 @@ pub struct ProxyClient {
 }
 
 impl ProxyClient {
-    pub fn addr(&self) -> &str { &self.addr }
-    pub fn max_conns(&self) -> usize { self.max_conns }
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+    pub fn max_conns(&self) -> usize {
+        self.max_conns
+    }
 }
 
 impl std::fmt::Debug for ProxyClient {
@@ -281,7 +315,11 @@ impl ProxyClient {
     }
 
     async fn acquire(&self) -> Result<(ProxyConn, OwnedSemaphorePermit)> {
-        let permit = self.semaphore.clone().acquire_owned().await
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| ProxyError::PoolExhausted)?;
         loop {
             let conn = {
@@ -326,7 +364,8 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::Stat, &args).await?;
             Stat::decode(&resp).ok_or_else(|| ProxyError::Invalid("stat decode".into()))
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -339,7 +378,8 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::Lstat, &args).await?;
             Stat::decode(&resp).ok_or_else(|| ProxyError::Invalid("lstat decode".into()))
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -352,7 +392,8 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::ListDir, &args).await?;
             parse_dir_entries(&resp)
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -366,7 +407,10 @@ impl ProxyClient {
         args.extend_from_slice(path.as_bytes());
         let resp = match conn.request(Op::Open, &args).await {
             Ok(resp) => resp,
-            Err(e) => { self.release(conn); return Err(e); }
+            Err(e) => {
+                self.release(conn);
+                return Err(e);
+            }
         };
         if resp.len() < 4 {
             self.release(conn);
@@ -392,7 +436,8 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             args.extend_from_slice(&mode.to_le_bytes());
             conn.request(Op::Mkdir, &args).await.map(|_| ())
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -404,7 +449,8 @@ impl ProxyClient {
             args.extend_from_slice(&(path.len() as u32).to_le_bytes());
             args.extend_from_slice(path.as_bytes());
             conn.request(Op::Unlink, &args).await.map(|_| ())
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -416,7 +462,8 @@ impl ProxyClient {
             args.extend_from_slice(&(path.len() as u32).to_le_bytes());
             args.extend_from_slice(path.as_bytes());
             conn.request(Op::Rmdir, &args).await.map(|_| ())
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -430,7 +477,8 @@ impl ProxyClient {
             args.extend_from_slice(&(dst.len() as u32).to_le_bytes());
             args.extend_from_slice(dst.as_bytes());
             conn.request(Op::Rename, &args).await.map(|_| ())
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -438,7 +486,10 @@ impl ProxyClient {
     pub async fn copy_file(&self, src: &str, dst: &str) -> Result<()> {
         for path in [src, dst] {
             if !path.starts_with('/') || path.contains('\0') || path.len() > 4096 {
-                return Err(ProxyError::Status(Status::InvalidArg, "copy paths must be absolute, non-NUL, and at most 4096 bytes".into()));
+                return Err(ProxyError::Status(
+                    Status::InvalidArg,
+                    "copy paths must be absolute, non-NUL, and at most 4096 bytes".into(),
+                ));
             }
         }
         let (conn, _permit) = self.acquire().await?;
@@ -447,14 +498,14 @@ impl ProxyClient {
         args.extend_from_slice(src.as_bytes());
         args.extend_from_slice(&(dst.len() as u32).to_le_bytes());
         args.extend_from_slice(dst.as_bytes());
-        let res = conn.request(Op::CopyFile, &args).await.map(|_| ()).map_err(|error| {
-            match error {
+        let res = conn.request(Op::CopyFile, &args).await.map(|_| ()).map_err(
+            |error| match error {
                 ProxyError::Status(_, _) => error,
                 _ => ProxyError::Other(format!(
                     "{error}; completion unknown; destination may be incomplete or still copying"
                 )),
-            }
-        });
+            },
+        );
         self.release(conn);
         res
     }
@@ -467,7 +518,8 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             args.extend_from_slice(&size.to_le_bytes());
             conn.request(Op::Truncate, &args).await.map(|_| ())
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -483,7 +535,8 @@ impl ProxyClient {
             args.extend_from_slice(&atime.to_le_bytes());
             args.extend_from_slice(&mtime.to_le_bytes());
             conn.request(Op::Utime, &args).await.map(|_| ())
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -496,7 +549,8 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::ReadLink, &args).await?;
             parse_string(&resp)
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -509,7 +563,8 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::RealPath, &args).await?;
             parse_string(&resp)
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -524,7 +579,8 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::DiskUsage, &args).await?;
             DiskUsage::decode(&resp)
-        }.await;
+        }
+        .await;
         self.release(conn);
         res
     }
@@ -597,8 +653,12 @@ impl std::fmt::Debug for ProxyFile {
 }
 
 impl ProxyFile {
-    pub fn path(&self) -> &str { &self.inner.path }
-    pub fn fd(&self) -> u32 { self.inner.fd }
+    pub fn path(&self) -> &str {
+        &self.inner.path
+    }
+    pub fn fd(&self) -> u32 {
+        self.inner.fd
+    }
 
     /// Clone of the live connection, or `Closed` if already closed.
     fn conn(&self) -> Result<ProxyConn> {
@@ -686,24 +746,26 @@ fn parse_string(data: &[u8]) -> Result<String> {
     if data.len() - 4 != len {
         return Err(ProxyError::Invalid("string payload length".into()));
     }
-    String::from_utf8(data[4..].to_vec())
-        .map_err(|_| ProxyError::Invalid("string utf8".into()))
+    String::from_utf8(data[4..].to_vec()).map_err(|_| ProxyError::Invalid("string utf8".into()))
 }
 
 fn parse_dir_entries(data: &[u8]) -> Result<Vec<DirEntry>> {
     let mut entries = Vec::new();
     let mut i = 0;
     while i < data.len() {
-        if i + 4 > data.len() { return Err(ProxyError::Invalid("dir entry name len".into())); }
-        let name_len = u32::from_le_bytes([data[i], data[i+1], data[i+2], data[i+3]]) as usize;
+        if i + 4 > data.len() {
+            return Err(ProxyError::Invalid("dir entry name len".into()));
+        }
+        let name_len =
+            u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
         i += 4;
         if i + name_len + 60 > data.len() {
             return Err(ProxyError::Invalid("dir entry payload".into()));
         }
-        let name = String::from_utf8(data[i..i+name_len].to_vec())
+        let name = String::from_utf8(data[i..i + name_len].to_vec())
             .map_err(|_| ProxyError::Invalid("dir entry utf8".into()))?;
         i += name_len;
-        let stat = Stat::decode(&data[i..i+60])
+        let stat = Stat::decode(&data[i..i + 60])
             .ok_or_else(|| ProxyError::Invalid("dir entry stat".into()))?;
         i += 60;
         entries.push(DirEntry { name, stat });
@@ -713,6 +775,10 @@ fn parse_dir_entries(data: &[u8]) -> Result<Vec<DirEntry>> {
 
 // Expose FileMode convenience constructors.
 impl FileMode {
-    pub fn dir() -> Self { Self(Self::S_IFDIR | 0o755) }
-    pub fn file() -> Self { Self(Self::S_IFREG | 0o644) }
+    pub fn dir() -> Self {
+        Self(Self::S_IFDIR | 0o755)
+    }
+    pub fn file() -> Self {
+        Self(Self::S_IFREG | 0o644)
+    }
 }

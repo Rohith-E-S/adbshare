@@ -11,7 +11,9 @@ use adb_proxy::ProxyClient;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let mountpoint = std::env::args().nth(1).expect("usage: test-adbfs <mountpoint>");
+    let mountpoint = std::env::args()
+        .nth(1)
+        .expect("usage: test-adbfs <mountpoint>");
     std::fs::create_dir_all(&mountpoint)?;
 
     // Find and start the local proxy.
@@ -24,7 +26,10 @@ async fn main() -> anyhow::Result<()> {
         .spawn()?;
     // Wait for it.
     for _ in 0..20 {
-        if tokio::net::TcpStream::connect("127.0.0.1:31399").await.is_ok() {
+        if tokio::net::TcpStream::connect("127.0.0.1:31399")
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -50,16 +55,24 @@ async fn main() -> anyhow::Result<()> {
 fn locate_proxy() -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let candidate = exe.parent().unwrap().join("adbshare-proxy");
-    if candidate.exists() { return Ok(candidate); }
-    if let Ok(p) = which("adbshare-proxy") { return Ok(p); }
-    anyhow::bail!("adbshare-proxy not found; build with `cargo build --bin adbshare-proxy --release`")
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    if let Ok(p) = which("adbshare-proxy") {
+        return Ok(p);
+    }
+    anyhow::bail!(
+        "adbshare-proxy not found; build with `cargo build --bin adbshare-proxy --release`"
+    )
 }
 
 fn which(name: &str) -> anyhow::Result<PathBuf> {
     let path = std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("no PATH"))?;
     for dir in std::env::split_paths(&path) {
         let p = dir.join(name);
-        if p.is_file() { return Ok(p); }
+        if p.is_file() {
+            return Ok(p);
+        }
     }
     Err(anyhow::anyhow!("not found"))
 }

@@ -31,8 +31,8 @@ pub mod verify;
 pub mod worker;
 
 pub use job::{Direction, Job, JobId, JobOptions, JobState};
-pub use mirror::{plan_mirror, MirrorEntry};
-pub use photo_import::{import_photos, PhotoImportResult, DEFAULT_PHOTO_SRC_DIRS};
+pub use mirror::{MirrorEntry, plan_mirror};
+pub use photo_import::{DEFAULT_PHOTO_SRC_DIRS, PhotoImportResult, import_photos};
 pub use progress::{ProgressSnapshot, SpeedSample};
 pub use queue::JobQueue;
 pub use verify::verify_checksum;

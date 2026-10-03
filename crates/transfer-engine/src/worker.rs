@@ -6,10 +6,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use adb_proxy::{OpenFlags, ProxyClient, ProxyError};
 
+use super::DEFAULT_CHUNK;
 use super::job::{Direction, Job, JobState, OverwriteMode};
 use super::progress::ProgressTracker;
 use super::verify;
-use super::DEFAULT_CHUNK;
 
 #[derive(Debug)]
 pub struct Worker {
@@ -19,10 +19,16 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(client: ProxyClient) -> Self {
-        Self { client, chunk_size: DEFAULT_CHUNK }
+        Self {
+            client,
+            chunk_size: DEFAULT_CHUNK,
+        }
     }
 
-    pub fn with_chunk(mut self, n: usize) -> Self { self.chunk_size = n; self }
+    pub fn with_chunk(mut self, n: usize) -> Self {
+        self.chunk_size = n;
+        self
+    }
 
     /// Run a job to completion. Updates job state and progress.
     pub async fn run(self: Arc<Self>, job: Job) -> Result<(), ProxyError> {
@@ -105,7 +111,8 @@ impl Worker {
     }
 
     async fn push(&self, job: &Job, tracker: &mut ProgressTracker) -> Result<(), ProxyError> {
-        let source_len = tokio::fs::metadata(&job.source).await
+        let source_len = tokio::fs::metadata(&job.source)
+            .await
             .map_err(|e| ProxyError::Other(format!("stat source: {e}")))?
             .len();
 
@@ -146,9 +153,12 @@ impl Worker {
             _ => OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNC,
         };
 
-        let mut src = tokio::fs::File::open(&job.source).await.map_err(|e| ProxyError::Other(e.to_string()))?;
+        let mut src = tokio::fs::File::open(&job.source)
+            .await
+            .map_err(|e| ProxyError::Other(e.to_string()))?;
         if offset > 0 {
-            src.seek(std::io::SeekFrom::Start(offset)).await
+            src.seek(std::io::SeekFrom::Start(offset))
+                .await
                 .map_err(|e| ProxyError::Other(format!("seek source: {e}")))?;
             job.add_bytes(offset);
         }
@@ -163,7 +173,9 @@ impl Worker {
                 Ok(n) => n,
                 Err(e) => break Err(ProxyError::Other(format!("read source: {e}"))),
             };
-            if n == 0 { break Ok(()); }
+            if n == 0 {
+                break Ok(());
+            }
             if let Err(e) = dst.write_at(offset, &buf[..n]).await {
                 break Err(e);
             }
@@ -187,7 +199,9 @@ impl Worker {
         }
         // A failed close may mean the device never durably received the
         // final chunks; report it instead of silently completing.
-        dst.close().await.map_err(|e| ProxyError::Other(format!("close destination: {e}")))?;
+        dst.close()
+            .await
+            .map_err(|e| ProxyError::Other(format!("close destination: {e}")))?;
         if matches!(job.options.verify, super::job::VerifyMode::On) {
             self.verify_paths(&job.source, &dest).await?;
         }
@@ -226,10 +240,14 @@ impl Worker {
                 let mut f = tokio::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
+                    // Not truncating: a resumed transfer continues at `offset`
+                    // in the bytes already on disk.
+                    .truncate(false)
                     .open(&dest)
                     .await
                     .map_err(|e| ProxyError::Other(format!("open destination: {e}")))?;
-                f.seek(std::io::SeekFrom::Start(offset)).await
+                f.seek(std::io::SeekFrom::Start(offset))
+                    .await
                     .map_err(|e| ProxyError::Other(format!("seek destination: {e}")))?;
                 job.add_bytes(offset);
                 f
@@ -237,20 +255,21 @@ impl Worker {
             (Some(_), OverwriteMode::Rename) => {
                 dest = self.pick_local_rename(&dest).await;
                 created = true;
-                tokio::fs::File::create(&dest).await
+                tokio::fs::File::create(&dest)
+                    .await
                     .map_err(|e| ProxyError::Other(format!("create destination: {e}")))?
             }
             // Always (and Resume when the local file is already at least as
             // large as the remote source): rewrite from scratch.
-            _ => tokio::fs::File::create(&dest).await
+            _ => tokio::fs::File::create(&dest)
+                .await
                 .map_err(|e| ProxyError::Other(format!("create destination: {e}")))?,
         };
 
-        let src = self.client.open(
-            job.source.to_str().unwrap(),
-            OpenFlags::READ,
-            0,
-        ).await?;
+        let src = self
+            .client
+            .open(job.source.to_str().unwrap(), OpenFlags::READ, 0)
+            .await?;
 
         let outcome: Result<(), ProxyError> = loop {
             if job.is_cancelled() || self.wait_while_paused(job).await {
@@ -261,7 +280,9 @@ impl Worker {
                 Ok(d) => d,
                 Err(e) => break Err(e),
             };
-            if data.is_empty() { break Ok(()); }
+            if data.is_empty() {
+                break Ok(());
+            }
             if let Err(e) = dst.write_all(&data).await {
                 break Err(ProxyError::Other(format!("write destination: {e}")));
             }
@@ -287,8 +308,12 @@ impl Worker {
         }
         // A failed close may mean the device never registered the final
         // read; report it instead of silently completing.
-        src.close().await.map_err(|e| ProxyError::Other(format!("close source: {e}")))?;
-        dst.flush().await.map_err(|e| ProxyError::Other(e.to_string()))?;
+        src.close()
+            .await
+            .map_err(|e| ProxyError::Other(format!("close source: {e}")))?;
+        dst.flush()
+            .await
+            .map_err(|e| ProxyError::Other(e.to_string()))?;
 
         if matches!(job.options.verify, super::job::VerifyMode::On) {
             let remote = job.source.to_string_lossy().into_owned();
@@ -310,9 +335,12 @@ impl Worker {
     /// corruption is not detected. Job options carry no source checksum,
     /// so there is no independent reference hash.
     async fn verify_paths(&self, local: &Path, remote: &str) -> Result<(), ProxyError> {
-        let local_hash = verify::sha256_file(local).await
+        let local_hash = verify::sha256_file(local)
+            .await
             .map_err(|e| ProxyError::Other(format!("verify: hashing local file failed: {e}")))?;
-        let remote_hash = self.hash_remote(remote).await
+        let remote_hash = self
+            .hash_remote(remote)
+            .await
             .map_err(|e| ProxyError::Other(format!("verify: hashing remote file failed: {e}")))?;
         if local_hash != remote_hash {
             return Err(ProxyError::Other(format!(
@@ -330,12 +358,16 @@ impl Worker {
         let want = self.chunk_size.min(u32::MAX as usize) as u32;
         loop {
             let data = f.read_at(offset, want).await?;
-            if data.is_empty() { break; }
+            if data.is_empty() {
+                break;
+            }
             hasher.update(&data);
             offset += data.len() as u64;
         }
         let hash = hex::encode(hasher.finalize());
-        f.close().await.map_err(|e| ProxyError::Other(format!("close remote file: {e}")))?;
+        f.close()
+            .await
+            .map_err(|e| ProxyError::Other(format!("close remote file: {e}")))?;
         Ok(hash)
     }
 
@@ -344,7 +376,12 @@ impl Worker {
         let mut cands = RenameCandidates::new(Path::new(original));
         for _ in 0..999 {
             let cand = cands.next();
-            if self.client.stat(cand.to_string_lossy().as_ref()).await.is_err() {
+            if self
+                .client
+                .stat(cand.to_string_lossy().as_ref())
+                .await
+                .is_err()
+            {
                 return cand.to_string_lossy().into_owned();
             }
         }
@@ -362,7 +399,10 @@ impl Worker {
         }
         original.with_file_name(format!(
             "{}.adbshare-new",
-            original.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            original
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
         ))
     }
 }
@@ -379,16 +419,22 @@ impl RenameCandidates {
     fn new(path: &Path) -> Self {
         Self {
             dir: path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-            stem: path.file_stem().map(|s| s.to_string_lossy().into_owned())
+            stem: path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".into()),
-            ext: path.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default(),
+            ext: path
+                .extension()
+                .map(|s| format!(".{}", s.to_string_lossy()))
+                .unwrap_or_default(),
             n: 0,
         }
     }
 
     fn next(&mut self) -> PathBuf {
         self.n += 1;
-        self.dir.join(format!("{} ({}){}", self.stem, self.n, self.ext))
+        self.dir
+            .join(format!("{} ({}){}", self.stem, self.n, self.ext))
     }
 }
 

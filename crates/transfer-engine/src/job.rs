@@ -36,10 +36,19 @@ impl Default for JobOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VerifyMode { Off, On, OnError }
+pub enum VerifyMode {
+    Off,
+    On,
+    OnError,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OverwriteMode { Always, SkipExisting, Resume, Rename }
+pub enum OverwriteMode {
+    Always,
+    SkipExisting,
+    Resume,
+    Rename,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobState {
@@ -77,7 +86,13 @@ pub struct Job {
 }
 
 impl Job {
-    pub fn new(id: JobId, direction: Direction, source: PathBuf, destination: PathBuf, options: JobOptions) -> Self {
+    pub fn new(
+        id: JobId,
+        direction: Direction,
+        source: PathBuf,
+        destination: PathBuf,
+        options: JobOptions,
+    ) -> Self {
         Self::with_device(id, direction, source, destination, options, None)
     }
 
@@ -90,7 +105,12 @@ impl Job {
         device: Option<String>,
     ) -> Self {
         Self {
-            id, direction, source, destination, options, device,
+            id,
+            direction,
+            source,
+            destination,
+            options,
+            device,
             state: Arc::new(Mutex::new(JobState::Pending)),
             bytes_done: Arc::new(AtomicU64::new(0)),
             bytes_total: Arc::new(AtomicU64::new(0)),
@@ -103,20 +123,48 @@ impl Job {
         }
     }
 
-    pub fn state(&self) -> JobState { *self.state.lock() }
-    pub fn set_state(&self, s: JobState) { *self.state.lock() = s; }
-    pub fn bytes_done(&self) -> u64 { self.bytes_done.load(Ordering::Relaxed) }
-    pub fn bytes_total(&self) -> u64 { self.bytes_total.load(Ordering::Relaxed) }
-    pub fn speed_bps(&self) -> u64 { self.speed_bps.load(Ordering::Relaxed) }
-    pub fn set_speed_bps(&self, s: u64) { self.speed_bps.store(s, Ordering::Relaxed); }
-    pub fn eta_secs(&self) -> u64 { self.eta_secs.load(Ordering::Relaxed) }
-    pub fn set_eta_secs(&self, e: u64) { self.eta_secs.store(e, Ordering::Relaxed); }
-    pub fn add_bytes(&self, n: u64) { self.bytes_done.fetch_add(n, Ordering::Relaxed); }
-    pub fn set_total(&self, n: u64) { self.bytes_total.store(n, Ordering::Relaxed); }
-    pub fn mark_started(&self) { *self.started.lock() = Some(Instant::now()); }
-    pub fn elapsed(&self) -> Option<std::time::Duration> { self.started.lock().map(|i| i.elapsed()) }
-    pub fn error(&self) -> Option<String> { self.error.lock().clone() }
-    pub fn set_error(&self, e: impl ToString) { *self.error.lock() = Some(e.to_string()); }
+    pub fn state(&self) -> JobState {
+        *self.state.lock()
+    }
+    pub fn set_state(&self, s: JobState) {
+        *self.state.lock() = s;
+    }
+    pub fn bytes_done(&self) -> u64 {
+        self.bytes_done.load(Ordering::Relaxed)
+    }
+    pub fn bytes_total(&self) -> u64 {
+        self.bytes_total.load(Ordering::Relaxed)
+    }
+    pub fn speed_bps(&self) -> u64 {
+        self.speed_bps.load(Ordering::Relaxed)
+    }
+    pub fn set_speed_bps(&self, s: u64) {
+        self.speed_bps.store(s, Ordering::Relaxed);
+    }
+    pub fn eta_secs(&self) -> u64 {
+        self.eta_secs.load(Ordering::Relaxed)
+    }
+    pub fn set_eta_secs(&self, e: u64) {
+        self.eta_secs.store(e, Ordering::Relaxed);
+    }
+    pub fn add_bytes(&self, n: u64) {
+        self.bytes_done.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn set_total(&self, n: u64) {
+        self.bytes_total.store(n, Ordering::Relaxed);
+    }
+    pub fn mark_started(&self) {
+        *self.started.lock() = Some(Instant::now());
+    }
+    pub fn elapsed(&self) -> Option<std::time::Duration> {
+        self.started.lock().map(|i| i.elapsed())
+    }
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().clone()
+    }
+    pub fn set_error(&self, e: impl ToString) {
+        *self.error.lock() = Some(e.to_string());
+    }
 
     pub fn reset_for_retry(&self) {
         *self.state.lock() = JobState::Pending;
@@ -131,13 +179,23 @@ impl Job {
     }
 
     /// Cooperative cancel: the worker checks this between chunks.
-    pub fn cancel(&self) { self.cancel.store(true, Ordering::Relaxed); }
-    pub fn is_cancelled(&self) -> bool { self.cancel.load(Ordering::Relaxed) }
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 
     /// Cooperative pause/resume: the worker parks between chunks while set.
-    pub fn pause(&self) { self.paused.store(true, Ordering::Relaxed); }
-    pub fn resume(&self) { self.paused.store(false, Ordering::Relaxed); }
-    pub fn is_paused(&self) -> bool { self.paused.load(Ordering::Relaxed) }
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+    }
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
 
     /// Fraction of the transfer completed, clamped to [0.0, 1.0].
     ///

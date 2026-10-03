@@ -31,7 +31,10 @@ pub struct PhotoImportResult {
 /// Fill in [`DEFAULT_PHOTO_SRC_DIRS`] when the caller passes nothing.
 pub fn resolve_src_dirs(src_dirs: &[String]) -> Vec<String> {
     if src_dirs.is_empty() {
-        DEFAULT_PHOTO_SRC_DIRS.iter().map(|s| s.to_string()).collect()
+        DEFAULT_PHOTO_SRC_DIRS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     } else {
         src_dirs.to_vec()
     }
@@ -76,11 +79,11 @@ pub async fn import_photos(
                 continue;
             }
             let dest = dest_for_import(dest_base, entry.stat.mtime, &entry.name);
-            if let Ok(meta) = tokio::fs::metadata(&dest).await {
-                if meta.len() == entry.stat.size {
-                    out.skipped += 1;
-                    continue;
-                }
+            if let Ok(meta) = tokio::fs::metadata(&dest).await
+                && meta.len() == entry.stat.size
+            {
+                out.skipped += 1;
+                continue;
             }
             let src = PathBuf::from(format!("{prefix}/{}", entry.name));
             let job = Job::with_device(
@@ -115,7 +118,10 @@ mod tests {
 
     #[test]
     fn empty_src_dirs_use_default() {
-        assert_eq!(resolve_src_dirs(&[]), vec!["/sdcard/DCIM/Camera".to_string()]);
+        assert_eq!(
+            resolve_src_dirs(&[]),
+            vec!["/sdcard/DCIM/Camera".to_string()]
+        );
         let custom = vec!["/sdcard/Pictures".to_string()];
         assert_eq!(resolve_src_dirs(&custom), custom);
     }

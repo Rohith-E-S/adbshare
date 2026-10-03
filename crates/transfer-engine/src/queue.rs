@@ -22,6 +22,21 @@ use super::job::{Job, JobId, JobState};
 /// window. Retrying is offered from the UI, not as a durable operation.
 pub const MAX_COMPLETED: usize = 200;
 
+/// Trim the finished-job history back to `MAX_COMPLETED`.
+///
+/// Oldest first, so the front is what falls off. Every path that puts a job
+/// into the history goes through here; `cancel_job` once did not, so cancelling
+/// a queueful of transfers undid the bound for the GUI's poll.
+fn trim_completed(completed: &mut Vec<Job>) {
+    if completed.len() > MAX_COMPLETED {
+        let excess = completed.len() - MAX_COMPLETED;
+        completed.drain(0..excess);
+    }
+}
+
+/// Called after a job's progress or state changes.
+pub type OnUpdate = Arc<dyn Fn(&Job) + Send + Sync>;
+
 pub struct JobQueue {
     pending: Mutex<VecDeque<Job>>,
     in_flight: Mutex<Vec<Job>>,
@@ -29,7 +44,7 @@ pub struct JobQueue {
     next_id: AtomicU64,
     pub parallelism: usize,
     notify: mpsc::UnboundedSender<()>,
-    pub on_update: Option<Arc<dyn Fn(&Job) + Send + Sync>>,
+    pub on_update: Option<OnUpdate>,
 }
 
 impl std::fmt::Debug for JobQueue {
@@ -46,15 +61,18 @@ impl std::fmt::Debug for JobQueue {
 impl JobQueue {
     pub fn new(parallelism: usize) -> (Arc<Self>, mpsc::UnboundedReceiver<()>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Arc::new(Self {
-            pending: Mutex::new(VecDeque::new()),
-            in_flight: Mutex::new(Vec::new()),
-            completed: Mutex::new(Vec::new()),
-            next_id: AtomicU64::new(1),
-            parallelism,
-            notify: tx,
-            on_update: None,
-        }), rx)
+        (
+            Arc::new(Self {
+                pending: Mutex::new(VecDeque::new()),
+                in_flight: Mutex::new(Vec::new()),
+                completed: Mutex::new(Vec::new()),
+                next_id: AtomicU64::new(1),
+                parallelism,
+                notify: tx,
+                on_update: None,
+            }),
+            rx,
+        )
     }
 
     pub fn submit(&self, mut job: Job) -> JobId {
@@ -63,7 +81,9 @@ impl JobQueue {
         }
         self.pending.lock().push_back(job.clone());
         let _ = self.notify.send(());
-        if let Some(cb) = &self.on_update { cb(&job); }
+        if let Some(cb) = &self.on_update {
+            cb(&job);
+        }
         job.id
     }
 
@@ -82,11 +102,7 @@ impl JobQueue {
         drop(inflight);
         let mut completed = self.completed.lock();
         completed.push(job);
-        // Oldest first, so the front is what falls off.
-        if completed.len() > MAX_COMPLETED {
-            let excess = completed.len() - MAX_COMPLETED;
-            completed.drain(0..excess);
-        }
+        trim_completed(&mut completed);
         drop(completed);
         // A parallelism slot just freed up; wake the dispatcher so a waiting
         // `try_dispatch` loop re-checks capacity and starts pending jobs.
@@ -151,11 +167,15 @@ impl JobQueue {
     pub fn find(&self, id: JobId) -> Option<Job> {
         {
             let q = self.pending.lock();
-            if let Some(j) = q.iter().find(|j| j.id == id) { return Some(j.clone()); }
+            if let Some(j) = q.iter().find(|j| j.id == id) {
+                return Some(j.clone());
+            }
         }
         {
             let f = self.in_flight.lock();
-            if let Some(j) = f.iter().find(|j| j.id == id) { return Some(j.clone()); }
+            if let Some(j) = f.iter().find(|j| j.id == id) {
+                return Some(j.clone());
+            }
         }
         self.completed.lock().iter().find(|j| j.id == id).cloned()
     }
@@ -180,7 +200,9 @@ impl JobQueue {
                 job.cancel();
                 job.set_error("cancelled");
                 job.set_state(JobState::Cancelled);
-                self.completed.lock().push(job);
+                let mut completed = self.completed.lock();
+                completed.push(job);
+                trim_completed(&mut completed);
                 return true;
             }
         }
@@ -190,7 +212,11 @@ impl JobQueue {
     pub fn retry_job(&self, id: JobId) -> bool {
         let mut completed = self.completed.lock();
         let pos = completed.iter().position(|j| {
-            j.id == id && matches!(j.state(), JobState::Failed | JobState::Cancelled | JobState::Skipped)
+            j.id == id
+                && matches!(
+                    j.state(),
+                    JobState::Failed | JobState::Cancelled | JobState::Skipped
+                )
         });
         let Some(job) = pos.map(|p| completed.remove(p)) else {
             return false;
@@ -342,7 +368,9 @@ mod tests {
                 let q = Arc::clone(&queue);
                 std::thread::spawn(move || {
                     let mut got = 0;
-                    while q.try_dispatch().is_some() { got += 1; }
+                    while q.try_dispatch().is_some() {
+                        got += 1;
+                    }
                     got
                 })
             })
@@ -376,7 +404,10 @@ mod tests {
             let n = ids.len();
             ids.sort_unstable();
             ids.dedup();
-            if ids.len() != n { seen_dupe = true; break; }
+            if ids.len() != n {
+                seen_dupe = true;
+                break;
+            }
         }
         churn.join().unwrap();
         assert!(!seen_dupe, "a job appeared more than once in a snapshot");
@@ -387,9 +418,9 @@ mod tests {
 
 #[cfg(test)]
 mod completed_bound_tests {
+    use super::super::Direction;
     use super::super::JobOptions;
     use super::*;
-    use super::super::Direction;
 
     fn job(i: u64) -> Job {
         Job::with_device(
@@ -450,6 +481,30 @@ mod completed_bound_tests {
             "a trimmed history must not stop dispatching"
         );
     }
+
+    #[test]
+    fn cancelling_a_queueful_of_transfers_keeps_the_history_bounded() {
+        let (queue, _rx) = JobQueue::new(1);
+        // Ids start at 1, or `submit` would assign one of its own.
+        let total = MAX_COMPLETED as u64 + 10;
+        for i in 1..=total {
+            queue.submit(job(i));
+            assert!(queue.cancel_job(i), "a queued job cancels straight away");
+        }
+        assert_eq!(queue.snapshot().pending, 0);
+        assert_eq!(
+            queue.snapshot().completed,
+            MAX_COMPLETED,
+            "cancelling must not grow the history without bound"
+        );
+        let snapshot = queue.jobs_snapshot();
+        assert_eq!(
+            snapshot.first().map(|j| j.id),
+            Some(11),
+            "the oldest ten went"
+        );
+        assert_eq!(snapshot.last().map(|j| j.id), Some(total));
+    }
 }
 
 /// What the daemon's `list_jobs` does, twice a second, for the GUI's poll.
@@ -485,6 +540,11 @@ mod poll_cost_tests {
         // `list_jobs` clones the snapshot and encodes it to JSON on every GUI
         // poll. Before the cap this grew without limit; now the cost at 10x the
         // history is the same as at the cap.
+        //
+        // The size assertions are the whole test. A wall-clock comparison would
+        // prove nothing here: both queues are trimmed to exactly
+        // MAX_COMPLETED, so `encode` does identical work and any ratio between
+        // them is timing noise.
         let (small, _a) = filled(MAX_COMPLETED as u64);
         let (large, _b) = filled(MAX_COMPLETED as u64 * 10);
         assert_eq!(small.snapshot().completed, MAX_COMPLETED);
@@ -492,27 +552,6 @@ mod poll_cost_tests {
             large.snapshot().completed,
             MAX_COMPLETED,
             "a ten-times-longer session keeps the same history"
-        );
-
-        let encode = |queue: &JobQueue| {
-            let snapshot = queue.jobs_snapshot();
-            std::hint::black_box(snapshot.len());
-        };
-        let mut best_small = f64::MAX;
-        for _ in 0..8 {
-            let start = std::time::Instant::now();
-            encode(&small);
-            best_small = best_small.min(start.elapsed().as_secs_f64() * 1000.0);
-        }
-        let mut best_large = f64::MAX;
-        for _ in 0..8 {
-            let start = std::time::Instant::now();
-            encode(&large);
-            best_large = best_large.min(start.elapsed().as_secs_f64() * 1000.0);
-        }
-        assert!(
-            best_large <= best_small * 3.0,
-            "snapshot cost must not track session length: {best_small:.3}ms vs {best_large:.3}ms"
         );
     }
 }
