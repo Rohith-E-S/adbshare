@@ -128,6 +128,15 @@ impl TextField {
         &self.content
     }
 
+    /// Take the caret, so a keystroke lands here without a click.
+    ///
+    /// `Ctrl+F` and `Ctrl+L` reveal their field and then have to call this;
+    /// revealing alone left the user with a visible field they still had to
+    /// click before they could type.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
     /// Replace the value, moving the caret to the end.
     pub fn set_value(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
         let value = value.into();

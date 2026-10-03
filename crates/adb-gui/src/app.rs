@@ -30,8 +30,7 @@ use crate::localfs;
 use crate::menu::{self, MenuItem};
 use crate::prefs::{Preferences, SIDEBAR_RANGE};
 use crate::protocol::{
-    ClipboardFiles, DeviceEntry, DirEntry, JobInfo, LOCAL_DEVICE, SortKey, format_capacity,
-    tree_result_message,
+    ClipboardFiles, DeviceEntry, DirEntry, JobInfo, SortKey, format_capacity, tree_result_message,
 };
 use crate::textinput::{TextField, TextFieldEvent};
 use crate::theme::{self, Themed};
@@ -51,6 +50,7 @@ const SIDEBAR_MAX: f32 = SIDEBAR_RANGE.1;
 /// Window widths at which the chrome sheds parts, matching the old breakpoints.
 const COMPACT_BELOW: f32 = 1000.0;
 const NARROW_BELOW: f32 = 760.0;
+const TINY_BELOW: f32 = 520.0;
 
 actions!(
     app,
@@ -71,6 +71,10 @@ actions!(
 /// what is actually bound; see `browser::BINDINGS`.
 pub const BINDINGS: &[crate::browser::Binding] = &[
     ("f9", || KeyBinding::new("f9", ToggleSidebar, None)),
+    // Escape closes whatever is on top, falling back to clearing the selection.
+    ("escape", || {
+        KeyBinding::new("escape", DismissOverlays, None)
+    }),
     ("secondary-comma", || {
         KeyBinding::new("secondary-comma", ShowDiagnostics, None)
     }),
@@ -97,6 +101,13 @@ struct ContextMenuState {
     position: Point<Pixels>,
 }
 
+/// Which of the app-owned fields the keyboard just revealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldFocus {
+    Search,
+    Path,
+}
+
 /// How much of the chrome fits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layout {
@@ -106,12 +117,18 @@ enum Layout {
     Compact,
     /// Browser only.
     Narrow,
+    /// Too narrow for the navigation capsule, so only the path bar is left.
+    /// The GTK build had this breakpoint and the rewrite dropped it, which left
+    /// the nav buttons crowding the path bar on a phone-sized window.
+    Tiny,
 }
 
 impl Layout {
     /// Pick a layout for a window width.
     fn for_width(width: f32) -> Self {
-        if width < NARROW_BELOW {
+        if width < TINY_BELOW {
+            Layout::Tiny
+        } else if width < NARROW_BELOW {
             Layout::Narrow
         } else if width < COMPACT_BELOW {
             Layout::Compact
@@ -122,6 +139,10 @@ impl Layout {
 
     fn shows_ops(self) -> bool {
         self == Layout::Full
+    }
+
+    fn shows_nav(self) -> bool {
+        self != Layout::Tiny
     }
 }
 
@@ -141,6 +162,14 @@ pub struct AdbShareApp {
     // ── What is selected ───────────────────────────────────────────────────
     selection: Option<Selection>,
     devices: Vec<DeviceEntry>,
+    /// The phone the user last picked.
+    ///
+    /// Browsing the disk clears `selection`, so this is what "send to phone"
+    /// falls back to when the user has wandered off the phone without losing
+    /// track of which one they meant.
+    last_device: Option<String>,
+    /// Whether the first phone has already been picked for the user.
+    auto_selected: bool,
 
     // ── Transfers ──────────────────────────────────────────────────────────
     jobs: Vec<JobInfo>,
@@ -157,6 +186,11 @@ pub struct AdbShareApp {
 
     // ── Dialog state ───────────────────────────────────────────────────────
     dialog: Dialog,
+    /// A field the keyboard revealed and that still needs the caret.
+    ///
+    /// Focusing needs a `&mut Window`, which only `render` has, so the request
+    /// is recorded when the event arrives and satisfied on the next frame.
+    pending_field_focus: Option<FieldFocus>,
     /// The field shared by the New Folder and Rename dialogs.
     name_field: Entity<TextField>,
     search_field: Entity<TextField>,
@@ -212,6 +246,8 @@ impl AdbShareApp {
             browser: cx.new(Browser::new),
             selection: None,
             devices: Vec::new(),
+            last_device: None,
+            auto_selected: false,
             jobs: Vec::new(),
             layout: Layout::Full,
             sidebar_visible: saved.sidebar_visible,
@@ -221,6 +257,7 @@ impl AdbShareApp {
             overflow_open: false,
             context_menu: None,
             dialog: Dialog::None,
+            pending_field_focus: None,
             name_field: cx.new(|cx| TextField::new(cx, "Name")),
             search_field: cx.new(|cx| TextField::new(cx, "Search this folder")),
             path_field: cx.new(|cx| TextField::new(cx, "/sdcard").monospace()),
@@ -452,12 +489,14 @@ impl AdbShareApp {
                     .unwrap_or_else(|| serial.clone());
                 self.toasts
                     .push(format!("{name} connected"), ToastTone::Success);
+                crate::notify::send(&format!("{name} connected"), APP_NAME);
             }
         }
         for serial in &before {
             if !serials.contains(serial) {
                 self.toasts
                     .push(format!("{serial} disconnected"), ToastTone::Warning);
+                crate::notify::send(&format!("{serial} disconnected"), APP_NAME);
             }
         }
 
@@ -491,7 +530,15 @@ impl AdbShareApp {
             self.toasts
                 .push("The selected phone disconnected", ToastTone::Warning);
             self.selection = None;
+            self.last_device = None;
             self.browser.update(cx, |b, cx| b.set_idle(cx));
+        }
+        // Same for the remembered phone, so a stale serial is never used as a
+        // transfer target.
+        if let Some(serial) = &self.last_device
+            && !devices.iter().any(|d| &d.serial == serial)
+        {
+            self.last_device = None;
         }
         // The list is polled every three seconds and rarely differs. Re-rendering
         // the whole window on an identical result is pure waste, and it is the
@@ -501,6 +548,18 @@ impl AdbShareApp {
             return;
         }
         self.devices = devices;
+        // Pick the first phone for the user, once. The GTK build did this and the
+        // rewrite dropped it, so a phone plugged in before launch still showed
+        // "Connect your phone" until the user found the sidebar.
+        if !self.auto_selected
+            && self.selection.is_none()
+            && let Some(first) = self.devices.first()
+        {
+            self.auto_selected = true;
+            let serial = first.serial.clone();
+            self.select_device(&serial, cx);
+            return;
+        }
         cx.notify();
     }
 
@@ -532,8 +591,16 @@ impl AdbShareApp {
         // `all` over an empty iterator is true, which would claim the queue was
         // paused and blank the status line.
         let paused = !active.is_empty() && active.iter().all(|job| job.state == "Paused");
+        // Add up the active jobs so the status bar can show a bar and a
+        // throughput. Rates are summed rather than averaged: each job reports
+        // its own current rate, and the aggregate is what the link is doing.
+        let progress = crate::browser::TransferProgress {
+            bytes_done: active.iter().map(|job| job.bytes_done).sum(),
+            bytes_total: active.iter().map(|job| job.bytes_total).sum(),
+            speed_bps: active.iter().map(|job| job.speed_bps).sum(),
+        };
         self.browser.update(cx, |b, cx| {
-            b.set_job_counts(active_count, self.jobs.len(), paused, cx)
+            b.set_job_counts(active_count, self.jobs.len(), paused, progress, cx)
         });
         cx.notify();
     }
@@ -549,6 +616,7 @@ impl AdbShareApp {
             .unwrap_or_else(|| serial.to_string());
 
         self.selection = Some(Selection::Device(serial.to_string()));
+        self.last_device = Some(serial.to_string());
         self.context_menu = None;
         self.browser.update(cx, |b, cx| {
             b.set_device(serial, &display, cx);
@@ -580,22 +648,58 @@ impl AdbShareApp {
     }
 
     fn fetch_dir_at(&mut self, device: String, path: PathBuf, cx: &mut Context<Self>) {
+        // One listing at a time: a second request while one is in flight would
+        // race, and the older answer landing last would show the wrong
+        // directory.
+        if !self.browser.update(cx, |b, cx| b.begin_load(cx)) {
+            return;
+        }
         let browser = self.browser.clone();
+        let me = cx.entity();
+        let shown = path.clone();
         cx.spawn(async move |_this, cx| {
             let result = daemon::list_dir(&device, &path.to_string_lossy()).await;
-            browser
+            let failure = result.as_ref().err().cloned();
+            let applied = browser
                 .update(cx, |b, cx| {
                     // A listing that arrives after the user has moved on is
                     // dropped, so a slow device cannot overwrite a newer view.
+                    // The guard has to be released anyway: `begin_load` refuses
+                    // every later request while it is set, so keeping it would
+                    // wedge the browser with no way back.
                     if b.device() != Some(device.as_str()) || b.path() != path {
-                        return;
+                        b.cancel_load(cx);
+                        return false;
                     }
                     match result {
                         Ok(entries) => b.set_entries(entries, cx),
                         Err(err) => b.set_error(format!("Could not read {path:?}: {err}"), cx),
                     }
+                    true
+                })
+                .unwrap_or(false);
+            if !applied {
+                return;
+            }
+            // A folder that will not open is worth a dialog, not a line of
+            // status-bar text the user has to be looking for. Only for a
+            // listing that was actually shown, and never over a dialog the user
+            // is already answering.
+            if let Some(err) = failure {
+                me.update(cx, |this, cx| {
+                    if !matches!(this.dialog, Dialog::None) {
+                        return;
+                    }
+                    this.dialog = Dialog::Message {
+                        title: "Could not open folder".into(),
+                        body: format!("{shown:?}\n\n{err}"),
+                        tone: MessageTone::Error,
+                        extra: None,
+                    };
+                    cx.notify();
                 })
                 .ok();
+            }
         })
         .detach();
     }
@@ -606,6 +710,9 @@ impl AdbShareApp {
     /// so the read happens on a worker thread and the result is applied only if
     /// the browser is still looking at that directory.
     fn list_local(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.browser.update(cx, |b, cx| b.begin_load(cx)) {
+            return;
+        }
         let browser = self.browser.clone();
         let wanted = path.clone();
         self.off_thread(
@@ -614,6 +721,7 @@ impl AdbShareApp {
             move |result, cx| {
                 browser.update(cx, |b, cx| {
                     if b.path() != wanted || !b.is_local() {
+                        b.cancel_load(cx);
                         return;
                     }
                     match result {
@@ -627,6 +735,9 @@ impl AdbShareApp {
 
     /// Re-read whatever the browser is currently showing.
     fn refresh_current(&mut self, cx: &mut Context<Self>) {
+        // Refresh is the one request allowed to interrupt one in flight, so it
+        // has to clear the guard first or the guard would swallow it.
+        self.browser.update(cx, |b, cx| b.cancel_load(cx));
         if self.browser.read(cx).is_local() {
             let path = self.browser.read(cx).path().to_path_buf();
             self.list_local(path, cx);
@@ -709,6 +820,20 @@ impl AdbShareApp {
             }
             BrowserEvent::Copy(entries) => self.copy(entries.clone(), cx),
             BrowserEvent::Paste => self.paste(cx),
+            BrowserEvent::Upload => self.upload(cx),
+            BrowserEvent::Download(entries) => self.download(entries.clone(), cx),
+            BrowserEvent::FocusSearch => {
+                self.pending_field_focus = Some(FieldFocus::Search);
+                cx.notify();
+            }
+            BrowserEvent::FocusPathEntry => self.pending_field_focus = Some(FieldFocus::Path),
+            BrowserEvent::DroppedPaths(paths) => self.on_dropped_paths(paths.clone(), cx),
+            BrowserEvent::DroppedOnFolder(folder, paths) => {
+                self.on_dropped_onto_folder(folder.clone(), paths.clone(), cx)
+            }
+            BrowserEvent::DraggedOntoFolder(folder, entries) => {
+                self.on_dragged_onto_folder(folder.clone(), entries.clone(), cx)
+            }
             BrowserEvent::TogglePauseTransfers => self.toggle_pause(cx),
             BrowserEvent::CancelTransfers => self.cancel_transfers(cx),
             BrowserEvent::ContextMenu { position, .. } => {
@@ -718,6 +843,15 @@ impl AdbShareApp {
                 cx.notify();
             }
         }
+    }
+
+    /// Reveal the directory being browsed in the desktop's file manager.
+    fn open_current_directory(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let target = self.browser.read(cx).local_current_dir().ok_or(
+            "Opening the phone's folders needs a FUSE mount — use the transfers \
+             list to save files instead.",
+        )?;
+        localfs::open_external(&target)
     }
 
     fn open_entry(&mut self, entry: DirEntry, cx: &mut Context<Self>) {
@@ -841,6 +975,7 @@ impl AdbShareApp {
             self.enqueue_one(
                 source.clone(),
                 destination.clone(),
+                snapshot.device.clone(),
                 target_device.clone(),
                 cx,
             );
@@ -900,19 +1035,39 @@ impl AdbShareApp {
         }
     }
 
-    /// Queue one file or directory, choosing push or pull by where it came from.
+    /// Queue one file, choosing push or pull by where it came from and where it
+    /// is going.
+    ///
+    /// `source_device` is the phone the source path lives on and `target_device`
+    /// the phone being browsed; either can be absent. Four cases:
+    ///
+    /// * phone to phone, different serials — refused earlier by
+    ///   [`clipboard::resolve_destination`].
+    /// * phone to phone, same serial — the caller short-circuits into
+    ///   [`Self::copy_on_device`] so nothing round-trips through the host.
+    /// * phone to disk — a pull. This is the case the GTK build handled and the
+    ///   rewrite used to get wrong, because it keyed off what was being browsed
+    ///   rather than where the source lived and tried to `fs::copy` a
+    ///   `/sdcard` path.
+    /// * disk to phone — a push.
+    /// * disk to disk — a local copy, which needs no daemon.
     fn enqueue_one(
         &mut self,
         source: PathBuf,
         destination: PathBuf,
+        source_device: Option<String>,
         target_device: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        match (self.selection.clone(), target_device) {
-            (Some(Selection::Device(device)), _) => {
-                self.enqueue_push(device, source, destination, cx)
-            }
-            (Some(Selection::Local(_)), None) => match localfs::copy_file(&source, &destination) {
+        match (source_device, target_device) {
+            // Local source, phone destination: a push. Only reachable when the
+            // snapshot came from the disk.
+            (None, Some(to)) => self.enqueue_push(to, source, destination, cx),
+            // Anything that starts on a phone is a pull, including into another
+            // phone — `resolve_destination` has already refused the case where
+            // that would clobber, and pulling is the safe direction anyway.
+            (Some(from), _) => self.enqueue_pull(from, source, destination, cx),
+            (None, None) => match localfs::copy_file(&source, &destination) {
                 Ok(()) => self
                     .toasts
                     .push(format!("Copied {}", source.display()), ToastTone::Success),
@@ -920,10 +1075,6 @@ impl AdbShareApp {
                     .toasts
                     .push(format!("Could not copy: {err}"), ToastTone::Error),
             },
-            (Some(Selection::Local(_)), Some(device)) => {
-                self.enqueue_pull(device, source, destination, cx)
-            }
-            (None, _) => {}
         }
     }
 
@@ -1119,13 +1270,54 @@ impl AdbShareApp {
         .detach();
     }
 
+    /// Send something to the phone, from wherever the user happens to be.
+    ///
+    /// On the phone this is a chooser: there is nothing local to send. On the
+    /// disk the selection is what to send, which is the gesture the GTK build
+    /// offered and the one the `Ctrl+U` label promises.
+    fn upload(&mut self, cx: &mut Context<Self>) {
+        if self.target_device().is_some() {
+            self.pick_for_upload(cx);
+            return;
+        }
+        let Some(device) = self.last_device.clone() else {
+            self.dialog = Dialog::Message {
+                title: "No phone selected".into(),
+                body: "Pick a device in the sidebar first, then send files to it.".into(),
+                tone: MessageTone::Info,
+                extra: None,
+            };
+            cx.notify();
+            return;
+        };
+        let entries = self.browser.read(cx).selected();
+        if entries.is_empty() {
+            self.toasts
+                .push("Select something to send first", ToastTone::Warning);
+            cx.notify();
+            return;
+        }
+        let from_dir = self.browser.read(cx).path().to_path_buf();
+        for (source, entry) in clipboard::absolute_paths(&entries, &from_dir)
+            .into_iter()
+            .zip(entries.iter())
+        {
+            if entry.looks_like_dir() {
+                let remote = device_download_dir().join(file_name_of(&source));
+                self.enqueue_tree(source, remote, device.clone(), cx);
+            } else {
+                let remote = device_download_dir().join(&entry.name);
+                self.enqueue_push(device.clone(), source, remote, cx);
+            }
+        }
+    }
+
     fn download(&mut self, entries: Vec<DirEntry>, cx: &mut Context<Self>) {
         let Some(device) = self.target_device() else {
-            self.toasts.push(
-                "Select a phone before saving to the computer",
-                ToastTone::Warning,
-            );
-            cx.notify();
+            // Browsing the disk: there is nothing to pull, so "save to the
+            // computer" means "put a copy in Downloads". The GTK build did this
+            // and the context menu still labels it that way.
+            self.copy_to_downloads(entries, cx);
             return;
         };
         // Resolve every source path now: the browser's path can change while
@@ -1182,6 +1374,208 @@ impl AdbShareApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Copy the selection into the user's Downloads folder, which is what
+    /// "Copy to Downloads" means on the disk.
+    fn copy_to_downloads(&mut self, entries: Vec<DirEntry>, cx: &mut Context<Self>) {
+        let Some(dest_dir) = dirs::download_dir().or_else(dirs::home_dir) else {
+            self.toasts
+                .push("Could not find a Downloads folder", ToastTone::Error);
+            cx.notify();
+            return;
+        };
+        let from_dir = self.browser.read(cx).path().to_path_buf();
+        let mut copied = 0usize;
+        let mut failures = Vec::new();
+        for (source, entry) in clipboard::absolute_paths(&entries, &from_dir)
+            .into_iter()
+            .zip(entries.iter())
+        {
+            let dest = dest_dir.join(&entry.name);
+            let result = if entry.looks_like_dir() {
+                localfs::copy_tree(&source, &dest).map(|_| ())
+            } else {
+                localfs::copy_file(&source, &dest)
+            };
+            match result {
+                Ok(_) => copied += 1,
+                Err(err) => failures.push(format!("{}: {err}", entry.name)),
+            }
+        }
+        if failures.is_empty() {
+            self.toasts.push(
+                format!("Copied {copied} item(s) to {}", dest_dir.display()),
+                ToastTone::Success,
+            );
+        } else {
+            self.dialog = Dialog::Message {
+                title: "Copy to Downloads partly finished".into(),
+                body: format!(
+                    "Copied {copied} item(s). These could not be copied:\n\n{}",
+                    failures.join("\n")
+                ),
+                tone: MessageTone::Warning,
+                extra: None,
+            };
+        }
+        cx.notify();
+    }
+
+    /// Files dropped from another window onto the browsed directory.
+    ///
+    /// Direction follows where the drop landed: onto the phone is a push, onto
+    /// the disk is a copy. Both use the folder being browsed as the
+    /// destination, which is what every file manager does.
+    fn on_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        let destination = self.browser.read(cx).path().to_path_buf();
+        if let Some(device) = self.target_device() {
+            for path in paths {
+                let remote = destination.join(file_name_of(&path));
+                let is_dir = path.is_dir();
+                if is_dir {
+                    self.enqueue_tree(path, remote, device.clone(), cx);
+                } else {
+                    self.enqueue_push(device.clone(), path, remote, cx);
+                }
+            }
+            return;
+        }
+        let mut copied = 0usize;
+        let mut failures = Vec::new();
+        for path in paths {
+            let dest = destination.join(file_name_of(&path));
+            let result = if path.is_dir() {
+                localfs::copy_tree(&path, &dest).map(|_| ())
+            } else {
+                localfs::copy_file(&path, &dest)
+            };
+            match result {
+                Ok(_) => copied += 1,
+                Err(err) => failures.push(format!("{}: {err}", path.display())),
+            }
+        }
+        self.report_local_copies("Copy", copied, failures, cx);
+    }
+
+    /// External files dropped onto a directory row, to put them inside it.
+    fn on_dropped_onto_folder(
+        &mut self,
+        folder: DirEntry,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if !folder.looks_like_dir() || paths.is_empty() {
+            return;
+        }
+        let parent = self.browser.read(cx).path().to_path_buf();
+        let destination = parent.join(&folder.name);
+        if let Some(device) = self.target_device() {
+            for path in paths {
+                let remote = destination.join(file_name_of(&path));
+                if path.is_dir() {
+                    self.enqueue_tree(path, remote, device.clone(), cx);
+                } else {
+                    self.enqueue_push(device.clone(), path, remote, cx);
+                }
+            }
+        } else {
+            let mut copied = 0usize;
+            let mut failures = Vec::new();
+            for path in paths {
+                let dest = destination.join(file_name_of(&path));
+                let result = if path.is_dir() {
+                    localfs::copy_tree(&path, &dest).map(|_| ())
+                } else {
+                    localfs::copy_file(&path, &dest)
+                };
+                match result {
+                    Ok(_) => copied += 1,
+                    Err(err) => failures.push(format!("{}: {err}", path.display())),
+                }
+            }
+            self.report_local_copies("Copy into folder", copied, failures, cx);
+        }
+        self.refresh_current(cx);
+    }
+
+    /// Entries dragged inside this window onto a directory row.
+    ///
+    /// A move, which is what dragging something you already own means. Within
+    /// one listing that is a `rename` per entry on the device, or a host move
+    /// on the disk; nothing is queued, so it is immediate and reversible by
+    /// another drag.
+    fn on_dragged_onto_folder(
+        &mut self,
+        folder: DirEntry,
+        entries: Vec<DirEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        if !folder.looks_like_dir() || entries.is_empty() {
+            return;
+        }
+        // Moving a folder into itself would strand the source inside the
+        // destination; the daemon would refuse it, but the error arrives late.
+        let moving = folder.name.clone();
+        if entries.iter().any(|e| e.name == moving) {
+            self.toasts
+                .push("A folder cannot be moved into itself", ToastTone::Warning);
+            cx.notify();
+            return;
+        }
+        let parent = self.browser.read(cx).path().to_path_buf();
+        let destination = parent.join(&folder.name);
+        if let Some(device) = self.target_device() {
+            for entry in entries {
+                let source = parent.join(&entry.name);
+                let dest = destination.join(&entry.name);
+                self.move_on_device(device.clone(), source, dest, cx);
+            }
+        } else {
+            for entry in entries {
+                let source = parent.join(&entry.name);
+                let dest = destination.join(&entry.name);
+                match localfs::move_path(&source, &dest) {
+                    Ok(()) => {}
+                    Err(err) => self.toasts.push(
+                        format!("Could not move {}: {err}", entry.name),
+                        ToastTone::Error,
+                    ),
+                }
+            }
+        }
+        self.refresh_current(cx);
+    }
+
+    /// Summarise a batch of local copies, escalating to a dialog only when some
+    /// of them failed — a toast cannot list a dozen unreadable paths.
+    fn report_local_copies(
+        &mut self,
+        action: &str,
+        copied: usize,
+        failures: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if failures.is_empty() {
+            if copied > 0 {
+                self.toasts
+                    .push(format!("{action}: {copied} item(s)"), ToastTone::Success);
+            }
+        } else {
+            self.dialog = Dialog::Message {
+                title: format!("{action} partly finished"),
+                body: format!(
+                    "Completed {copied} item(s). These could not be copied:\n\n{}",
+                    failures.join("\n")
+                ),
+                tone: MessageTone::Warning,
+                extra: None,
+            };
+        }
+        cx.notify();
     }
 
     fn on_tree_result(
@@ -1368,6 +1762,37 @@ impl AdbShareApp {
                 Err(err) => this
                     .toasts
                     .push(format!("Could not create {shown}: {err}"), ToastTone::Error),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Rename one path on the device to an explicit destination, which is what a
+    /// move is: the source and destination directories differ.
+    fn move_on_device(
+        &mut self,
+        device: String,
+        from: PathBuf,
+        to: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let from = from.to_string_lossy().to_string();
+        let to = to.to_string_lossy().to_string();
+        let shown = to.clone();
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let result = daemon::rename(&device, &from, &to).await;
+            me.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this
+                        .toasts
+                        .push(format!("Moved to {shown}"), ToastTone::Success),
+                    Err(err) => this
+                        .toasts
+                        .push(format!("Could not move: {err}"), ToastTone::Error),
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -1765,7 +2190,7 @@ impl AdbShareApp {
                     field: self.name_field.clone(),
                 };
             }
-            "upload" => self.pick_for_upload(cx),
+            "upload" => self.upload(cx),
             "upload-folder" => self.pick_folder_for_upload(cx),
             "download" => {
                 let entries = self.browser.read(cx).selected();
@@ -1833,6 +2258,17 @@ impl AdbShareApp {
             }
             "save-as" => self.save_as(cx),
             "open-external" => {
+                // "Open in Files" means the folder being browsed, not whatever
+                // happens to be focused. The GTK build revealed the current
+                // directory; opening the focused *file* instead meant the item
+                // did nothing at all when nothing was focused, which is most of
+                // the time.
+                if let Err(err) = self.open_current_directory(cx) {
+                    self.toasts.push(err, ToastTone::Error);
+                    cx.notify();
+                }
+            }
+            "open-with" => {
                 if let Some(entry) = self.browser.read(cx).focused_entry() {
                     self.open_entry(entry, cx);
                 }
@@ -1844,14 +2280,27 @@ impl AdbShareApp {
             }
             "open-terminal" => {
                 let path = self.browser.read(cx).path().to_path_buf();
-                if let Err(err) = localfs::open_terminal(&path) {
+                // On a phone, a local terminal would sit in a `/sdcard` path
+                // that does not exist here, so shell into the device instead.
+                let result = match self.target_device() {
+                    Some(serial) => localfs::open_device_terminal(&serial, &path),
+                    None => localfs::open_terminal(&path),
+                };
+                if let Err(err) = result {
                     self.toasts.push(err, ToastTone::Error);
                 }
             }
             "properties" => {
                 if let Some(entry) = self.browser.read(cx).focused_entry() {
                     let full = self.browser.read(cx).full_path(&entry);
-                    let device = self.target_device().unwrap_or_else(|| LOCAL_DEVICE.into());
+                    // A sentinel is carried through the protocol so the daemon
+                    // can tell "not a device" from a device called
+                    // `__local__`; showing it to a user as a Device row reads
+                    // as corruption, so it becomes the disk's name here.
+                    let device = match self.target_device() {
+                        Some(serial) => serial,
+                        None => "This computer".to_string(),
+                    };
                     self.dialog = Dialog::Properties {
                         entry,
                         full_path: full,
@@ -1974,12 +2423,7 @@ impl AdbShareApp {
             ),
             MenuItem::Separator,
             MenuItem::with_icon("open-external", names::FILE_MANAGER, "Open in Files", None),
-            MenuItem::with_icon(
-                "open-terminal",
-                names::TERMINAL,
-                "Open in terminal",
-                Some("Alt+T"),
-            ),
+            MenuItem::with_icon("open-terminal", names::TERMINAL, "Open in terminal", None),
             MenuItem::with_icon(
                 "diagnostics",
                 names::DIALOG_INFORMATION,
@@ -2075,6 +2519,17 @@ impl AdbShareApp {
             ));
         }
         items.push(MenuItem::Separator);
+        if single && !local {
+            // Opening one specific file with its default application. The
+            // overflow menu's "Open in Files" reveals the folder instead, so
+            // this is the only route to actually launching a file.
+            items.push(MenuItem::with_icon(
+                "open-with",
+                names::FILE_MANAGER,
+                "Open with…",
+                None,
+            ));
+        }
         items.push(if has_selection {
             MenuItem::with_icon("copy", names::EDIT_COPY, "Copy", Some("Ctrl+C"))
         } else {
@@ -2169,29 +2624,31 @@ impl AdbShareApp {
         let browser = self.browser.clone();
         #[allow(unused_mut)]
         let mut browser = browser;
-        capsules.push(
-            ui::capsule([
-                ui::icon_button(
-                    t,
-                    "toggle-sidebar",
-                    names::SIDEBAR_SHOW,
-                    theme::CAPSULE_BTN,
-                    t.text_dim,
-                    cx.listener(|this, _e, _w, cx| {
-                        this.sidebar_visible = !this.sidebar_visible;
-                        cx.notify();
-                    }),
-                )
+        if self.layout.shows_nav() {
+            capsules.push(
+                ui::capsule([
+                    ui::icon_button(
+                        t,
+                        "toggle-sidebar",
+                        names::SIDEBAR_SHOW,
+                        theme::CAPSULE_BTN,
+                        t.text_dim,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.sidebar_visible = !this.sidebar_visible;
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    ui::capsule_separator(t).into_any_element(),
+                    self.nav_button(t, "back", names::GO_PREVIOUS, &browser, cx),
+                    self.nav_button(t, "forward", names::GO_NEXT, &browser, cx),
+                    self.nav_button(t, "up", names::GO_UP, &browser, cx),
+                    ui::capsule_separator(t).into_any_element(),
+                    self.nav_button(t, "refresh", names::REFRESH, &browser, cx),
+                ])
                 .into_any_element(),
-                ui::capsule_separator(t).into_any_element(),
-                self.nav_button(t, "back", names::GO_PREVIOUS, &browser, cx),
-                self.nav_button(t, "forward", names::GO_NEXT, &browser, cx),
-                self.nav_button(t, "up", names::GO_UP, &browser, cx),
-                ui::capsule_separator(t).into_any_element(),
-                self.nav_button(t, "refresh", names::REFRESH, &browser, cx),
-            ])
-            .into_any_element(),
-        );
+            );
+        }
 
         // The path bar, which doubles as the search box and the Ctrl+L path
         // editor.
@@ -2201,33 +2658,36 @@ impl AdbShareApp {
             let _browser = self.browser.clone();
             capsules.push(
                 ui::capsule([
-                    ui::icon_button(
+                    ui::icon_button_with_hint(
                         t,
                         "new-folder",
                         names::FOLDER_NEW,
                         theme::CAPSULE_BTN,
                         t.text_dim,
+                        "New folder (Ctrl+N)",
                         cx.listener(|this, _e, _w, cx| {
                             this.on_menu_select("new-folder", cx);
                         }),
                     )
                     .into_any_element(),
                     ui::capsule_separator(t).into_any_element(),
-                    ui::icon_button(
+                    ui::icon_button_with_hint(
                         t,
                         "upload",
                         names::FOLDER_UPLOAD,
                         theme::CAPSULE_BTN,
                         t.text_dim,
+                        "Send to phone (Ctrl+U)",
                         cx.listener(|this, _e, _w, cx| this.on_menu_select("upload", cx)),
                     )
                     .into_any_element(),
-                    ui::icon_button(
+                    ui::icon_button_with_hint(
                         t,
                         "download",
                         names::FOLDER_DOWNLOAD,
                         theme::CAPSULE_BTN,
                         t.text_dim,
+                        "Save to computer (Ctrl+Shift+C)",
                         cx.listener(|this, _e, _w, cx| this.on_menu_select("download", cx)),
                     )
                     .into_any_element(),
@@ -2340,6 +2800,11 @@ impl AdbShareApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let enabled = match id {
+            // Back, forward and up are disabled while a listing is in flight:
+            // they would queue a second request that the re-entrancy guard
+            // drops, which looks like the button did nothing. Refresh stays
+            // live because re-asking is exactly what it means.
+            _ if id != "refresh" && browser.read(cx).is_loading() => false,
             "back" => browser.read(cx).can_go_back(),
             "forward" => browser.read(cx).can_go_forward(),
             "up" => browser.read(cx).can_go_up(),
@@ -3264,6 +3729,16 @@ impl Render for AdbShareApp {
         let viewport_w: f32 = f32::from(window.viewport_size().width);
         self.layout = Layout::for_width(viewport_w);
 
+        // Hand the caret to a field the keyboard just revealed. This is the only
+        // place with a `&mut Window`, which focusing requires.
+        if let Some(target) = self.pending_field_focus.take() {
+            let handle = match target {
+                FieldFocus::Search => self.search_field.read(cx).focus_handle(),
+                FieldFocus::Path => self.path_field.read(cx).focus_handle(),
+            };
+            window.focus(&handle);
+        }
+
         // The window title says where the user is, or which dialog is in the
         // way. Both matter once more than one window is open.
         //
@@ -3352,9 +3827,27 @@ impl Render for AdbShareApp {
             .text_color(t.text_primary)
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &DismissOverlays, _w, cx| {
-                this.context_menu = None;
-                this.overflow_open = false;
-                this.transfers_open = false;
+                // Escape unwinds one layer at a time, outermost first, and only
+                // clears the selection once there is nothing left to close. The
+                // GTK build's dialogs were Escape-dismissable by default; this
+                // is the equivalent, decided in one place so no overlay has to
+                // remember to bind the key itself.
+                if !matches!(this.dialog, Dialog::None) {
+                    this.dialog = Dialog::None;
+                } else if this.context_menu.take().is_some() {
+                } else if this.overflow_open {
+                    this.overflow_open = false;
+                } else if this.transfers_open {
+                    this.transfers_open = false;
+                } else if this.browser.read(cx).path_entry_active() {
+                    this.browser.update(cx, |b, cx| b.close_path_entry(cx));
+                } else if this.browser.read(cx).search_active() {
+                    this.browser
+                        .update(cx, |b, cx| b.set_search_active(false, cx));
+                } else {
+                    let browser = this.browser.clone();
+                    browser.update(cx, |b, cx| b.clear_selection(cx));
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ShowAbout, _w, cx| {
@@ -3428,6 +3921,12 @@ fn window_title(heading: &str, has_target: bool, path: &Path) -> String {
 enum NamePurpose {
     CreateFolder,
     Rename(DirEntry),
+}
+
+/// Where "send to phone" puts files when the user is browsing the disk and so
+/// has not picked a destination on the phone.
+fn device_download_dir() -> PathBuf {
+    PathBuf::from("/sdcard/Download")
 }
 
 /// A path's last component, or a fallback when it has none.

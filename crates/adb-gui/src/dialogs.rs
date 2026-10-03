@@ -812,6 +812,44 @@ fn detail_table(t: &Palette, rows: Vec<(&str, String)>, label_w: f32) -> AnyElem
 // ── Specific dialogs ─────────────────────────────────────────────────────────
 
 /// Name, type, size, location, modified and permissions.
+/// A human description of what a file is, from its extension.
+///
+/// The GTK build had a table for this and said "Image", "Android Package",
+/// "PDF Document" and so on; the rewrite collapsed it to "File", which is the
+/// one answer nobody needs. Only extensions are consulted — there is no MIME
+/// database here — so an unknown extension falls back to "File".
+fn file_kind(entry: &DirEntry) -> String {
+    if entry.is_symlink && !entry.is_dir {
+        return "Symbolic link".to_string();
+    }
+    if entry.is_dir {
+        return "Folder".to_string();
+    }
+    let ext = entry.ext();
+    if ext.is_empty() {
+        return "File".to_string();
+    }
+    let label = match ext.as_str() {
+        "apk" => "Android package",
+        "zip" | "7z" | "rar" | "xz" | "zst" => "Archive",
+        "tar" | "gz" | "tgz" | "bz2" => "Tar archive",
+        "pdf" => "PDF document",
+        "doc" | "docx" | "odt" | "rtf" => "Word processor document",
+        "xls" | "xlsx" | "ods" | "csv" => "Spreadsheet",
+        "ppt" | "pptx" | "odp" => "Presentation",
+        "epub" => "E-book",
+        "txt" | "log" | "md" => "Text document",
+        "json" | "xml" | "yaml" | "yml" | "toml" | "ini" => "Structured data",
+        "mp3" | "flac" | "ogg" | "wav" | "m4a" | "aac" | "opus" => "Audio",
+        "mp4" | "mkv" | "avi" | "webm" | "mov" | "m4v" => "Video",
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "heic" => "Image",
+        _ => return "File".to_string(),
+    };
+    // "Image" reads better than "image file", but "PDF document" does not want
+    // a trailing noun, so the label carries its own shape.
+    label.to_string()
+}
+
 fn properties<F>(
     t: &Palette,
     entry: &DirEntry,
@@ -822,13 +860,7 @@ fn properties<F>(
 where
     F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
 {
-    let kind = if entry.is_symlink && !entry.is_dir {
-        "Symbolic link"
-    } else if entry.is_dir {
-        "Folder"
-    } else {
-        "File"
-    };
+    let kind = file_kind(entry);
     let size = if entry.is_dir {
         "—".to_string()
     } else {
@@ -1037,7 +1069,7 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Select all", "Ctrl+A"),
             ("Extend selection", "Shift or Ctrl + click"),
             ("Select a band", "Drag in the file area"),
-            ("Clear selection", "Esc"),
+            ("Close a menu, field or dialog; else clear", "Esc"),
         ],
     ),
     (
@@ -1190,6 +1222,9 @@ where
             "Licence",
             "GPL-3.0-or-later. The transfer queue lives in memory and is lost on exit.".to_string(),
         ),
+        // The Lucide SVGs are embedded in this binary under the ISC licence,
+        // which requires the notice to travel with them.
+        ("Icons", "Lucide (ISC)".to_string()),
     ];
 
     card(
@@ -1229,6 +1264,17 @@ where
                 )
                 .into_any_element(),
             detail_table(t, rows, 76.0),
+            // The ISC notice for the embedded Lucide icons, rendered rather than
+            // just named: the licence requires the notice to accompany the
+            // work, and a binary that embeds 61 SVGs is a copy of them.
+            div()
+                .px(px(18.0))
+                .pb(px(12.0))
+                .text_size(px(9.0))
+                .font_family(theme::MONO)
+                .text_color(t.text_muted)
+                .child(icons::LUCIDE_LICENSE.trim())
+                .into_any_element(),
             buttons(
                 t,
                 vec![Button::normal("close", DialogResult::Dismiss)],
@@ -1241,6 +1287,40 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::protocol::DirEntry;
+
+    fn named(name: &str) -> DirEntry {
+        DirEntry {
+            name: name.into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0o644,
+            mtime: 0,
+        }
+    }
+
+    #[test]
+    fn file_kind_names_the_common_types() {
+        assert_eq!(file_kind(&named("report.pdf")), "PDF document");
+        assert_eq!(file_kind(&named("app.apk")), "Android package");
+        assert_eq!(file_kind(&named("holiday.jpg")), "Image");
+        assert_eq!(file_kind(&named("song.flac")), "Audio");
+        assert_eq!(file_kind(&named("bundle.tar.gz")), "Tar archive");
+    }
+
+    #[test]
+    fn file_kind_falls_back_for_anything_it_does_not_know() {
+        assert_eq!(file_kind(&named("mystery")), "File");
+        assert_eq!(file_kind(&named("libfoo.so.7")), "File");
+        let mut dir = named("photos");
+        dir.is_dir = true;
+        assert_eq!(file_kind(&dir), "Folder");
+        let mut link = named("shortcut");
+        link.is_symlink = true;
+        assert_eq!(file_kind(&link), "Symbolic link");
+    }
+
     use super::*;
 
     #[test]

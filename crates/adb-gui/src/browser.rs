@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollHandle, Size, Window, actions, div, px, relative, rgba, uniform_list,
+    AnyElement, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, ScrollHandle, Size, Window, actions, div, px, relative, rgba, uniform_list,
 };
 
 use crate::icons::{self, names};
@@ -52,6 +52,8 @@ actions!(
         Deselect,
         CopySelection,
         Paste,
+        Upload,
+        Download,
         ToggleHidden,
         ZoomIn,
         ZoomOut,
@@ -94,7 +96,6 @@ pub const BINDINGS: &[Binding] = &[
     ("secondary-a", || {
         KeyBinding::new("secondary-a", SelectAll, None)
     }),
-    ("escape", || KeyBinding::new("escape", Deselect, None)),
     ("delete", || {
         KeyBinding::new("delete", DeleteSelection, None)
     }),
@@ -118,17 +119,24 @@ pub const BINDINGS: &[Binding] = &[
     ("secondary-l", || {
         KeyBinding::new("secondary-l", TogglePathEntry, None)
     }),
-    ("secondary-shift-c", || {
-        KeyBinding::new("secondary-shift-c", CopySelection, None)
-    }),
+    // Enter opens, the way the context menu and the shortcuts dialog both say.
+    // Text fields register their own `enter` under `TEXT_CONTEXT`, which takes
+    // precedence while one has focus, so typing a path does not open a row.
+    ("enter", || KeyBinding::new("enter", OpenFocused, None)),
     ("secondary-c", || {
         KeyBinding::new("secondary-c", CopySelection, None)
     }),
     ("secondary-v", || {
         KeyBinding::new("secondary-v", Paste, None)
     }),
+    // Ctrl+U and Ctrl+Shift+C are upload and download, as every menu that
+    // advertises them says. They used to be duplicate spellings of paste and
+    // copy, which quietly turned two advertised shortcuts into the wrong action.
     ("secondary-u", || {
-        KeyBinding::new("secondary-u", Paste, None)
+        KeyBinding::new("secondary-u", Upload, None)
+    }),
+    ("secondary-shift-c", || {
+        KeyBinding::new("secondary-shift-c", Download, None)
     }),
     ("secondary-equal", || {
         KeyBinding::new("secondary-equal", ZoomIn, None)
@@ -180,6 +188,11 @@ pub enum BrowserEvent {
     DeletePermanently(Vec<DirEntry>),
     Copy(Vec<DirEntry>),
     Paste,
+    /// Send local files to the phone. Only meaningful while browsing the disk,
+    /// which is where the chooser is anchored.
+    Upload,
+    /// Save the selection to the computer.
+    Download(Vec<DirEntry>),
     /// Install an `.apk` on the connected device.
     InstallApk(DirEntry),
     /// Pause or resume every active job.
@@ -193,6 +206,15 @@ pub enum BrowserEvent {
     },
     /// A double click or Enter on a directory: a listing is needed for it.
     OpenedDirectory(PathBuf),
+    /// The keyboard revealed the search or path field, which needs the caret.
+    FocusSearch,
+    FocusPathEntry,
+    /// Files arrived from another application or the desktop.
+    DroppedPaths(Vec<PathBuf>),
+    /// An entry was dropped onto a directory row, to move it inside.
+    DroppedOnFolder(DirEntry, Vec<PathBuf>),
+    /// Entries were dragged within this window, to move them onto a folder row.
+    DraggedOntoFolder(DirEntry, Vec<DirEntry>),
 }
 
 /// What opening an entry turns into.
@@ -214,6 +236,80 @@ impl OpenOutcome {
             OpenOutcome::InstallApk(entry) => BrowserEvent::InstallApk(entry),
             OpenOutcome::Download(entry) => BrowserEvent::Open(entry),
         }
+    }
+}
+
+/// How a click changes the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extend {
+    /// Replace the selection with the clicked row.
+    None,
+    /// Add or remove just the clicked row.
+    Toggle,
+    /// Add everything between the anchor and the clicked row.
+    Range,
+}
+
+/// Aggregate byte counts across the active transfers, so the status bar can show
+/// a bar and a throughput the way the GTK build did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransferProgress {
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub speed_bps: u64,
+}
+
+impl TransferProgress {
+    /// Fraction complete, or zero when nothing has a known size.
+    pub fn fraction(&self) -> f32 {
+        if self.bytes_total == 0 {
+            return 0.0;
+        }
+        ((self.bytes_done as f64) / (self.bytes_total as f64)).clamp(0.0, 1.0) as f32
+    }
+}
+
+/// What an in-window drag is carrying.
+/// GPUI types a drag by payload, so this is how the browser tells its own drags
+/// apart from files coming in from the desktop. Dragging something you already
+/// own means moving it, so a drop on a folder row moves; the GTK build drew the
+/// same distinction from whether the drag started inside the window.
+#[derive(Debug, Clone)]
+pub struct DraggedEntries(pub Vec<DirEntry>);
+
+/// The chip that follows the cursor during an in-window drag.
+///
+/// One entity is created per browser and re-labelled per drag, because
+/// [`InteractiveElement::on_drag`] wants an entity but hands its constructor
+/// only an `&mut App`, which cannot build one.
+pub struct DragGhost {
+    label: String,
+}
+
+impl DragGhost {
+    fn describe(payload: &DraggedEntries) -> String {
+        match payload.0.as_slice() {
+            [] => String::new(),
+            [one] => one.name.clone(),
+            many => format!("{} items", many.len()),
+        }
+    }
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
+        div()
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(t.capsule_border)
+            .bg(t.capsule_bg)
+            .text_size(px(11.0))
+            .text_color(t.text_primary)
+            .child(self.label.clone())
+            .into_any_element()
     }
 }
 
@@ -275,6 +371,10 @@ pub struct Browser {
     scroll: ScrollHandle,
     grid_geometry: GridGeometry,
     list_geometry: ListGeometry,
+    /// The chip shown under the cursor during an in-window drag.
+    drag_ghost: Entity<DragGhost>,
+    /// Name of the directory row a drag is currently over, for the drop hint.
+    hovered_drop_folder: Option<String>,
 
     // ── Item-area metrics ───────────────────────────────────────────────────
     //
@@ -300,6 +400,13 @@ pub struct Browser {
     // ── Status line ────────────────────────────────────────────────────────
     status_text: String,
     active_jobs: usize,
+    /// Aggregate bytes moved by the active jobs, for the status bar's bar.
+    progress: TransferProgress,
+    /// True between asking for a listing and getting one, which is what greys
+    /// the navigation buttons and puts "Loading…" in the status bar.
+    loading: bool,
+    /// Where a Shift-extended selection starts. A plain or Ctrl click sets it.
+    extend_anchor: Option<usize>,
     transfers_paused: bool,
 
     focus: FocusHandle,
@@ -328,6 +435,10 @@ impl Browser {
             search_query: String::new(),
             search_active: false,
             path_entry_active: false,
+            drag_ghost: cx.new(|_cx| DragGhost {
+                label: String::new(),
+            }),
+            hovered_drop_folder: None,
             scroll: ScrollHandle::new(),
             grid_geometry: GridGeometry::default(),
             list_geometry: ListGeometry::default(),
@@ -342,6 +453,9 @@ impl Browser {
             drag_extend: false,
             status_text: String::new(),
             active_jobs: 0,
+            progress: TransferProgress::default(),
+            loading: false,
+            extend_anchor: None,
             transfers_paused: false,
             focus: cx.focus_handle(),
         }
@@ -519,6 +633,21 @@ impl Browser {
         Some(Path::new(mount).join(relative))
     }
 
+    /// The browsed directory as a path on this machine.
+    ///
+    /// On the disk that is the path itself. On a phone the FUSE mount stands in
+    /// for the device root, so the browsed path is re-rooted onto the mount:
+    /// pointing a file manager at `/sdcard/Download` would show the host's root,
+    /// which is not what anyone means by "open this folder".
+    pub fn local_current_dir(&self) -> Option<PathBuf> {
+        if self.local_mode {
+            return Some(self.current_path.clone());
+        }
+        let mount = self.fuse_mount.as_deref()?;
+        let relative = self.current_path.strip_prefix("/").ok()?;
+        Some(Path::new(mount).join(relative))
+    }
+
     // ── Mutators the app root drives ────────────────────────────────────────
 
     /// Point the browser at a device, starting at its Download folder.
@@ -621,20 +750,55 @@ impl Browser {
     /// The state part of [`Self::set_entries`], so it can be driven without a
     /// `Context`.
     pub fn install_entries(&mut self, mut entries: Vec<DirEntry>) {
+        self.loading = false;
         sort_entries(&mut entries, self.sort_key, self.sort_descending);
         self.entries = entries;
         self.selection.clear();
         self.focused = None;
+        self.extend_anchor = None;
         self.recompute_visible();
     }
 
     /// Report a listing failure in the status bar.
     pub fn set_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.loading = false;
         self.entries.clear();
         self.selection.clear();
         self.visible.clear();
+        self.extend_anchor = None;
         self.status_text = message;
         cx.notify();
+    }
+
+    /// Mark that a listing is on its way.
+    ///
+    /// Also the re-entrancy guard: a second request while one is in flight is
+    /// dropped, because two answers for the same directory would race and the
+    /// later one could be the staler of the pair.
+    pub fn begin_load(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.loading {
+            return false;
+        }
+        self.loading = true;
+        cx.notify();
+        true
+    }
+
+    /// Whether a listing is in flight.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Drop the in-flight guard without touching the listing on screen.
+    ///
+    /// Only [`Self::begin_load`]'s counterpart for a deliberate re-read: the
+    /// stale answer is discarded by the path check in the fetch handler, so
+    /// letting a second one start cannot show the wrong directory.
+    pub fn cancel_load(&mut self, cx: &mut Context<Self>) {
+        if self.loading {
+            self.loading = false;
+            cx.notify();
+        }
     }
 
     /// Update the transfer counters shown in the status bar.
@@ -643,11 +807,17 @@ impl Browser {
         active: usize,
         total: usize,
         paused: bool,
+        progress: TransferProgress,
         cx: &mut Context<Self>,
     ) {
-        let unchanged = self.active_jobs == active && self.transfers_paused == paused;
+        let unchanged = self.active_jobs == active
+            && self.transfers_paused == paused
+            && self.progress.bytes_done == progress.bytes_done
+            && self.progress.bytes_total == progress.bytes_total
+            && self.progress.speed_bps == progress.speed_bps;
         self.active_jobs = active;
         self.transfers_paused = paused;
+        self.progress = progress;
         if !unchanged {
             // Rewriting the label on every 600ms poll would make it flicker, so
             // it is only touched when the state actually changes.
@@ -706,23 +876,62 @@ impl Browser {
         self.visible.clear();
         self.selection.clear();
         self.focused = None;
+        // The anchor is an index into the listing that just went away.
+        self.extend_anchor = None;
     }
 
     // ── State transforms, kept free of `Context` so they can be tested ─────
 
     /// A plain click replaces the selection; Shift or Ctrl toggles the row in or
     /// out of it.
-    pub fn click_row(&mut self, index: usize, extend: bool) -> bool {
-        if extend {
-            if !self.selection.insert(index) {
-                self.selection.remove(&index);
+    pub fn click_row(&mut self, index: usize, extend: Extend) -> bool {
+        match extend {
+            // Ctrl toggles exactly one row.
+            Extend::Toggle => {
+                if !self.selection.insert(index) {
+                    self.selection.remove(&index);
+                }
+                self.extend_anchor = Some(index);
             }
-        } else {
-            self.selection.clear();
-            self.selection.insert(index);
+            // Shift extends from the anchor left by the last plain or Ctrl
+            // click. GTK's ListBox and FlowBox gave ranges for free, so the
+            // rewrite lost them by hand-rolling selection and nothing noticed
+            // until the shortcuts dialog advertised "Shift or Ctrl + click".
+            Extend::Range => match self.extend_anchor {
+                Some(anchor) => self.extend_range(anchor, index),
+                None => {
+                    self.selection.clear();
+                    self.selection.insert(index);
+                    self.extend_anchor = Some(index);
+                }
+            },
+            Extend::None => {
+                self.selection.clear();
+                self.selection.insert(index);
+                self.extend_anchor = Some(index);
+            }
         }
         self.focused = Some(index);
         true
+    }
+
+    /// Select everything between two positions in the visible order.
+    ///
+    /// Direction does not matter: dragging the band upwards is still a range
+    /// between the same two rows.
+    fn extend_range(&mut self, anchor: usize, index: usize) {
+        let (Some(from), Some(to)) = (
+            self.visible.iter().position(|ix| *ix == anchor),
+            self.visible.iter().position(|ix| *ix == index),
+        ) else {
+            return;
+        };
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        // Shift extends the existing selection rather than replacing it, which
+        // is what makes two disjoint bands possible.
+        for slot in lo..=hi {
+            self.selection.insert(self.visible[slot]);
+        }
     }
 
     /// Move the focus, and with it the selection, for arrow-key traversal.
@@ -814,6 +1023,10 @@ impl Browser {
     }
 
     fn deselect(&mut self, _: &Deselect, _: &mut Window, cx: &mut Context<Self>) {
+        self.deselect_action(cx);
+    }
+
+    fn deselect_action(&mut self, cx: &mut Context<Self>) {
         self.selection.clear();
         self.drag_anchor = None;
         self.drag_current = None;
@@ -829,6 +1042,23 @@ impl Browser {
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(BrowserEvent::Paste);
+    }
+
+    fn upload(&mut self, _: &Upload, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(BrowserEvent::Upload);
+    }
+
+    fn download(&mut self, _: &Download, _: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.selected();
+        if !selected.is_empty() {
+            cx.emit(BrowserEvent::Download(selected));
+        }
+    }
+
+    /// Clear the selection. Public so the app root can fall back to it once
+    /// Escape has found no overlay to dismiss.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.deselect_action(cx);
     }
 
     fn toggle_hidden(&mut self, _: &ToggleHidden, _: &mut Window, cx: &mut Context<Self>) {
@@ -980,6 +1210,9 @@ impl Browser {
     fn toggle_search(&mut self, _: &ToggleSearch, _: &mut Window, cx: &mut Context<Self>) {
         let next = !self.search_active;
         self.set_search_active(next, cx);
+        if next {
+            cx.emit(BrowserEvent::FocusSearch);
+        }
     }
 
     fn focus_previous(&mut self, _: &FocusPrevious, window: &mut Window, cx: &mut Context<Self>) {
@@ -1109,7 +1342,19 @@ impl Browser {
 
     fn toggle_path_entry(&mut self, _: &TogglePathEntry, _: &mut Window, cx: &mut Context<Self>) {
         self.path_entry_active = !self.path_entry_active;
+        if self.path_entry_active {
+            cx.emit(BrowserEvent::FocusPathEntry);
+        }
         cx.notify();
+    }
+
+    /// Leave path-entry mode. Public so the app root's Escape handler can do it
+    /// without going through the action, which would toggle rather than close.
+    pub fn close_path_entry(&mut self, cx: &mut Context<Self>) {
+        if self.path_entry_active {
+            self.path_entry_active = false;
+            cx.notify();
+        }
     }
 
     fn index_of(&self, entry: &DirEntry) -> usize {
@@ -1142,7 +1387,14 @@ impl Browser {
         self.drag_current = Some(event.position);
         // Ctrl or Shift turns a fresh drag into an extension of the selection.
         self.drag_extend = event.modifiers.control || event.modifiers.shift;
-        if !self.drag_extend {
+        // Only a press on empty space clears the selection. A press that lands
+        // on a tile may become that tile's drag, and clearing here would
+        // destroy the very selection the drag is meant to move.
+        let on_item = self
+            .visible
+            .iter()
+            .any(|ix| self.row_contains(*ix, event.position));
+        if !self.drag_extend && !on_item {
             self.selection.clear();
         }
         cx.notify();
@@ -1373,9 +1625,48 @@ fn empty_state(t: &theme::Palette) -> Div {
 }
 
 /// The bottom strip: item counts and transfer state.
+/// `12.4 MB of 40.0 MB — 3.1 MB/s`, or just `Transferring` when the queue has
+/// no byte counts to add up yet.
+fn throughput(progress: &TransferProgress) -> String {
+    if progress.bytes_total == 0 {
+        return "Transferring".to_string();
+    }
+    let mut line = format!(
+        "{} of {}",
+        human_size(progress.bytes_done),
+        human_size(progress.bytes_total)
+    );
+    if progress.speed_bps > 0 {
+        line.push_str(&format!(" — {}/s", human_size(progress.speed_bps)));
+    }
+    line
+}
+
+/// The aggregate progress bar for the active jobs.
+fn transfer_bar(browser: &Browser, t: &theme::Palette) -> AnyElement {
+    let fraction = browser.progress.fraction();
+    div()
+        .w(px(120.0))
+        .h(px(4.0))
+        .rounded(px(2.0))
+        .bg(t.border_soft)
+        .child(
+            div()
+                .w(px(120.0 * fraction))
+                .h_full()
+                .rounded(px(2.0))
+                .bg(t.accent),
+        )
+        .into_any_element()
+}
+
 fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) -> AnyElement {
     let running = browser.active_jobs > 0;
-    let text = if browser.status_text.is_empty() {
+    // A listing in flight outranks the item count: the count is the previous
+    // directory's until the answer lands, so showing it would be a lie.
+    let text = if browser.loading {
+        "Loading…".to_string()
+    } else if browser.status_text.is_empty() {
         format!("{} item(s)", browser.visible.len())
     } else {
         browser.status_text.clone()
@@ -1409,12 +1700,18 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
                         t.text_dim
                     })
                     .child(if browser.transfers_paused {
-                        "Transfers paused"
+                        "Transfers paused".to_string()
                     } else {
-                        "Transferring"
+                        throughput(&browser.progress)
                     }),
             )
         })
+        // The bar only means something while bytes are moving, so it is hidden
+        // rather than shown empty next to a paused queue.
+        .when(
+            running && !browser.transfers_paused && browser.progress.bytes_total > 0,
+            |d| d.child(transfer_bar(browser, t)),
+        )
         // Pause and cancel act on every active job, which is what the GTK build
         // did from the same spot.
         .when(running, |d| {
@@ -1539,7 +1836,13 @@ impl Browser {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let extend = event.modifiers().shift || event.modifiers().control;
+        let extend = if event.modifiers().shift {
+            Extend::Range
+        } else if event.modifiers().control {
+            Extend::Toggle
+        } else {
+            Extend::None
+        };
         self.click_row(index, extend);
         if event.click_count() >= 2
             && let Some(outcome) = self.open_index(index)
@@ -1559,7 +1862,7 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         if !self.selection.contains(&index) {
-            self.click_row(index, false);
+            self.click_row(index, Extend::None);
         }
         self.focused = Some(index);
         cx.notify();
@@ -1585,6 +1888,76 @@ impl Browser {
     }
 
     /// One tile of the grid view.
+    /// Make an item a drag source, and — when it is a directory — a drop target
+    /// for both kinds of payload.
+    ///
+    /// A file cannot accept a drop, so only directories get `on_drop`; without
+    /// that guard GPUI would happily route a drop over a file row to its
+    /// container and the move would land somewhere the user never pointed at.
+    fn draggable_item(
+        &self,
+        tile: impl StatefulInteractiveElement + IntoElement,
+        entry: &DirEntry,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let ghost = self.drag_ghost.clone();
+        // Dragging a tile that is part of the selection moves the selection, not
+        // just that one tile.
+        let payload = DraggedEntries(if self.selection.contains(&index) {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.selection.contains(i))
+                .map(|(_, e)| e.clone())
+                .collect()
+        } else {
+            vec![entry.clone()]
+        });
+        let tile = tile.on_drag(payload, move |payload, _offset, _window, cx| {
+            let label = DragGhost::describe(payload);
+            ghost.update(cx, |ghost, cx| {
+                ghost.label = label;
+                cx.notify();
+            });
+            ghost.clone()
+        });
+
+        if !entry.looks_like_dir() {
+            return tile.into_any_element();
+        }
+
+        let folder = entry.clone();
+        let external_folder = folder.clone();
+        let internal_folder = folder.clone();
+        tile.on_drop::<ExternalPaths>(cx.listener(
+            move |this, dropped: &ExternalPaths, _window, cx| {
+                let paths = dropped.paths().to_vec();
+                cx.emit(BrowserEvent::DroppedOnFolder(
+                    external_folder.clone(),
+                    paths,
+                ));
+                this.hovered_drop_folder = None;
+            },
+        ))
+        .on_drop::<DraggedEntries>(cx.listener(
+            move |this, dragged: &DraggedEntries, _window, cx| {
+                cx.emit(BrowserEvent::DraggedOntoFolder(
+                    internal_folder.clone(),
+                    dragged.0.clone(),
+                ));
+                this.hovered_drop_folder = None;
+            },
+        ))
+        .on_drag_move::<ExternalPaths>(cx.listener(
+            move |this, _event: &gpui::DragMoveEvent<ExternalPaths>, _w, cx| {
+                this.hovered_drop_folder = Some(folder.name.clone());
+                cx.notify();
+            },
+        ))
+        .into_any_element()
+    }
+
     fn grid_tile(&self, slot: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         // The palette is `Copy`, so take a value: a borrow of `cx` would collide
         // with the closures below that need `&mut cx`.
@@ -1664,41 +2037,43 @@ impl Browser {
         };
         let hover_bg = if selected { t.selected_strong } else { t.hover };
 
+        let tile = div()
+            .id(("tile", index))
+            .flex()
+            .flex_col()
+            .items_center()
+            .w(px(tile_w))
+            .h(px(tile_h))
+            .pt(px(GRID_TILE_PAD))
+            .px(px(4.0))
+            .pb(px(6.0))
+            .rounded(px(10.0))
+            .cursor_pointer()
+            .when_some(resting_bg, |d, bg| d.bg(bg))
+            .hover(move |d| d.bg(hover_bg))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(icon_size))
+                    .w_full()
+                    .child(icon_el),
+            )
+            .child(label)
+            .when_some(sub, |d, sub| d.child(sub))
+            .on_click(
+                cx.listener(move |this, event, w, cx| this.on_item_click(index, event, w, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event, w, cx| {
+                    this.on_item_right_click(index, event, w, cx)
+                }),
+            );
+
         Some(
-            div()
-                .id(("tile", index))
-                .flex()
-                .flex_col()
-                .items_center()
-                .w(px(tile_w))
-                .h(px(tile_h))
-                .pt(px(GRID_TILE_PAD))
-                .px(px(4.0))
-                .pb(px(6.0))
-                .rounded(px(10.0))
-                .cursor_pointer()
-                .when_some(resting_bg, |d, bg| d.bg(bg))
-                .hover(move |d| d.bg(hover_bg))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(icon_size))
-                        .w_full()
-                        .child(icon_el),
-                )
-                .child(label)
-                .when_some(sub, |d, sub| d.child(sub))
-                .on_click(
-                    cx.listener(move |this, event, w, cx| this.on_item_click(index, event, w, cx)),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event, w, cx| {
-                        this.on_item_right_click(index, event, w, cx)
-                    }),
-                )
+            self.draggable_item(tile, &entry, index, cx)
                 .into_any_element(),
         )
     }
@@ -1725,50 +2100,52 @@ impl Browser {
             human_size(entry.size)
         };
 
+        let row = div()
+            .id(("row", index))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .w_full()
+            .h(px(LIST_ROW_H))
+            .mx(px(10.0))
+            .px(px(8.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .when(selected, |d| d.bg(t.hover))
+            .when(focused && !selected, |d| d.bg(t.hover))
+            .hover(|d| d.bg(if selected { t.pressed } else { t.hover }))
+            .child(icons::icon(
+                self.glyph_for(&entry),
+                15.0,
+                if selected { t.text_header } else { t.text_dim },
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(if selected {
+                        t.text_header
+                    } else {
+                        t.text_primary
+                    })
+                    .child(entry.name.clone()),
+            )
+            .child(ui::mono(size, t).w(px(72.0)).text_right())
+            .child(ui::mono(entry.mtime_string(), t).w(px(118.0)).text_right())
+            .on_click(
+                cx.listener(move |this, event, w, cx| this.on_item_click(index, event, w, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event, w, cx| {
+                    this.on_item_right_click(index, event, w, cx)
+                }),
+            );
+
         Some(
-            div()
-                .id(("row", index))
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .w_full()
-                .h(px(LIST_ROW_H))
-                .mx(px(10.0))
-                .px(px(8.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .when(selected, |d| d.bg(t.hover))
-                .when(focused && !selected, |d| d.bg(t.hover))
-                .hover(|d| d.bg(if selected { t.pressed } else { t.hover }))
-                .child(icons::icon(
-                    self.glyph_for(&entry),
-                    15.0,
-                    if selected { t.text_header } else { t.text_dim },
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(if selected {
-                            t.text_header
-                        } else {
-                            t.text_primary
-                        })
-                        .child(entry.name.clone()),
-                )
-                .child(ui::mono(size, t).w(px(72.0)).text_right())
-                .child(ui::mono(entry.mtime_string(), t).w(px(118.0)).text_right())
-                .on_click(
-                    cx.listener(move |this, event, w, cx| this.on_item_click(index, event, w, cx)),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event, w, cx| {
-                        this.on_item_right_click(index, event, w, cx)
-                    }),
-                )
+            self.draggable_item(row, &entry, index, cx)
                 .into_any_element(),
         )
     }
@@ -1911,6 +2288,14 @@ impl Render for Browser {
             .on_mouse_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_drag_end))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_drag_end))
+            // Dropping on empty canvas means "into the directory being browsed".
+            // Rows sit on top of this and take the drop first, so a drop over a
+            // row is never mistaken for a drop over the directory.
+            .on_drop::<ExternalPaths>(cx.listener(|this, dropped: &ExternalPaths, _window, cx| {
+                let paths = dropped.paths().to_vec();
+                cx.emit(BrowserEvent::DroppedPaths(paths));
+                this.hovered_drop_folder = None;
+            }))
             .child(body)
             .when_some(rubber_band(self, &t), |d, band| d.child(band));
 
@@ -1925,6 +2310,8 @@ impl Render for Browser {
             .on_action(cx.listener(Self::deselect))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::upload))
+            .on_action(cx.listener(Self::download))
             .on_action(cx.listener(Self::toggle_hidden))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
@@ -2017,6 +2404,32 @@ mod tests {
             "12345678",
             "a serial that is already eight characters passes through"
         );
+    }
+
+    #[gpui::test]
+    async fn a_dropped_listing_does_not_wedge_the_browser(cx: &mut TestAppContext) {
+        // Regression: the caller dropped a listing whose device/path no longer
+        // matched, returned without clearing `loading`, and `begin_load` then
+        // refused every request forever — no directory could be listed again,
+        // including "This computer".
+        let handle = open(cx);
+        cx.update(|app| {
+            let browser = handle.root(app).expect("root view");
+            let accepted = browser.update(app, |b, cx| {
+                b.set_device("A", "Phone A", cx);
+                b.navigate(PathBuf::from("/sdcard"));
+                assert!(b.begin_load(cx), "the first load starts");
+                // The user switched phones while the listing was in flight, so
+                // the answer comes back stale.
+                b.set_device("B", "Phone B", cx);
+                b.cancel_load(cx);
+                b.begin_load(cx)
+            });
+            assert!(
+                accepted,
+                "the browser still accepts requests after a discarded listing"
+            );
+        });
     }
 
     #[gpui::test]
@@ -2430,7 +2843,69 @@ mod tests {
     // ── State: these need a real entity, hence the harness ─────────────────
 
     #[gpui::test]
-    async fn clicking_replaces_the_selection_and_shift_extends_it(cx: &mut TestAppContext) {
+    #[gpui::test]
+    async fn shift_click_selects_the_range_between_the_anchor_and_the_click(
+        cx: &mut TestAppContext,
+    ) {
+        let handle = open(cx);
+        cx.update(|app| {
+            let b = handle.root(app).expect("root view");
+            b.update(app, |b, _| {
+                b.install_entries(vec![
+                    entry("a", true),
+                    entry("b", true),
+                    entry("c", true),
+                    entry("d", true),
+                    entry("e", true),
+                ])
+            });
+
+            b.update(app, |b, _| b.click_row(1, Extend::None));
+            b.update(app, |b, _| b.click_row(3, Extend::Range));
+            let names: Vec<String> = b
+                .read(app)
+                .selected()
+                .iter()
+                .map(|e| e.name.clone())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["b", "c", "d"],
+                "shift fills every row between the anchor and the click"
+            );
+
+            // Backwards, because dragging the band up is still a range.
+            b.update(app, |b, _| b.click_row(4, Extend::None));
+            b.update(app, |b, _| b.click_row(0, Extend::Range));
+            let names: Vec<String> = b
+                .read(app)
+                .selected()
+                .iter()
+                .map(|e| e.name.clone())
+                .collect();
+            assert_eq!(names, vec!["a", "b", "c", "d", "e"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn shift_click_without_an_anchor_selects_only_the_clicked_row(cx: &mut TestAppContext) {
+        let handle = open(cx);
+        cx.update(|app| {
+            let b = handle.root(app).expect("root view");
+            b.update(app, |b, _| {
+                b.install_entries(vec![entry("a", true), entry("b", true), entry("c", true)])
+            });
+            b.update(app, |b, _| b.click_row(2, Extend::Range));
+            assert_eq!(
+                b.read(app).selected().len(),
+                1,
+                "with no anchor there is no range to extend"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn clicking_replaces_the_selection_and_ctrl_toggles_it(cx: &mut TestAppContext) {
         let handle = open(cx);
         cx.update(|app| {
             let b = handle.root(app).expect("root view");
@@ -2438,10 +2913,10 @@ mod tests {
                 b.install_entries(vec![entry("a", true), entry("b", true), entry("c", false)])
             });
 
-            b.update(app, |b, _| b.click_row(0, false));
+            b.update(app, |b, _| b.click_row(0, Extend::None));
             assert_eq!(b.read(app).selected().len(), 1);
 
-            b.update(app, |b, _| b.click_row(2, false));
+            b.update(app, |b, _| b.click_row(2, Extend::None));
             assert_eq!(
                 b.read(app).selected().len(),
                 1,
@@ -2449,18 +2924,18 @@ mod tests {
             );
             assert_eq!(b.read(app).selected()[0].name, "c");
 
-            b.update(app, |b, _| b.click_row(0, true));
+            b.update(app, |b, _| b.click_row(0, Extend::Toggle));
             assert_eq!(
                 b.read(app).selected().len(),
                 2,
-                "shift adds to the selection"
+                "ctrl adds to the selection"
             );
 
-            b.update(app, |b, _| b.click_row(0, true));
+            b.update(app, |b, _| b.click_row(0, Extend::Toggle));
             assert_eq!(
                 b.read(app).selected().len(),
                 1,
-                "shift on an already-selected row removes it"
+                "ctrl on an already-selected row removes it"
             );
         });
     }
@@ -2524,7 +2999,7 @@ mod tests {
                 b.install_entries(vec![entry("a", true), entry("b", true), entry("c", true)])
             });
 
-            b.update(app, |b, _| b.click_row(0, false));
+            b.update(app, |b, _| b.click_row(0, Extend::None));
             b.update(app, |b, _| b.focus_step(1, true));
             assert_eq!(b.read(app).selected().len(), 2, "the anchor row is kept");
 
@@ -2595,7 +3070,7 @@ mod tests {
                 let drop = (0..b.entries.len())
                     .find(|ix| b.entries[*ix].name == "drop")
                     .expect("the entry is present");
-                b.click_row(drop, false);
+                b.click_row(drop, Extend::None);
                 assert_eq!(b.selected().len(), 1);
 
                 b.set_search_query_raw("keep".into());
@@ -2826,7 +3301,7 @@ mod tests {
                     "an empty listing has nothing to act on"
                 );
 
-                b.click_row(1, false);
+                b.click_row(1, Extend::None);
                 assert_eq!(b.focused_entry().map(|e| e.name), Some("b".into()));
 
                 b.selection.clear();
@@ -2853,7 +3328,7 @@ mod tests {
             let b = handle.root(app).expect("root view");
             b.update(app, |b, _| {
                 b.install_entries(vec![entry("a", false), entry("b", false)]);
-                b.click_row(1, false);
+                b.click_row(1, Extend::None);
                 b.focused = None;
                 assert_eq!(
                     b.focused_entry().map(|e| e.name),

@@ -79,6 +79,12 @@ pub fn delete(path: &Path) -> io::Result<()> {
 
 /// Copy one file, creating the destination's parent directory.
 pub fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
+    // `fs::copy` opens the destination O_TRUNC, so copying a file onto itself
+    // zeroes it and still reports success. Reachable whenever the destination
+    // directory is the one the selection already came from.
+    if src == dst {
+        return Ok(());
+    }
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -96,6 +102,14 @@ pub fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
 /// Symlinks are skipped: following them risks loops and duplicating data
 /// outside the source tree.
 pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<usize> {
+    // Copying a tree into itself would walk the destination it is still
+    // creating, so `copy_file`'s per-file guard would never be reached.
+    if dst.starts_with(src) {
+        return Err(io::Error::other(format!(
+            "cannot copy {} into itself",
+            src.display()
+        )));
+    }
     let mut copied = 0;
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf(), 0u32)];
 
@@ -191,7 +205,7 @@ fn unique_name(dir: &Path, stem: &str) -> (PathBuf, String) {
 
 /// `move_path` on the same filesystem is a rename; across filesystems it has to
 /// copy then delete, so try the cheap case first.
-fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
+pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
         // EXDEV, the errno for a cross-device rename.
@@ -255,6 +269,62 @@ pub fn open_terminal(dir: &Path) -> Result<(), String> {
     Err(format!("no terminal emulator found ({})", tried.join(", ")))
 }
 
+/// Open a shell *on the phone*, in the directory being browsed.
+///
+/// Runs `adb shell 'cd <dir> && exec $SHELL -l'` in a host terminal, which is
+/// what makes "open in terminal" useful on a device: the alternative is a
+/// local terminal sitting in a `/sdcard/...` path that does not exist here.
+/// The GTK build did this; the GPUI rewrite always opened a local terminal and
+/// so never gave the user a shell on the phone at all.
+pub fn open_device_terminal(serial: &str, dir: &Path) -> Result<(), String> {
+    let adb = which("adb").map_err(|e| format!("adb: {e}"))?;
+    let path = dir.display().to_string();
+    let mut tried = Vec::new();
+    for (program, flag) in terminal_candidates() {
+        let shell = format!("cd {} && exec $SHELL -l", shell_quote(&path));
+        match std::process::Command::new(program)
+            .arg(flag)
+            .arg(adb.display().to_string())
+            .arg("-s")
+            .arg(serial)
+            .arg("shell")
+            .arg(shell)
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => tried.push(format!("{program}: {err}")),
+        }
+    }
+    Err(format!("no terminal emulator found ({})", tried.join(", ")))
+}
+
+/// Quote a path for the phone's shell. Single quotes disable every expansion,
+/// so an embedded quote is closed, escaped and reopened.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Locate an executable on `PATH`.
+fn which(name: &str) -> Result<PathBuf, String> {
+    let path = std::env::var_os("PATH").ok_or("no PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| format!("{name} not found on PATH"))
+}
+
+/// Terminal emulators that take the command to run as trailing arguments.
+fn terminal_candidates() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("gnome-terminal", "--"),
+        ("kgx", "--"),
+        ("xfce4-terminal", "--command"),
+        ("konsole", "-e"),
+        ("alacritty", "-e"),
+        ("kitty", "--"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +349,35 @@ mod tests {
         fs::write(src.join("sub").join("b.txt"), b"b").unwrap();
         std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
         (src, base.join("dst"))
+    }
+
+    #[test]
+    fn copying_onto_itself_does_not_zero_the_file() {
+        // `fs::copy` opens the destination O_TRUNC, so without the guard in
+        // `copy_file` this leaves the file empty and still returns Ok.
+        let base = temp_dir("selfcopy");
+        let file = base.join("report.pdf");
+        fs::write(&file, b"important").unwrap();
+
+        copy_file(&file, &file).expect("copying onto itself is a no-op, not a failure");
+
+        assert_eq!(fs::read(&file).unwrap(), b"important");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn copy_tree_refuses_a_destination_inside_the_source() {
+        let base = temp_dir("nested");
+        let src = base.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.txt"), b"a").unwrap();
+
+        let err = copy_tree(&src, &src.join("nested")).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("into itself"),
+            "unhelpful error: {err}"
+        );
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]

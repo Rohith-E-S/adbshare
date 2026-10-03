@@ -70,13 +70,59 @@ pub fn absolute_paths(entries: &[DirEntry], from_dir: &Path) -> Vec<PathBuf> {
 
 /// Split a mirrored clipboard payload into absolute paths, ignoring blanks and
 /// anything that is not absolute.
+///
+/// Accepts both conventions a file manager might leave on the clipboard: bare
+/// absolute paths, and `file://` URIs. The URI form is what Nautilus, Dolphin
+/// and `gio` actually copy, and dropping it made pasting between file managers
+/// silently do nothing.
 pub fn decode(text: &str) -> Vec<PathBuf> {
     text.lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let path = from_uri(line).unwrap_or_else(|| PathBuf::from(line));
+            path.is_absolute().then_some(path)
+        })
         .collect()
+}
+
+/// Resolve one clipboard line to a path, decoding a `file://` URI if it is one.
+///
+/// A URI is only accepted with an empty or `localhost` authority, because
+/// `file://somehost/share/x` names a path on another machine and this process
+/// cannot read it.
+fn from_uri(line: &str) -> Option<PathBuf> {
+    let rest = line.strip_prefix("file://")?;
+    let path = match rest.find('/') {
+        Some(0) => rest,
+        // `file://localhost/x` and `file:///x` are the same path.
+        Some(_) if rest[..rest.find('/').unwrap()].eq_ignore_ascii_case("localhost") => {
+            &rest[rest.find('/').unwrap()..]
+        }
+        Some(_) => return None,
+        None => return None,
+    };
+    Some(PathBuf::from(percent_decode(path)))
+}
+
+/// Decode `%XX` escapes in a URI path.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Resolve a clipboard snapshot against the directory being browsed now,
@@ -167,6 +213,46 @@ mod tests {
             ]
         );
         assert!(decode("").is_empty());
+    }
+
+    #[test]
+    fn decode_reads_the_file_uris_a_file_manager_leaves() {
+        let text = concat!(
+            "# This is a URI list as Nautilus writes it.\n",
+            "file:///home/me/My%20Documents/report.pdf\n",
+            "file://localhost/home/me/plain.txt\n",
+        );
+        assert_eq!(
+            decode(text),
+            vec![
+                PathBuf::from("/home/me/My Documents/report.pdf"),
+                PathBuf::from("/home/me/plain.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_refuses_a_uri_that_names_another_host() {
+        // `file://nas/share/x` is a path on another machine; pretending it is
+        // local would hand the transfer engine a path that cannot be read.
+        assert!(decode("file://nas/share/x").is_empty());
+        assert!(decode("file://").is_empty());
+    }
+
+    #[test]
+    fn decode_mixes_bare_paths_and_uris() {
+        let text = "/tmp/a.txt\nfile:///tmp/b%20c.txt\nhttp://example.com/x\nnot absolute";
+        assert_eq!(
+            decode(text),
+            vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b c.txt"),]
+        );
+    }
+
+    #[test]
+    fn percent_decoding_survives_a_malformed_escape() {
+        assert_eq!(percent_decode("/a%2"), "/a%2");
+        assert_eq!(percent_decode("/a%zz"), "/a%zz");
+        assert_eq!(percent_decode("/a%20b"), "/a b");
     }
 
     #[test]

@@ -6,17 +6,54 @@ pkgdesc="Fast, reliable Linux file manager for Android devices over ADB"
 arch=('x86_64' 'aarch64')
 url="https://github.com/yourusername/adbshare"
 license=('GPL3')
-depends=('vulkan-icd-loader' 'libxkbcommon' 'wayland' 'libx11' 'libxext' 'fontconfig' 'fuse3' 'libusb')
+# libvulkan: GPUI selects Vulkan unconditionally, there is no GL fallback.
+# libxkbcommon ships the x11 half in the same package on Arch. libX11 and
+# libXext are dlopened for the X11 backend, fontconfig for font discovery.
+# libusb is deliberately absent: adb-device builds rusb with the `vendored`
+# feature, so libusb is statically linked and the daemon needs no shared one.
+depends=('vulkan-icd-loader' 'libxkbcommon' 'wayland' 'libx11' 'libxext' 'fontconfig' 'fuse3')
 makedepends=('cargo' 'rust' 'pkgconf')
 optdepends=('android-tools: fallback adb binary')
 
+# No source=() and no sha256sums=(): this builds from the checkout the
+# maintainer already has, the same tree the release workflow builds. There is
+# nothing to fetch and therefore no checksum to pin.
+#
+# With no sources, makepkg sets $srcdir to this directory, so the workspace
+# root is the nearest ancestor holding the workspace Cargo.toml — not
+# "$srcdir/..", which is only `packaging/`.
+_adbshare_root() {
+    local dir="$srcdir"
+    while [ "$dir" != "/" ]; do
+        if [ -f "$dir/Cargo.toml" ]; then
+            printf '%s' "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo "adbshare PKGBUILD: no workspace Cargo.toml above $srcdir" >&2
+    return 1
+}
+
+# Track the base version from Cargo.toml, disambiguated by commit count and
+# short SHA so a rebuild of a newer commit gets a newer pkgver. The release
+# workflow uses the same v<base>-r<run>-g<sha> shape.
+pkgver() {
+    local root
+    root="$(_adbshare_root)" || return 1
+    printf '%s.r%s.g%s\n' \
+        "$(sed -n 's/^version *= *"\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -n1)" \
+        "$(git -C "$root" rev-list --count HEAD 2>/dev/null || echo 0)" \
+        "$(git -C "$root" rev-parse --short=7 HEAD 2>/dev/null || echo unknown)"
+}
+
 build() {
-    cd "$srcdir/.."
-    cargo build --release --workspace
+    cd "$(_adbshare_root)" || return 1
+    cargo build --release --workspace --locked
 }
 
 package() {
-    cd "$srcdir/.."
+    cd "$(_adbshare_root)" || return 1
     install -Dm755 target/release/adb-gui "$pkgdir/usr/bin/adb-gui"
     install -Dm755 target/release/adb-daemon "$pkgdir/usr/bin/adb-daemon"
     install -Dm755 target/release/adbshare-proxy "$pkgdir/usr/lib/adbshare/adbshare-proxy"
@@ -28,4 +65,9 @@ package() {
         "$pkgdir/usr/share/dbus-1/services/org.adbshare.Manager.service"
     install -Dm644 packaging/systemd/adbshare-daemon.service \
         "$pkgdir/usr/lib/systemd/user/adbshare-daemon.service"
+    # Lucide's ISC notice: the 61 SVGs are compiled into adb-gui by the
+    # asset_table! in crates/adb-gui/src/icons.rs, and ISC requires the notice
+    # to travel with copies of the icons.
+    install -Dm644 crates/adb-gui/assets/icons/LICENSE \
+        "$pkgdir/usr/share/doc/adbshare/icons-LICENSE"
 }
