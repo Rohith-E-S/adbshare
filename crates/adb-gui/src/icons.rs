@@ -12,18 +12,28 @@
 //!
 //! * **chrome icons** (`icons/*.svg`) are monochrome and drawn with `currentColor`,
 //!   so they are rendered with [`gpui::svg`] and tinted per call site.
-//! * **artwork** (`art/*.svg`) is full-colour and is rendered with [`gpui::img`],
-//!   which rasterises SVG without the alpha-mask tinting that `svg()` applies.
+//! * **artwork** (`art/*.svg`, `folders/*.png`) is full-colour and is rendered
+//!   with [`gpui::img`], which keeps the pixels instead of reducing the drawing
+//!   to a tinted alpha mask. The folder icons are PNG rather than SVG for
+//!   exactly that reason: they are filled, so `svg()` would flatten them.
+//!
+//! Use [`icon_or_art`] wherever a key could be either, since handing a PNG to
+//! [`icon`] draws a blank square.
 //!
 //! Lucide is ISC-licensed and its notice has to travel with the files, so it is
 //! both vendored at `assets/icons/LICENSE` and compiled into the binary as
 //! [`LUCIDE_LICENSE`], which the About dialog shows. Shipping the SVGs without
 //! the notice would not satisfy the licence.
+//!
+//! The folder PNGs are the Yaru icon theme's, which is CC-BY-SA-4.0 rather than
+//! anything in this project's GPL licence. They are aggregated alongside the
+//! code, unmodified, and attributed in the About dialog via
+//! [`YARU_ATTRIBUTION`]; `assets/folders/` holds the notice and the licence.
 
 use std::borrow::Cow;
 
 use gpui::prelude::*;
-use gpui::{AssetSource, ImageSource, Img, Result, Rgba, SharedString, Svg, px, svg};
+use gpui::{AnyElement, AssetSource, ImageSource, Img, Result, Rgba, SharedString, Svg, px, svg};
 
 macro_rules! asset_table {
     ($($name:literal => $path:literal,)*) => {
@@ -55,16 +65,9 @@ asset_table! {
     "icons/edit-undo.svg" => "../assets/icons/edit-undo.svg",
     "icons/emblem-symbolic-link.svg" => "../assets/icons/emblem-symbolic-link.svg",
     "icons/emblem-synchronizing.svg" => "../assets/icons/emblem-synchronizing.svg",
-    "icons/folder.svg" => "../assets/icons/folder.svg",
     "icons/folder-copy.svg" => "../assets/icons/folder-copy.svg",
-    "icons/folder-documents.svg" => "../assets/icons/folder-documents.svg",
-    "icons/folder-download.svg" => "../assets/icons/folder-download.svg",
-    "icons/folder-music.svg" => "../assets/icons/folder-music.svg",
     "icons/folder-new.svg" => "../assets/icons/folder-new.svg",
-    "icons/folder-open.svg" => "../assets/icons/folder-open.svg",
-    "icons/folder-pictures.svg" => "../assets/icons/folder-pictures.svg",
     "icons/folder-upload.svg" => "../assets/icons/folder-upload.svg",
-    "icons/folder-videos.svg" => "../assets/icons/folder-videos.svg",
     "icons/go-down.svg" => "../assets/icons/go-down.svg",
     "icons/go-down-bold.svg" => "../assets/icons/go-down-bold.svg",
     "icons/go-next.svg" => "../assets/icons/go-next.svg",
@@ -97,6 +100,19 @@ asset_table! {
     "icons/window-close.svg" => "../assets/icons/window-close.svg",
     "icons/x-office-document.svg" => "../assets/icons/x-office-document.svg",
 
+    // ── full-colour folders ─────────────────────────────────────────────
+    // PNGs, not SVGs, and that is not a preference. `svg()` renders through
+    // usvg and then keeps only the alpha channel, tinting the silhouette with
+    // one colour — so a filled purple folder drawn as SVG would come out as a
+    // flat blob. `img()` keeps the pixels, which is what these need.
+    "folders/folder.png" => "../assets/folders/folder.png",
+    "folders/folder-documents.png" => "../assets/folders/folder-documents.png",
+    "folders/folder-download.png" => "../assets/folders/folder-download.png",
+    "folders/folder-music.png" => "../assets/folders/folder-music.png",
+    "folders/folder-open.png" => "../assets/folders/folder-open.png",
+    "folders/folder-pictures.png" => "../assets/folders/folder-pictures.png",
+    "folders/folder-videos.png" => "../assets/folders/folder-videos.png",
+
     // ── full-colour file-type artwork ──────────────────────────────────
     "art/apk.svg" => "../assets/art/apk.svg",
     "art/documents.svg" => "../assets/art/documents.svg",
@@ -114,6 +130,16 @@ asset_table! {
 /// files ship inside the binary; the same notice is installed by the release
 /// tarball and the AUR package. The About dialog renders this.
 pub const LUCIDE_LICENSE: &str = include_str!("../assets/icons/LICENSE");
+
+/// Attribution for the embedded Yaru folder PNGs.
+///
+/// CC-BY-SA-4.0 requires the credit to accompany the work, not the whole legal
+/// text, so this is the notice and `assets/folders/LICENSE` holds the licence
+/// itself. A binary embedding these PNGs is a copy of them.
+pub const YARU_ATTRIBUTION: &str = "\
+Folder icons from the Yaru icon theme (https://github.com/ubuntu/yaru), \
+copyright 2018 Sam Hewitt, derived from Adwaita (Red Hat, Inc. and Canonical \
+Ltd). Used under CC-BY-SA-4.0; the licence is in assets/folders/LICENSE.";
 
 /// Serves [`ASSETS`] to GPUI. Installed on the [`gpui::Application`] in `main`.
 pub struct AdbShareAssets;
@@ -165,6 +191,20 @@ pub mod names {
         pub const ZIP: &str = "art/zip.svg";
     }
 
+    /// Full-colour folder artwork, drawn through [`artwork`] rather than
+    /// [`icon`]. These are the same Yaru folders the desktop shows, so a
+    /// directory looks in this window like it looks everywhere else on the
+    /// system. `folder_icon_for` picks between them by name.
+    pub mod folders {
+        pub const FOLDER: &str = "folders/folder.png";
+        pub const DOCUMENTS: &str = "folders/folder-documents.png";
+        pub const DOWNLOAD: &str = "folders/folder-download.png";
+        pub const MUSIC: &str = "folders/folder-music.png";
+        pub const OPEN: &str = "folders/folder-open.png";
+        pub const PICTURES: &str = "folders/folder-pictures.png";
+        pub const VIDEOS: &str = "folders/folder-videos.png";
+    }
+
     pub const AUDIO_GENERIC: &str = "icons/audio-x-generic.svg";
     pub const CAMERA_PHOTO: &str = "icons/camera-photo.svg";
     pub const CHECKBOX_CHECKED: &str = "icons/checkbox-checked.svg";
@@ -186,15 +226,8 @@ pub mod names {
     pub const EDIT_UNDO: &str = "icons/edit-undo.svg";
     pub const EMBLEM_SYNC: &str = "icons/emblem-synchronizing.svg";
     pub const FILE_MANAGER: &str = "icons/system-file-manager.svg";
-    pub const FOLDER: &str = "icons/folder.svg";
-    pub const FOLDER_DOCUMENTS: &str = "icons/folder-documents.svg";
-    pub const FOLDER_DOWNLOAD: &str = "icons/folder-download.svg";
-    pub const FOLDER_MUSIC: &str = "icons/folder-music.svg";
     pub const FOLDER_NEW: &str = "icons/folder-new.svg";
-    pub const FOLDER_OPEN: &str = "icons/folder-open.svg";
-    pub const FOLDER_PICTURES: &str = "icons/folder-pictures.svg";
     pub const FOLDER_UPLOAD: &str = "icons/folder-upload.svg";
-    pub const FOLDER_VIDEOS: &str = "icons/folder-videos.svg";
     pub const GO_NEXT: &str = "icons/go-next.svg";
     pub const GO_PREVIOUS: &str = "icons/go-previous.svg";
     pub const GO_UP: &str = "icons/go-up.svg";
@@ -243,4 +276,18 @@ pub fn artwork(key: &'static str, size: f32) -> Img {
     gpui::img(ImageSource::from(SharedString::from(key)))
         .size(px(size))
         .object_fit(gpui::ObjectFit::Contain)
+}
+
+/// Draw an icon by asset key, picking the right pipeline for the file.
+///
+/// `icon()` throws away an SVG's colour and tints its silhouette, which is right
+/// for line art and wrong for the filled folder PNGs, so those need `artwork()`.
+/// Every call site that can receive either goes through here, because handing a
+/// PNG to `icon()` renders a blank square rather than failing.
+pub fn icon_or_art(key: &'static str, size: f32, color: Rgba) -> AnyElement {
+    if key.ends_with(".png") {
+        artwork(key, size).into_any_element()
+    } else {
+        icon(key, size, color).into_any_element()
+    }
 }

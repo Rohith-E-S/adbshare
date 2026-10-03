@@ -336,7 +336,7 @@ pub fn menu_row(
         .text_color(fg)
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
         .when_some(icon.map(|i| (i, fg)), |d, (icon, color)| {
-            d.child(icons::icon(icon, 15.0, color))
+            d.child(icons::icon_or_art(icon, 15.0, color))
         })
         .child(label.to_string())
         .on_click(on_click)
@@ -371,7 +371,7 @@ pub fn menu_check(
         .text_sm()
         .text_color(t.text_secondary)
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
-        .child(icons::icon(
+        .child(icons::icon_or_art(
             icon,
             15.0,
             if checked {

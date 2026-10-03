@@ -70,13 +70,26 @@ and no theme type of its own, so that stylesheet's palette and geometry
 now live in `theme.rs` as tokens, its repeated components as small
 builders in `ui.rs`, and its icons as an embedded SVG set in `icons.rs`.
 
-The icons are 61 Lucide SVGs on a 24x24 grid with a 2px stroke, vendored
+The icons are Lucide SVGs on a 24x24 grid with a 2px stroke, vendored
 by `crates/adb-gui/tools/fetch_icons.py` under the GTK build's semantic
-names (`folder-download.svg` is Lucide's `folder-down`), so call sites
-still read as intent. The file chooser goes through `ashpd` — the XDG
-desktop portal — rather than GTK4's `FileChooserNative`, which under
-Wayland was itself a portal client. See `crates/adb-gui/assets/icons/LICENSE`
-for Lucide's ISC notice.
+names, so call sites still read as intent. The file chooser goes through
+`ashpd` — the XDG desktop portal — rather than GTK4's `FileChooserNative`,
+which under Wayland was itself a portal client.
+
+Directories are the exception: they use the Yaru icon theme's full-colour
+folders, the same artwork the desktop file manager draws, vendored as PNGs
+under `assets/folders/`. They have to be raster. GPUI's `svg()` renders
+through `usvg` and then keeps only the alpha channel, tinting the silhouette
+with one colour — correct for line art, but it turns a filled purple folder
+into a flat blob. `img()` keeps the pixels. `icons::icon_or_art` picks
+between the two so no call site can hand a PNG to the SVG path and get a
+blank square.
+
+Two sets of third-party assets therefore travel with the binary, under
+different licences. See `assets/icons/LICENSE` for Lucide's ISC notice and
+`assets/folders/` for the Yaru notice; the Yaru icons are CC-BY-SA-4.0,
+aggregated alongside the code rather than merged into it, and attributed in
+the About dialog.
 
 ## Wire protocol summary
 

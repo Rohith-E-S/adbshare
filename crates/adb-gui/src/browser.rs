@@ -1786,26 +1786,30 @@ fn rubber_band(browser: &Browser, t: &theme::Palette) -> Option<AnyElement> {
     )
 }
 
-/// The folder glyph for a directory, chosen by name where that reads better than
-/// a plain folder.
-fn folder_icon_for(entry: &DirEntry) -> &'static str {
+/// The full-colour folder for a directory, chosen by name where that reads
+/// better than a plain folder.
+///
+/// These are drawn through [`icons::artwork`], not [`icons::icon`]: gpui's
+/// `svg()` keeps only a silhouette's alpha channel and tints it, so the desktop
+/// folder would come out a featureless blob. See the note on the asset table.
+fn folder_art_for(entry: &DirEntry) -> &'static str {
     let lower = entry.name.to_lowercase();
     if lower == "documents" || lower == "document" {
-        names::FOLDER_DOCUMENTS
+        names::folders::DOCUMENTS
     } else if lower == "downloads" || lower == "download" {
-        names::FOLDER_DOWNLOAD
+        names::folders::DOWNLOAD
     } else if lower == "music" {
-        names::FOLDER_MUSIC
+        names::folders::MUSIC
     } else if lower == "videos" || lower == "movies" || lower == "video" {
-        names::FOLDER_VIDEOS
+        names::folders::VIDEOS
     } else if lower.contains("screenshot")
         || lower.contains("camera")
         || lower == "dcim"
         || lower == "pictures"
     {
-        names::FOLDER_PICTURES
+        names::folders::PICTURES
     } else {
-        names::FOLDER
+        names::folders::FOLDER
     }
 }
 
@@ -1872,11 +1876,9 @@ impl Browser {
         });
     }
 
-    /// The monochrome glyph for an entry.
+    /// The monochrome glyph for a file. Folders never reach here: they are drawn
+    /// full-colour by [`folder_art_for`].
     fn glyph_for(&self, entry: &DirEntry) -> &'static str {
-        if entry.looks_like_dir() {
-            return folder_icon_for(entry);
-        }
         match entry.ext().as_str() {
             "txt" | "log" | "json" | "xml" => names::TEXT_GENERIC,
             "png" | "jpg" | "jpeg" | "webp" | "gif" => names::IMAGE_GENERIC,
@@ -1974,13 +1976,12 @@ impl Browser {
             Some(art) if !entry.looks_like_dir() => {
                 icons::artwork(art, icon_size).into_any_element()
             }
+            _ if entry.looks_like_dir() => {
+                icons::artwork(folder_art_for(&entry), icon_size).into_any_element()
+            }
             _ => icons::icon(
                 self.glyph_for(&entry),
-                if entry.looks_like_dir() {
-                    icon_size
-                } else {
-                    icon_size * 0.9
-                },
+                icon_size * 0.9,
                 if selected { t.text_header } else { t.text_dim },
             )
             .into_any_element(),
@@ -2114,11 +2115,16 @@ impl Browser {
             .when(selected, |d| d.bg(t.hover))
             .when(focused && !selected, |d| d.bg(t.hover))
             .hover(|d| d.bg(if selected { t.pressed } else { t.hover }))
-            .child(icons::icon(
-                self.glyph_for(&entry),
-                15.0,
-                if selected { t.text_header } else { t.text_dim },
-            ))
+            .child(if entry.looks_like_dir() {
+                icons::artwork(folder_art_for(&entry), 18.0).into_any_element()
+            } else {
+                icons::icon(
+                    self.glyph_for(&entry),
+                    15.0,
+                    if selected { t.text_header } else { t.text_dim },
+                )
+                .into_any_element()
+            })
             .child(
                 div()
                     .flex_1()
@@ -2756,29 +2762,42 @@ mod tests {
     // ── Icon mapping ───────────────────────────────────────────────────────
 
     #[test]
-    fn folders_get_a_variant_glyph_by_name() {
-        assert_eq!(
-            folder_icon_for(&entry("Documents", true)),
-            names::FOLDER_DOCUMENTS
-        );
-        assert_eq!(
-            folder_icon_for(&entry("Downloads", true)),
-            names::FOLDER_DOWNLOAD
-        );
-        assert_eq!(folder_icon_for(&entry("Music", true)), names::FOLDER_MUSIC);
-        assert_eq!(
-            folder_icon_for(&entry("Videos", true)),
-            names::FOLDER_VIDEOS
-        );
-        assert_eq!(
-            folder_icon_for(&entry("DCIM", true)),
-            names::FOLDER_PICTURES
-        );
-        assert_eq!(
-            folder_icon_for(&entry("Screenshots", true)),
-            names::FOLDER_PICTURES
-        );
-        assert_eq!(folder_icon_for(&entry("random", true)), names::FOLDER);
+    fn folders_get_a_variant_by_name() {
+        use crate::icons::names::folders;
+        for (name, expected) in [
+            ("Documents", folders::DOCUMENTS),
+            ("Downloads", folders::DOWNLOAD),
+            ("Music", folders::MUSIC),
+            ("Videos", folders::VIDEOS),
+            ("DCIM", folders::PICTURES),
+            ("Screenshots", folders::PICTURES),
+            ("random", folders::FOLDER),
+        ] {
+            assert_eq!(folder_art_for(&entry(name, true)), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_folder_asset_is_actually_embedded() {
+        // A typo in a name here would render nothing at all, and `img()` fails
+        // silently — so assert each key resolves to real bytes.
+        use crate::icons::names::folders;
+        for key in [
+            folders::FOLDER,
+            folders::DOCUMENTS,
+            folders::DOWNLOAD,
+            folders::MUSIC,
+            folders::OPEN,
+            folders::PICTURES,
+            folders::VIDEOS,
+        ] {
+            let found = crate::icons::ASSETS.iter().find(|(name, _)| *name == key);
+            assert!(found.is_some(), "{key} is not in the asset table");
+            assert!(
+                found.unwrap().1.starts_with(b"\x89PNG"),
+                "{key} is not a PNG, so artwork() would not decode it"
+            );
+        }
     }
 
     #[test]
@@ -2809,10 +2828,9 @@ mod tests {
         // The icon constants already carry their full asset key, so this is just
         // the list of what the browser can ask for.
         let mut referenced: Vec<&str> = vec![
-            folder_icon_for(&entry("x", true)),
+            folder_art_for(&entry("x", true)),
             names::PHONE,
             names::DRIVE_HARDDISK,
-            names::FOLDER,
             names::TEXT_GENERIC,
             names::IMAGE_GENERIC,
             names::AUDIO_GENERIC,

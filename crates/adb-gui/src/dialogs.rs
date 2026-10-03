@@ -1266,13 +1266,17 @@ where
             detail_table(t, rows, 76.0),
             // The ISC notice for the embedded Lucide icons, rendered rather than
             // just named: the licence requires the notice to accompany the
-            // work, and a binary that embeds 61 SVGs is a copy of them.
+            // work, and a binary that embeds 61 SVGs is a copy of them. The
+            // Yaru folders are CC-BY-SA-4.0, which asks for the credit; the
+            // licence text itself is 400-odd lines and stays in the repo.
             div()
                 .px(px(18.0))
                 .pb(px(12.0))
                 .text_size(px(9.0))
                 .font_family(theme::MONO)
                 .text_color(t.text_muted)
+                .child(icons::YARU_ATTRIBUTION)
+                .child("\n\n")
                 .child(icons::LUCIDE_LICENSE.trim())
                 .into_any_element(),
             buttons(

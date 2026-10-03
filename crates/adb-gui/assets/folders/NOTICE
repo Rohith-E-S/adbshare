@@ -1,0 +1,26 @@
+The folder PNGs in this directory are from the Yaru icon theme
+(https://github.com/ubuntu/yaru), taken from the `Yaru-purple` variant at
+48x48@2x. They are the same artwork the desktop file manager shows, so a
+directory looks the same in adbshare as it does everywhere else.
+
+Upstream states:
+
+  The Yaru icon assets (any and all source `.svg` files or rendered `.png`
+  files) are licensed under the terms of the Creative Commons
+  Attribution-ShareAlike 4.0 License.
+
+  Copyright 2018 Sam Hewitt. Derived from Adwaita (GNOME), copyright Red Hat,
+  Inc. and Canonical Ltd.
+
+The full licence text is in LICENSE beside this file.
+
+These files are unmodified and are *not* covered by this project's GPL-3.0
+licence: they remain CC-BY-SA-4.0. They are aggregated alongside the code
+rather than merged into it, so distributing this directory does not place the
+rest of adbshare under ShareAlike. If that is not the intent, replace this
+directory with artwork of your own; `names::folders` in `src/icons.rs` is the
+only thing that names these files.
+
+Why PNG and not SVG: gpui 0.2's `svg()` renders with usvg and then keeps only
+the alpha channel, tinting the silhouette with a single colour. These are
+filled, so as SVG they would come out as flat blobs. `img()` keeps the pixels.

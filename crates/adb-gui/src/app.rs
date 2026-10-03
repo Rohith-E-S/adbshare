@@ -149,11 +149,11 @@ impl Layout {
 /// The phone folder shortcuts offered in the sidebar.
 const PHONE_PLACES: &[(&str, &str, &str)] = &[
     ("Internal storage", names::PHONE, "/sdcard"),
-    ("Download", names::FOLDER_DOWNLOAD, "/sdcard/Download"),
+    ("Download", names::folders::DOWNLOAD, "/sdcard/Download"),
     ("Camera", names::CAMERA_PHOTO, "/sdcard/DCIM"),
-    ("Pictures", names::FOLDER_PICTURES, "/sdcard/Pictures"),
-    ("Music", names::FOLDER_MUSIC, "/sdcard/Music"),
-    ("Documents", names::FOLDER_DOCUMENTS, "/sdcard/Documents"),
+    ("Pictures", names::folders::PICTURES, "/sdcard/Pictures"),
+    ("Music", names::folders::MUSIC, "/sdcard/Music"),
+    ("Documents", names::folders::DOCUMENTS, "/sdcard/Documents"),
 ];
 
 pub struct AdbShareApp {
@@ -2468,7 +2468,7 @@ impl AdbShareApp {
             if entry.looks_like_dir() {
                 items.push(MenuItem::with_icon(
                     "open-folder",
-                    names::FOLDER_OPEN,
+                    names::folders::OPEN,
                     "Open",
                     Some("Return"),
                 ));
@@ -3297,7 +3297,7 @@ impl AdbShareApp {
         rows.push(ui::section_heading("This computer", t).into_any_element());
         for (label, icon, kind) in [
             ("Home", names::HOME, LocalPlace::Home),
-            ("Downloads", names::FOLDER_DOWNLOAD, LocalPlace::Downloads),
+            ("Downloads", names::folders::DOWNLOAD, LocalPlace::Downloads),
             ("Trash", names::TRASH, LocalPlace::Trash),
         ] {
             rows.push(
@@ -3514,7 +3514,7 @@ fn place_row(
         })
         .bg(if active { t.hover } else { rgba(0x00000000) })
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
-        .child(icons::icon(
+        .child(icons::icon_or_art(
             icon,
             16.0,
             if active { t.text_header } else { t.text_muted },
