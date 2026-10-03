@@ -1,0 +1,63 @@
+# cargo-audit configuration — the triage record for this dependency tree.
+#
+# Every ID in `advisories.ignore` is a finding that was investigated and judged
+# not actionable here, with the reasoning kept next to it so the next person does
+# not have to re-derive it. Nothing else is suppressed: `[output] deny` below
+# makes a new vulnerability or a new unsound advisory fail the build, so this
+# list is the complete record of accepted risk and cannot grow quietly.
+#
+# `unmaintained` advisories are deliberately NOT denied. The crates carrying them
+# are transitive dependencies of gpui that we do not control, and the set churns
+# whenever gpui moves; denying them would mean re-triaging on every bump to learn
+# nothing. They still print on every `cargo audit` run.
+#
+# Re-run `cargo audit` after touching any dependency. `--locked` in CI means the
+# lockfile is what gets checked, so a version bump cannot slip past unreviewed.
+
+[advisories]
+ignore = [
+  # rsa 0.9.10 — "Marvin Attack" (CVE-2023-49092, GHSA-c38w-74pg-36hr).
+  #
+  # No patched release exists. The advisory sets `patched = []` deliberately:
+  # the crypto-bigint migration did not close it and PKCS#1 v1.5 padding is
+  # still not constant-time (RustCrypto/RSA#626). rsa 0.10.0-rc.18 is affected
+  # too, so there is no version to upgrade to.
+  #
+  # We cannot drop the crate either: ADB authentication is defined as
+  # RSA-2048 PKCS#1 v1.5 SHA-1 signing of a device-supplied challenge
+  # (crates/adb-device/src/auth.rs). Removing RSA breaks USB *and* wireless
+  # pairing, which is the whole product.
+  #
+  # The advisory's own guidance is to avoid the crate "in settings where
+  # attackers can observe timing, for example over the network. Local use on a
+  # non-compromised computer is fine." That is the case here: the key is
+  # generated on the user's machine and kept at
+  # $XDG_DATA_HOME/adbshare/adb_key.pkcs8, and signing happens locally with the
+  # paired phone as the only peer. An attacker who can time the local signing
+  # operation has already won the machine.
+  #
+  # Revisit when rsa ships constant-time padding or implicit rejection.
+  "RUSTSEC-2023-0071",
+
+  # git2 0.20.4 — undefined behaviour in Remote::list() (RUSTSEC-2026-0183) and
+  # in a BlameHunk signature built from a buffer (RUSTSEC-2026-0184).
+  #
+  # git2 is a dev-dependency-only transitive dep and adb-gui calls none of it.
+  # It arrives via gpui_util's `test-support` feature, which is switched on only
+  # by the `[dev-dependencies] gpui` entry that carries "test-support" for the
+  # GPUI windowing tests. `cargo tree -i git2 --edges normal` prints nothing, so
+  # git2 is not in the runtime graph and is never linked into the shipped
+  # adb-gui/adb-daemon binaries; the affected code cannot execute.
+  #
+  # Both advisories concern libgit2's blame and remote-listing code, which the
+  # GPUI tests do not reach either.
+  "RUSTSEC-2026-0183",
+  "RUSTSEC-2026-0184",
+]
+
+[output]
+# Unsound crates are memory-safety bugs, so they are treated as build-failing
+# rather than as noise. git2's two findings are ignored above with
+# justification; a new one will break the build and get triaged.
+deny = ["unsound"]
+quiet = false

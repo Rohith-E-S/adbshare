@@ -15,8 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    FUSE_ROOT_ID, FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, OpenFlags as FOpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    WriteFlags,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -59,10 +61,10 @@ pub struct Adbfs {
     /// Recent directory listings, so a continued `readdir` does not re-list
     /// the whole directory over ADB.
     dir_cache: DirCache,
-    ino_to_path: Mutex<HashMap<u64, PathBuf>>,
-    path_to_ino: Mutex<HashMap<PathBuf, u64>>,
+    ino_to_path: Mutex<HashMap<INodeNo, PathBuf>>,
+    path_to_ino: Mutex<HashMap<PathBuf, INodeNo>>,
     next_ino: AtomicU64,
-    open_files: Mutex<HashMap<u64, OpenFile>>,
+    open_files: Mutex<HashMap<FileHandle, OpenFile>>,
     next_fh: AtomicU64,
 }
 
@@ -281,8 +283,8 @@ impl Adbfs {
     fn with_proxy(proxy: SyncProxy) -> Self {
         let mut ino_to_path = HashMap::new();
         let mut path_to_ino = HashMap::new();
-        ino_to_path.insert(FUSE_ROOT_ID, PathBuf::from("/"));
-        path_to_ino.insert(PathBuf::from("/"), FUSE_ROOT_ID);
+        ino_to_path.insert(INodeNo::ROOT, PathBuf::from("/"));
+        path_to_ino.insert(PathBuf::from("/"), INodeNo::ROOT);
         Self {
             proxy,
             cache: StatCache::new(TTL),
@@ -328,18 +330,18 @@ impl Adbfs {
         }
     }
 
-    fn ino_for(&self, path: PathBuf) -> u64 {
+    fn ino_for(&self, path: PathBuf) -> INodeNo {
         let mut p2i = self.path_to_ino.lock();
         if let Some(&ino) = p2i.get(&path) {
             return ino;
         }
-        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+        let ino = INodeNo(self.next_ino.fetch_add(1, Ordering::Relaxed));
         p2i.insert(path.clone(), ino);
         self.ino_to_path.lock().insert(ino, path);
         ino
     }
 
-    fn attr_from_stat(&self, ino: u64, stat: Stat) -> FileAttr {
+    fn attr_from_stat(&self, ino: INodeNo, stat: Stat) -> FileAttr {
         let kind = Self::kind_from_mode(&stat.mode);
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.mtime.max(0) as u64);
         let atime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.atime.max(0) as u64);
@@ -373,7 +375,7 @@ impl Adbfs {
         }
     }
 
-    fn resolve_child(&self, parent: u64, name: &OsStr) -> Option<PathBuf> {
+    fn resolve_child(&self, parent: INodeNo, name: &OsStr) -> Option<PathBuf> {
         let parent_path = self.ino_to_path.lock().get(&parent).cloned()?;
         let mut p = parent_path;
         p.push(name);
@@ -386,7 +388,7 @@ impl Adbfs {
     /// then are its stats worth caching: the snapshot a cache hit serves is
     /// already up to a TTL old, and re-stamping it would keep answering with
     /// it for another TTL on top of that.
-    fn adopt_listing_entry(&self, parent: &Path, entry: &DirEntry, fresh: bool) -> u64 {
+    fn adopt_listing_entry(&self, parent: &Path, entry: &DirEntry, fresh: bool) -> INodeNo {
         let mut child_path = parent.to_path_buf();
         child_path.push(OsStr::from_bytes(entry.name.as_bytes()));
         let ino = self.ino_for(child_path.clone());
@@ -396,33 +398,33 @@ impl Adbfs {
         ino
     }
 
-    fn proxy_to_errno(e: ProxyError) -> i32 {
+    fn proxy_to_errno(e: ProxyError) -> Errno {
         match e {
-            ProxyError::Status(Status::NotFound, _) => libc::ENOENT,
-            ProxyError::Status(Status::PermissionDenied, _) => libc::EACCES,
-            ProxyError::Status(Status::IsDir, _) => libc::EISDIR,
-            ProxyError::Status(Status::NotDir, _) => libc::ENOTDIR,
-            ProxyError::Status(Status::Exists, _) => libc::EEXIST,
-            ProxyError::Status(Status::NotEmpty, _) => libc::ENOTEMPTY,
-            ProxyError::Status(Status::NoSpace, _) => libc::ENOSPC,
-            ProxyError::Status(Status::NameTooLong, _) => libc::ENAMETOOLONG,
-            ProxyError::Status(Status::InvalidArg, _) => libc::EINVAL,
-            _ => libc::EIO,
+            ProxyError::Status(Status::NotFound, _) => Errno::ENOENT,
+            ProxyError::Status(Status::PermissionDenied, _) => Errno::EACCES,
+            ProxyError::Status(Status::IsDir, _) => Errno::EISDIR,
+            ProxyError::Status(Status::NotDir, _) => Errno::ENOTDIR,
+            ProxyError::Status(Status::Exists, _) => Errno::EEXIST,
+            ProxyError::Status(Status::NotEmpty, _) => Errno::ENOTEMPTY,
+            ProxyError::Status(Status::NoSpace, _) => Errno::ENOSPC,
+            ProxyError::Status(Status::NameTooLong, _) => Errno::ENAMETOOLONG,
+            ProxyError::Status(Status::InvalidArg, _) => Errno::EINVAL,
+            _ => Errno::EIO,
         }
     }
 }
 
 impl Filesystem for Adbfs {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         let res = self.proxy.stat(&path_str);
@@ -431,19 +433,19 @@ impl Filesystem for Adbfs {
                 self.cache.put(path.clone(), stat);
                 let ino = self.ino_for(path);
                 let attr = self.attr_from_stat(ino, stat);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
             }
-            Err(ProxyError::Status(Status::NotFound, _)) => reply.error(libc::ENOENT),
+            Err(ProxyError::Status(Status::NotFound, _)) => reply.error(Errno::ENOENT),
             Err(e) => reply.error(Self::proxy_to_errno(e)),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
@@ -453,7 +455,7 @@ impl Filesystem for Adbfs {
             return;
         }
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         let res = self.proxy.stat(&path_str);
@@ -468,23 +470,23 @@ impl Filesystem for Adbfs {
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         // FUSE walks a directory in as many `readdir` calls as the consumer
@@ -509,88 +511,88 @@ impl Filesystem for Adbfs {
                 }
             }
         };
-        let mut cur = offset.max(0) as usize;
+        let mut cur = offset as usize;
         if cur == 0 {
             let _ = reply.add(ino, 1, FileType::Directory, ".");
             cur = 1;
         }
-        // NOTE: `..` is advertised with FUSE_ROOT_ID, not the real parent
+        // NOTE: `..` is advertised with the root inode, not the real parent
         // inode. The kernel resolves parents through its own dentry cache,
         // so this works in practice; reworking parent inode tracking is a
         // separate change.
         if cur == 1 {
-            let _ = reply.add(FUSE_ROOT_ID, 2, FileType::Directory, "..");
+            let _ = reply.add(INodeNo::ROOT, 2, FileType::Directory, "..");
             cur = 2;
         }
         for (n, entry) in entries.iter().enumerate().skip(cur.saturating_sub(2)) {
             let child_ino = self.adopt_listing_entry(&path, entry, fresh);
             let kind = Self::kind_from_mode(&entry.stat.mode);
-            let _ = reply.add(child_ino, (n as i64) + 3, kind, &entry.name);
+            let _ = reply.add(child_ino, (n as u64) + 3, kind, &entry.name);
         }
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: FOpenFlags, reply: ReplyOpen) {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         let mut oflags = OpenFlags::READ;
-        if flags & libc::O_WRONLY != 0 {
+        if flags.0 & libc::O_WRONLY != 0 {
             oflags = OpenFlags::WRITE;
         }
-        if flags & libc::O_RDWR != 0 {
+        if flags.0 & libc::O_RDWR != 0 {
             oflags = OpenFlags::READ | OpenFlags::WRITE;
         }
-        if flags & libc::O_CREAT != 0 {
+        if flags.0 & libc::O_CREAT != 0 {
             oflags |= OpenFlags::CREATE;
         }
-        if flags & libc::O_TRUNC != 0 {
+        if flags.0 & libc::O_TRUNC != 0 {
             oflags |= OpenFlags::TRUNC;
         }
-        if flags & libc::O_APPEND != 0 {
+        if flags.0 & libc::O_APPEND != 0 {
             oflags |= OpenFlags::APPEND;
         }
         let mode = 0o644;
         let res = self.proxy.open(&path_str, oflags, mode);
         match res {
             Ok(file) => {
-                let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+                let fh = FileHandle(self.next_fh.fetch_add(1, Ordering::Relaxed));
                 self.open_files.lock().insert(fh, OpenFile { proxy: file });
-                reply.opened(fh, 0);
+                reply.opened(fh, FopenFlags::empty());
             }
             Err(e) => reply.error(Self::proxy_to_errno(e)),
         }
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: FOpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
         let file = { self.open_files.lock().get(&fh).map(|f| f.proxy.clone()) };
         let file = match file {
             Some(f) => f,
             None => {
-                reply.error(libc::EBADF);
+                reply.error(Errno::EBADF);
                 return;
             }
         };
-        let res = self.proxy.read_at(file, offset as u64, size);
+        let res = self.proxy.read_at(file, offset, size);
         match res {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(Self::proxy_to_errno(e)),
@@ -598,26 +600,26 @@ impl Filesystem for Adbfs {
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: FOpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         let file = { self.open_files.lock().get(&fh).map(|f| f.proxy.clone()) };
         let file = match file {
             Some(f) => f,
             None => {
-                reply.error(libc::EBADF);
+                reply.error(Errno::EBADF);
                 return;
             }
         };
-        let res = self.proxy.write_at(file, offset as u64, data.to_vec());
+        let res = self.proxy.write_at(file, offset, data.to_vec());
         match res {
             Ok(()) => {
                 if let Some(path) = self.ino_to_path.lock().get(&ino) {
@@ -634,12 +636,12 @@ impl Filesystem for Adbfs {
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: FOpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
@@ -653,9 +655,9 @@ impl Filesystem for Adbfs {
     }
 
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -665,12 +667,12 @@ impl Filesystem for Adbfs {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         let mut oflags = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE;
@@ -683,7 +685,7 @@ impl Filesystem for Adbfs {
         let res = self.proxy.open(&path_str, oflags, mode);
         match res {
             Ok(file) => {
-                let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+                let fh = FileHandle(self.next_fh.fetch_add(1, Ordering::Relaxed));
                 self.open_files.lock().insert(fh, OpenFile { proxy: file });
                 let ino = self.ino_for(path.clone());
                 let stat = self.proxy.stat(&path_str).unwrap_or(Stat {
@@ -701,16 +703,16 @@ impl Filesystem for Adbfs {
                 self.invalidate_parent_listing(&path);
                 self.cache.put(path, stat);
                 let attr = self.attr_from_stat(ino, stat);
-                reply.created(&TTL, &attr, 0, fh, 0);
+                reply.created(&TTL, &attr, Generation(0), fh, FopenFlags::empty());
             }
             Err(e) => reply.error(Self::proxy_to_errno(e)),
         }
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -719,12 +721,12 @@ impl Filesystem for Adbfs {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         match self.proxy.mkdir(&path_str, mode) {
@@ -745,22 +747,22 @@ impl Filesystem for Adbfs {
                 self.invalidate_parent_listing(&path);
                 self.cache.put(path, stat);
                 let attr = self.attr_from_stat(ino, stat);
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
             }
             Err(e) => reply.error(Self::proxy_to_errno(e)),
         }
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         match self.proxy.unlink(&path_str) {
@@ -773,16 +775,16 @@ impl Filesystem for Adbfs {
         }
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         match self.proxy.rmdir(&path_str) {
@@ -799,35 +801,35 @@ impl Filesystem for Adbfs {
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let src = match self.resolve_child(parent, name) {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let dst = match self.resolve_child(newparent, newname) {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(src_str) = path_to_string(&src) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         let Some(dst_str) = path_to_string(&dst) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         // Was src a directory? Ask *before* the rename, while src still exists;
@@ -861,7 +863,7 @@ impl Filesystem for Adbfs {
                         i2p.remove(&dst_ino);
                     }
 
-                    let mut moved: Vec<(u64, PathBuf)> = Vec::new();
+                    let mut moved: Vec<(INodeNo, PathBuf)> = Vec::new();
                     if let Some(ino) = p2i.remove(&src) {
                         moved.push((ino, dst.clone()));
                     }
@@ -894,9 +896,9 @@ impl Filesystem for Adbfs {
     }
 
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -904,23 +906,23 @@ impl Filesystem for Adbfs {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                reply.error(Errno::EINVAL);
                 return;
             }
         };
         let Some(path_str) = path_to_string(&path) else {
-            reply.error(libc::EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         };
         if let Some(s) = size {
@@ -937,7 +939,7 @@ impl Filesystem for Adbfs {
             // The proxy protocol has no chmod/chown/utimens ops. Fail
             // loudly instead of silently accepting and losing the change;
             // adding protocol support is a follow-up.
-            reply.error(libc::ENOSYS);
+            reply.error(Errno::ENOSYS);
             return;
         }
         match self.proxy.stat(&path_str) {
@@ -950,7 +952,7 @@ impl Filesystem for Adbfs {
         }
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
         let _ = ino;
         // The proxy protocol has no statfs op, so report large practical
         // values the way network filesystems commonly do. Adding a real
@@ -1160,7 +1162,7 @@ mod tests {
         let ino = fs.adopt_listing_entry(Path::new("/sdcard"), &fresh[0], true);
 
         assert!(
-            ino > FUSE_ROOT_ID,
+            ino > INodeNo::ROOT,
             "the entry was given an inode of its own"
         );
         assert_eq!(

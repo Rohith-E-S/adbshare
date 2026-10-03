@@ -202,11 +202,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # RustSec advisory check against Cargo.lock: flags known
-      # vulnerabilities and unmaintained crates in the dependency tree.
-      # Advisory until the current findings (if any) are triaged.
-      - name: Dependency audit (advisory)
+      # RustSec advisory check against Cargo.lock. Blocking now that the
+      # dependency tree has been triaged: `.cargo/audit.toml` records every
+      # finding that was investigated and accepted (rsa's unpatched Marvin
+      # advisory, which the ADB signing protocol makes unavoidable, and two
+      # git2 unsound advisories reachable only through gpui's dev-only
+      # test-support feature). That file also sets `deny = ["unsound"]`, so a
+      # new vulnerability or a new unsound advisory fails this job and has to
+      # be triaged rather than absorbed. `unmaintained` stays advisory: those
+      # crates are upstream gpui transitive deps whose set churns per release.
+      - name: Dependency audit
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
