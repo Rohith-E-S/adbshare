@@ -2403,21 +2403,18 @@ impl AdbShareApp {
             ),
             MenuItem::action("select-all", "Select all").shortcut("Ctrl+A"),
             MenuItem::Separator,
-            MenuItem::with_icon(
-                "upload",
-                names::FOLDER_UPLOAD,
-                "Send to phone…",
-                Some("Ctrl+U"),
-            ),
+            MenuItem::with_icon("upload", names::SEND_TO, "Send to phone…", Some("Ctrl+U")),
             MenuItem::with_icon(
                 "upload-folder",
-                names::FOLDER_SEND,
+                // The folder variant takes the folder glyph, so it does not put
+                // a second paper plane next to "Send to phone…" above it.
+                names::FOLDER_UPLOAD,
                 "Send a folder to phone…",
                 None,
             ),
             MenuItem::with_icon(
                 "download",
-                names::FOLDER_DOWNLOAD,
+                names::DOWNLOAD,
                 "Save to computer…",
                 Some("Ctrl+Shift+C"),
             ),
@@ -2488,7 +2485,7 @@ impl AdbShareApp {
         items.push(if has_selection {
             MenuItem::with_icon(
                 "download",
-                names::FOLDER_DOWNLOAD,
+                names::DOWNLOAD,
                 if local {
                     "Copy to Downloads"
                 } else {
@@ -2499,7 +2496,7 @@ impl AdbShareApp {
         } else {
             MenuItem::disabled(
                 "download",
-                names::FOLDER_DOWNLOAD,
+                names::DOWNLOAD,
                 "Save to computer",
                 Some("Ctrl+Shift+C"),
             )
@@ -2674,7 +2671,10 @@ impl AdbShareApp {
                     ui::icon_button_with_hint(
                         t,
                         "upload",
-                        names::FOLDER_UPLOAD,
+                        // A paper plane, not `folder-up`. Paired with a
+                        // `folder-down` next to it the two read as one icon
+                        // mirrored, and a plane is unmistakable at 14px.
+                        names::SEND_TO,
                         theme::CAPSULE_BTN,
                         t.text_dim,
                         "Send to phone (Ctrl+U)",
@@ -2684,7 +2684,7 @@ impl AdbShareApp {
                     ui::icon_button_with_hint(
                         t,
                         "download",
-                        names::FOLDER_DOWNLOAD,
+                        names::DOWNLOAD,
                         theme::CAPSULE_BTN,
                         t.text_dim,
                         "Save to computer (Ctrl+Shift+C)",

@@ -53,7 +53,6 @@ MAPPING = {
     "folder-new": "folder-plus",
     "folder-open": "folder-open",
     "folder-pictures": "image",
-    "folder-send": "send-horizontal",
     "folder-upload": "folder-up",
     "folder-videos": "video",
     "go-down": "chevron-down",
@@ -70,6 +69,7 @@ MAPPING = {
     "package-x-generic": "package",
     "phone": "smartphone",
     "process-stop": "square",
+    # `send-to` was also mapped from `folder-send`; one name for one glyph.
     "send-to": "send-horizontal",
     "sidebar-show": "panel-left",
     "system-file-manager": "folder-search",

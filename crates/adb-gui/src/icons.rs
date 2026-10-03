@@ -63,7 +63,6 @@ asset_table! {
     "icons/folder-new.svg" => "../assets/icons/folder-new.svg",
     "icons/folder-open.svg" => "../assets/icons/folder-open.svg",
     "icons/folder-pictures.svg" => "../assets/icons/folder-pictures.svg",
-    "icons/folder-send.svg" => "../assets/icons/folder-send.svg",
     "icons/folder-upload.svg" => "../assets/icons/folder-upload.svg",
     "icons/folder-videos.svg" => "../assets/icons/folder-videos.svg",
     "icons/go-down.svg" => "../assets/icons/go-down.svg",
@@ -173,6 +172,10 @@ pub mod names {
     pub const DIALOG_INFORMATION: &str = "icons/dialog-information.svg";
     pub const DIALOG_WARNING: &str = "icons/dialog-warning.svg";
     pub const DOCUMENT: &str = "icons/x-office-document.svg";
+    /// Lucide's `download`: an arrow dropping into a tray. The same glyph as
+    /// [`SOFTWARE_INSTALL`], named for the transfer rather than the APK
+    /// install, so a call site reads as what the button does.
+    pub const DOWNLOAD: &str = "icons/system-software-install.svg";
     pub const DOCUMENT_EDIT: &str = "icons/document-edit.svg";
     pub const DOCUMENT_OPEN: &str = "icons/document-open.svg";
     pub const DRIVE_HARDDISK: &str = "icons/drive-harddisk.svg";
@@ -190,7 +193,6 @@ pub mod names {
     pub const FOLDER_NEW: &str = "icons/folder-new.svg";
     pub const FOLDER_OPEN: &str = "icons/folder-open.svg";
     pub const FOLDER_PICTURES: &str = "icons/folder-pictures.svg";
-    pub const FOLDER_SEND: &str = "icons/folder-send.svg";
     pub const FOLDER_UPLOAD: &str = "icons/folder-upload.svg";
     pub const FOLDER_VIDEOS: &str = "icons/folder-videos.svg";
     pub const GO_NEXT: &str = "icons/go-next.svg";
