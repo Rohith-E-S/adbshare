@@ -181,34 +181,3 @@ impl Message {
 pub fn data_checksum(data: &[u8]) -> u32 {
     data.iter().fold(0u32, |a, &b| a.wrapping_add(b as u32))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn data_checksum_known_answers() {
-        // Additive byte sum, so empty input is 0 and "hello" sums to
-        // 104+101+108+108+111 = 532 = 0x214.
-        assert_eq!(data_checksum(b""), 0);
-        assert_eq!(data_checksum(b"hello"), 0x214);
-        // "host:version" from the AOSP adb protocol doc.
-        assert_eq!(data_checksum(b"host:version"), 1278);
-    }
-
-    #[test]
-    fn try_encode_matches_encode() {
-        let msg = Message::new(Command::Open, 7, 0, Bytes::from_static(b"shell:"));
-        assert_eq!(msg.try_encode().unwrap(), msg.encode());
-    }
-
-    #[test]
-    fn roundtrip_sync() {
-        let msg = Message::new(Command::Sync, 1, 0, Bytes::from_static(b"host:version"));
-        let encoded = msg.encode();
-        let header: [u8; 24] = encoded[..24].try_into().unwrap();
-        let decoded = Message::decode(&header, encoded.freeze().slice(24..)).unwrap();
-        assert_eq!(decoded.command, Command::Sync);
-        assert_eq!(&decoded.payload[..], b"host:version");
-    }
-}

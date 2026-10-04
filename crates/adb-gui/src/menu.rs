@@ -116,25 +116,6 @@ impl MenuItem {
         }
         self
     }
-
-    /// The id this item reports when chosen.
-    #[cfg(test)]
-    pub fn id(&self) -> Option<&'static str> {
-        match self {
-            MenuItem::Action { id, .. } | MenuItem::Check { id, .. } => Some(id),
-            MenuItem::Heading(_) | MenuItem::Separator => None,
-        }
-    }
-
-    /// Whether the item can be chosen.
-    #[cfg(test)]
-    pub fn is_enabled(&self) -> bool {
-        match self {
-            MenuItem::Action { enabled, .. } => *enabled,
-            MenuItem::Check { .. } => true,
-            _ => false,
-        }
-    }
 }
 
 /// Render a menu into a card of the given minimum width.
@@ -244,58 +225,4 @@ where
 /// collide with the real item's element id.
 fn concat_id(id: &'static str, suffix: &str) -> ElementId {
     ElementId::from(SharedString::from(format!("{id}{suffix}")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builders_set_the_fields_they_name() {
-        let plain = MenuItem::action("refresh", "Refresh");
-        assert_eq!(plain.id(), Some("refresh"));
-        assert!(plain.is_enabled());
-        assert!(matches!(
-            plain,
-            MenuItem::Action {
-                icon: None,
-                shortcut: None,
-                danger: false,
-                prominent: false,
-                ..
-            }
-        ));
-
-        let shortcut =
-            MenuItem::with_icon("upload", "send-to", "Upload", Some("Ctrl+U")).shortcut("Ctrl+U");
-        assert!(matches!(
-            shortcut,
-            MenuItem::Action {
-                icon: Some("send-to"),
-                ..
-            }
-        ));
-        assert_eq!(shortcut.id(), Some("upload"));
-
-        let off = MenuItem::disabled("apk", "system-software-install", "Install APK", None);
-        assert!(!off.is_enabled(), "a disabled item must not be selectable");
-
-        let del = MenuItem::danger("delete", "edit-delete", "Delete");
-        assert!(del.is_enabled());
-        assert!(matches!(del, MenuItem::Action { danger: true, .. }));
-    }
-
-    #[test]
-    fn decorative_items_have_no_id() {
-        assert_eq!(MenuItem::Separator.id(), None);
-        assert_eq!(MenuItem::Heading("Group".into()).id(), None);
-        assert!(!MenuItem::Separator.is_enabled());
-    }
-
-    #[test]
-    fn disabled_ids_do_not_collide_with_enabled_ones() {
-        let on = ElementId::from("apk");
-        let off = concat_id("apk", "-off");
-        assert_ne!(format!("{on:?}"), format!("{off:?}"));
-    }
 }

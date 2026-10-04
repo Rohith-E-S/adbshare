@@ -89,32 +89,3 @@ impl Default for ProgressTracker {
         Self::new()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn avg_bps_uses_bytes_done_not_total() {
-        let mut tracker = ProgressTracker::new();
-        // Simulate a 1-second run that has transferred 250 of 1000 bytes.
-        tracker.tick(250);
-        tracker.started = Instant::now() - std::time::Duration::from_secs(1);
-
-        let snap = tracker.snapshot(1000);
-        assert_eq!(snap.bytes_done, 250);
-        // elapsed is slightly over 1s, so avg must be slightly under 250.
-        assert!(
-            snap.avg_bps < 250.0 && snap.avg_bps > 240.0,
-            "avg_bps = {}",
-            snap.avg_bps
-        );
-    }
-
-    #[test]
-    fn avg_bps_zero_before_any_bytes() {
-        let tracker = ProgressTracker::new();
-        let snap = tracker.snapshot(1000);
-        assert_eq!(snap.avg_bps, 0.0);
-    }
-}

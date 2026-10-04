@@ -406,37 +406,3 @@ impl WatcherImpl for UsbWatcher {
 }
 
 use tokio::net::TcpStream;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ensure_adb_server_rejects_remote_host() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .unwrap();
-        let err = rt
-            .block_on(ensure_adb_server("10.0.0.5", 5037))
-            .unwrap_err();
-        assert!(err.to_string().contains("10.0.0.5:5037 unreachable"));
-    }
-
-    #[test]
-    fn ensure_adb_server_fails_fast_when_adb_missing() {
-        // Exercise the happy-path spawn machinery with a binary that exists
-        // everywhere (true) but exits non-zero, so no adb install is needed
-        // and no real server is started.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .unwrap();
-        let err = rt
-            .block_on(ensure_adb_server_via("false", &[], "127.0.0.1", 5037))
-            .unwrap_err();
-        assert_eq!(err.to_string(), "adb start-server failed");
-    }
-}

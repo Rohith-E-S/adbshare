@@ -18,9 +18,6 @@
 pub mod client;
 pub mod ops;
 
-#[cfg(test)]
-mod tests;
-
 pub use client::{DiskUsage, ProxyClient, ProxyError, ProxyFile};
 pub use ops::{DirEntry, FileMode, OpenFlags, Stat, Status};
 

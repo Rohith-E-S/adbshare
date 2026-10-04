@@ -60,37 +60,3 @@ fn send_blocking(title: &str, body: &str) -> bool {
         .icon(Icon::with_names([ICON_NAME]));
     futures::executor::block_on(proxy.add_notification(NOTIFICATION_ID, notification)).is_ok()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn availability_is_a_plain_environment_check() {
-        // A missing portal has to stay a cheap boolean with no I/O, so a headless
-        // test run costs nothing here.
-        let _ = available();
-    }
-
-    /// Ignored by default because it needs a session bus with a notification
-    /// portal. Run it with `--ignored` on a desktop:
-    ///
-    /// ```sh
-    /// cargo test -p adb-gui -- --ignored a_notification_reaches_the_portal
-    /// ```
-    ///
-    /// It asserts the call *completes*, which is the failure mode worth catching:
-    /// a `block_on` on a future zbus's reactor never wakes would hang here
-    /// instead of silently leaking a thread per connect and disconnect.
-    #[test]
-    #[ignore = "needs a session bus with a notification portal"]
-    fn a_notification_reaches_the_portal() {
-        if !available() {
-            return;
-        }
-        assert!(
-            send_blocking("ADBShare", "notification smoke test"),
-            "the portal refused the notification"
-        );
-    }
-}

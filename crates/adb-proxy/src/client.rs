@@ -541,34 +541,6 @@ impl ProxyClient {
         res
     }
 
-    pub async fn read_link(&self, path: &str) -> Result<String> {
-        let (conn, _permit) = self.acquire().await?;
-        let res = async {
-            let mut args = Vec::new();
-            args.extend_from_slice(&(path.len() as u32).to_le_bytes());
-            args.extend_from_slice(path.as_bytes());
-            let resp = conn.request(Op::ReadLink, &args).await?;
-            parse_string(&resp)
-        }
-        .await;
-        self.release(conn);
-        res
-    }
-
-    pub async fn real_path(&self, path: &str) -> Result<String> {
-        let (conn, _permit) = self.acquire().await?;
-        let res = async {
-            let mut args = Vec::new();
-            args.extend_from_slice(&(path.len() as u32).to_le_bytes());
-            args.extend_from_slice(path.as_bytes());
-            let resp = conn.request(Op::RealPath, &args).await?;
-            parse_string(&resp)
-        }
-        .await;
-        self.release(conn);
-        res
-    }
-
     /// Filesystem usage for the mount containing `path` (op `DiskUsage` /
     /// `statvfs` on the device). Returns available + total bytes.
     pub async fn disk_usage(&self, path: &str) -> Result<DiskUsage> {
@@ -729,17 +701,6 @@ impl Drop for ProxyFile {
             }
         }
     }
-}
-
-fn parse_string(data: &[u8]) -> Result<String> {
-    if data.len() < 4 {
-        return Err(ProxyError::Invalid("string length prefix".into()));
-    }
-    let len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-    if data.len() - 4 != len {
-        return Err(ProxyError::Invalid("string payload length".into()));
-    }
-    String::from_utf8(data[4..].to_vec()).map_err(|_| ProxyError::Invalid("string utf8".into()))
 }
 
 fn parse_dir_entries(data: &[u8]) -> Result<Vec<DirEntry>> {

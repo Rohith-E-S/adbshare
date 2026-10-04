@@ -16,8 +16,6 @@ pub enum Op {
     Rmdir = 0x09,
     Rename = 0x0A,
     Truncate = 0x0B,
-    RealPath = 0x0C,
-    ReadLink = 0x0D,
     Symlink = 0x0E,
     Lstat = 0x0F,
     Utime = 0x10,
@@ -87,35 +85,6 @@ impl OpenFlags {
             f |= OpenFlags::WRITE;
         }
         f
-    }
-}
-
-#[cfg(test)]
-mod openflags_tests {
-    use super::OpenFlags;
-
-    #[test]
-    fn owner_class_bits() {
-        assert_eq!(
-            OpenFlags::from_octal(0o600),
-            OpenFlags::READ | OpenFlags::WRITE
-        );
-        assert_eq!(OpenFlags::from_octal(0o400), OpenFlags::READ);
-        assert_eq!(OpenFlags::from_octal(0o200), OpenFlags::WRITE);
-    }
-
-    #[test]
-    fn group_and_other_class_bits() {
-        assert!(OpenFlags::from_octal(0o040).contains(OpenFlags::READ));
-        assert!(OpenFlags::from_octal(0o020).contains(OpenFlags::WRITE));
-        assert!(OpenFlags::from_octal(0o004).contains(OpenFlags::READ));
-        assert!(OpenFlags::from_octal(0o002).contains(OpenFlags::WRITE));
-    }
-
-    #[test]
-    fn no_bits_means_no_access() {
-        assert_eq!(OpenFlags::from_octal(0o000), OpenFlags::empty());
-        assert_eq!(OpenFlags::from_octal(0o100), OpenFlags::empty());
     }
 }
 

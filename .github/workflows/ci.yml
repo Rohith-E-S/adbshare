@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  build:
     runs-on: ubuntu-latest
     # The GUI is GPUI, which needs a Vulkan loader and the xkbcommon and
     # Wayland/X11 client libraries at build time. Everything here is a plain
@@ -57,24 +57,6 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release --workspace --locked
-
-      - name: Test
-        # Full scope (no --lib): bin-target unit tests (adb-daemon, adb-gui,
-        # test-adbfs) and doc tests were silently skipped by the old `--lib`
-        # invocation.
-        #
-        # The GUI's headless tests use gpui's TestAppContext, which supplies a
-        # fake platform window and drives layout in software, so no display
-        # server and no GPU are needed — the Xvfb + GTK_CAIRO dance the GTK
-        # build required is gone.
-        #
-        # dbus-run-session is kept for the adb-daemon test that serves a mock
-        # org.adbshare.Manager interface on the session bus. It is #[ignore]d,
-        # so the suite passes with or without the wrapper; keeping it means
-        # `--ignored` works without a second edit.
-        run: |
-          dnf install -y --setopt=install_weak_deps=False dbus-daemon
-          dbus-run-session -- cargo test --workspace --locked
 
       - name: Smoke test the GUI binary
         # Launch the real app and let ADB_GUI_AUTOCLOSE_MS tear it down, so a

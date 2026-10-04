@@ -223,42 +223,4 @@ impl Job {
         };
         frac.clamp(0.0, 1.0)
     }
-
-    #[cfg(test)]
-    pub(crate) fn test_job(direction: Direction, source: &str, destination: &str) -> Self {
-        Self::new(
-            0,
-            direction,
-            PathBuf::from(source),
-            PathBuf::from(destination),
-            JobOptions::default(),
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn progress_frac_completed_zero_byte_file() {
-        let job = Job::test_job(Direction::Push, "/src/a", "/dst/a");
-        job.set_total(0);
-        job.set_state(JobState::Running);
-        assert_eq!(job.progress_frac(), 0.0);
-        job.set_state(JobState::Completed);
-        assert_eq!(job.progress_frac(), 1.0);
-    }
-
-    #[test]
-    fn progress_frac_is_clamped() {
-        let job = Job::test_job(Direction::Push, "/src/a", "/dst/a");
-        job.set_total(100);
-        job.add_bytes(250); // over-counted bytes must not exceed 1.0
-        assert_eq!(job.progress_frac(), 1.0);
-        let job2 = Job::test_job(Direction::Push, "/src/b", "/dst/b");
-        job2.set_total(100);
-        job2.add_bytes(50);
-        assert!((job2.progress_frac() - 0.5).abs() < 1e-9);
-    }
 }

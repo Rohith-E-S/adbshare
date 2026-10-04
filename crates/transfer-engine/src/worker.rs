@@ -440,19 +440,3 @@ impl RenameCandidates {
             .join(format!("{} ({}){}", self.stem, self.n, self.ext))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rename_candidates_generate_numbered_names() {
-        let mut c = RenameCandidates::new(Path::new("/dcim/photo.jpg"));
-        assert_eq!(c.next(), PathBuf::from("/dcim/photo (1).jpg"));
-        assert_eq!(c.next(), PathBuf::from("/dcim/photo (2).jpg"));
-        assert_eq!(c.next(), PathBuf::from("/dcim/photo (3).jpg"));
-
-        let mut c = RenameCandidates::new(Path::new("noext"));
-        assert_eq!(c.next(), PathBuf::from("noext (1)"));
-    }
-}

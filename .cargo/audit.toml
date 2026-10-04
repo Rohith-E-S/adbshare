@@ -38,22 +38,13 @@ ignore = [
   #
   # Revisit when rsa ships constant-time padding or implicit rejection.
   "RUSTSEC-2023-0071",
-
-  # git2 0.20.4 — undefined behaviour in Remote::list() (RUSTSEC-2026-0183) and
-  # in a BlameHunk signature built from a buffer (RUSTSEC-2026-0184).
-  #
-  # git2 is a dev-dependency-only transitive dep and adb-gui calls none of it.
-  # It arrives via gpui_util's `test-support` feature, which is switched on only
-  # by the `[dev-dependencies] gpui` entry that carries "test-support" for the
-  # GPUI windowing tests. `cargo tree -i git2 --edges normal` prints nothing, so
-  # git2 is not in the runtime graph and is never linked into the shipped
-  # adb-gui/adb-daemon binaries; the affected code cannot execute.
-  #
-  # Both advisories concern libgit2's blame and remote-listing code, which the
-  # GPUI tests do not reach either.
-  "RUSTSEC-2026-0183",
-  "RUSTSEC-2026-0184",
 ]
+
+# git2's two unsound advisories (RUSTSEC-2026-0183 / -0184) used to be listed
+# here: they came in through gpui_util's `test-support` feature. Dropping the
+# GUI's dev-dependency on gpui's test support took git2 out of the tree
+# entirely -- `cargo tree -i git2` no longer resolves a package -- so they no
+# longer need suppressing.
 
 [output]
 # Unsound crates are memory-safety bugs, so they are treated as build-failing

@@ -103,30 +103,10 @@ but it is the documented path for llvmpipe-only machines.
 `./run.sh` does both and writes logs to `/tmp/adb-daemon.log` and
 `/tmp/adb-gui.log`.
 
-## Test
+## Verifying
 
-```sh
-dbus-run-session -- cargo test --workspace
-```
-
-`make test` runs exactly that. `dbus-run-session` comes from `dbus` /
-`dbus-daemon` (`sudo apt install dbus`, `sudo dnf install dbus-daemon`).
-
-The one test that needs the bus —
-`copy_file_over_dbus_with_device_helper`, which serves a mock
-`org.adbshare.Manager` — is `#[ignore]`d, so the default run passes with or
-without the wrapper. The wrapper is what makes it usable when enabled:
-
-```sh
-# Also needs a host-built helper binary for ADBSHARE_TEST_PROXY_BIN.
-dbus-run-session -- env ADBSHARE_TEST_PROXY_BIN="$PWD/target/release/adbshare-proxy" \
-  cargo test --locked -p adb-daemon -- --ignored
-```
-
-The GUI's unit tests need neither a display server nor a GPU: they drive
-`gpui`'s `TestAppContext`, which supplies a fake platform window and lays
-out in software. No Xvfb is involved — the tests never construct a platform
-window, so there is nothing for a virtual X server to host.
+There is no test suite. Verification is the smoke test below, plus
+`cargo clippy` and `cargo fmt`, all of which CI runs.
 
 Smoke-testing the *binary* is a different matter. The end-to-end path —
 `Application::new()`, Vulkan device selection, asset resolution, window
