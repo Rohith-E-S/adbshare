@@ -62,10 +62,6 @@ struct DeviceSlot {
     /// own port so several devices can be connected simultaneously; the
     /// device-side port stays fixed at `DEFAULT_PROXY_PORT`.
     host_port: u16,
-    /// Whether a full setup (push, forward, proxy start) completed for this
-    /// device. Re-add/Changed events use it to decide between a health check
-    /// and a full (proxy-killing) re-setup.
-    setup_ok: bool,
 }
 
 #[derive(Debug, Default)]
@@ -199,7 +195,6 @@ mod tests {
                     mountpoint: None,
                     client: Arc::new(client),
                     host_port: port,
-                    setup_ok: true,
                 });
             }
             let (queue, _rx) = JobQueue::new(1);
@@ -351,7 +346,6 @@ mod tests {
                 mountpoint: None,
                 client: Arc::new(client),
                 host_port: 0,
-                setup_ok: true,
             },
         );
         ManagerInterface {
@@ -992,9 +986,12 @@ async fn ensure_device_ready(
         .lock()
         .devices
         .get(id)
-        .map(|slot| (slot.client.clone(), slot.setup_ok, slot.host_port));
-    if let Some((client, setup_ok, host_port)) = existing {
-        if setup_ok && device_healthy(&client).await {
+        .map(|slot| (slot.client.clone(), slot.host_port));
+    if let Some((client, host_port)) = existing {
+        // A slot only exists once setup succeeded -- a failed setup inserts
+        // nothing -- so reaching here means "already set up", and the only
+        // question is whether the proxy is still healthy.
+        if device_healthy(&client).await {
             info!(?id, "existing setup healthy; skipping re-setup");
             return;
         }
@@ -1027,7 +1024,6 @@ async fn ensure_device_ready(
                     mountpoint: mp,
                     client: Arc::new(client),
                     host_port,
-                    setup_ok: true,
                 },
             );
             info!(?id, "device ready");
@@ -1414,7 +1410,6 @@ fn parse_getprop(raw: &str) -> HashMap<String, String> {
 struct DeviceInfoDto {
     serial: String,
     model: Option<String>,
-    android_version: Option<String>,
     /// "usb" or "wifi", inferred from the serial format.
     transport: &'static str,
     battery_pct: Option<u8>,
@@ -1435,26 +1430,19 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
         adb_shell(serial, "df -k /sdcard"),
     );
 
-    let (model, android_version) = match props_raw {
+    let model = match props_raw {
         Ok(raw) => {
             let props = parse_getprop(&raw);
-            let model = props
+            props
                 .get("ro.product.marketname")
                 .filter(|s| !s.is_empty() && s.as_str() != "UNRECOGNIZED")
                 .or_else(|| props.get("ro.product.model"))
                 .filter(|s| !s.is_empty())
-                .cloned();
-            (
-                model,
-                props
-                    .get("ro.build.version.release")
-                    .filter(|s| !s.is_empty())
-                    .cloned(),
-            )
+                .cloned()
         }
         Err(e) => {
             warn!(serial, error = %e, "getprop failed");
-            (None, None)
+            None
         }
     };
 
@@ -1498,38 +1486,12 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
     serde_json::to_string(&DeviceInfoDto {
         serial: serial.to_string(),
         model,
-        android_version,
         transport,
         battery_pct,
         storage_used,
         storage_total,
     })
     .map_err(|e| anyhow::anyhow!("serialize device info: {e}"))
-}
-
-/// "Android Debug Bridge version 1.0.41" -> "1.0.41"
-async fn adb_version() -> anyhow::Result<String> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(5),
-        Command::new("adb")
-            .arg("version")
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("adb version timed out"))??;
-    if !out.status.success() {
-        anyhow::bail!("adb version failed");
-    }
-    let first = String::from_utf8_lossy(&out.stdout);
-    let ver = first
-        .lines()
-        .next()
-        .and_then(|l| l.rsplit(' ').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
-    Ok(ver)
 }
 
 fn client_for(
@@ -1675,13 +1637,6 @@ impl ManagerInterface {
         }
     }
 
-    /// Version string of the host `adb` server binary (e.g. "1.0.41").
-    async fn adb_version(&self) -> zbus::fdo::Result<String> {
-        adb_version()
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("adb_version: {e}")))
-    }
-
     /// FUSE mountpoint for a device, if mounted.
     async fn mountpoint_for(&self, device: &str) -> zbus::fdo::Result<String> {
         let s = self.state.lock();
@@ -1690,10 +1645,6 @@ impl ManagerInterface {
             .and_then(|slot| slot.mountpoint.as_ref())
             .map(|p| p.to_string_lossy().into_owned())
             .ok_or_else(|| zbus::fdo::Error::ServiceUnknown("device not mounted".into()))
-    }
-
-    async fn version(&self) -> zbus::fdo::Result<String> {
-        Ok(env!("CARGO_PKG_VERSION").into())
     }
 
     /// List a directory on a device. Returns a JSON array of entries so we
@@ -1731,47 +1682,6 @@ impl ManagerInterface {
         }
         serde_json::to_string(&dtos)
             .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
-    }
-
-    /// Storage insight: sizes of the immediate children of `path` on the
-    /// device plus filesystem totals (via the `DISKUSAGE`/`statvfs` proxy
-    /// op). Returns JSON `DuResult`; `entries` is the `(name, size)` array
-    /// (stat size per entry; directories report their entry size, not
-    /// recursive totals).
-    async fn du(&self, device: &str, path: &str) -> zbus::fdo::Result<String> {
-        let client = client_for(&self.state, device)?;
-        let usage = client
-            .disk_usage(path)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("du: {e}")))?;
-        let entries = match client.listdir(path).await {
-            Ok(list) => list
-                .into_iter()
-                .map(|e| DuEntry {
-                    name: e.name,
-                    size: e.stat.size,
-                })
-                .collect(),
-            Err(_) => {
-                // `path` may be a file: report it as a single entry.
-                let st = client
-                    .stat(path)
-                    .await
-                    .map_err(|e| zbus::fdo::Error::Failed(format!("du: {e}")))?;
-                let name = path.rsplit('/').next().unwrap_or(path).to_string();
-                vec![DuEntry {
-                    name,
-                    size: st.size,
-                }]
-            }
-        };
-        let out = DuResult {
-            path: path.to_string(),
-            avail_bytes: usage.avail_bytes,
-            total_bytes: usage.total_bytes,
-            entries,
-        };
-        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
     /// Enqueue a push (local file -> device). `local_path` is on the host;
@@ -2034,52 +1944,6 @@ impl ManagerInterface {
         serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
     }
 
-    /// Photo import (backend only; no GUI button yet). Lists `src_dirs`
-    /// (defaults to `/sdcard/DCIM/Camera` when empty), skips files already
-    /// present under `dest_base/YYYY-MM-DD/<name>` with the same size, and
-    /// enqueues `Pull` jobs for the rest. Returns a JSON
-    /// `transfer_engine::PhotoImportResult`.
-    async fn import_photos(
-        &self,
-        device: &str,
-        src_dirs: Vec<String>,
-        dest_base: &str,
-    ) -> zbus::fdo::Result<String> {
-        let dest = PathBuf::from(dest_base);
-        if !dest.is_absolute() {
-            return Err(zbus::fdo::Error::InvalidArgs(
-                "dest_base must be an absolute path".into(),
-            ));
-        }
-        let client = client_for(&self.state, device)?;
-        let result = transfer_engine::import_photos(&client, &self.queue, device, &src_dirs, &dest)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("import_photos: {e}")))?;
-        serde_json::to_string(&result)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
-    }
-
-    /// Mirror diff (no auto-sync): list `remote_path` on the device and
-    /// return a JSON array of `transfer_engine::MirrorEntry` (regular files
-    /// only) so the GUI can call `plan_mirror(local_dir, remote)` itself and
-    /// enqueue push/pull jobs via `enqueue_push`/`enqueue_pull`.
-    async fn mirror_diff(&self, device: &str, remote_path: &str) -> zbus::fdo::Result<String> {
-        let client = client_for(&self.state, device)?;
-        let entries = client
-            .listdir(remote_path)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("mirror_diff: {e}")))?;
-        let out: Vec<transfer_engine::MirrorEntry> = entries
-            .into_iter()
-            .filter(|e| !e.stat.mode.is_dir())
-            .map(|e| transfer_engine::MirrorEntry {
-                name: e.name,
-                size: e.stat.size,
-            })
-            .collect();
-        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
-    }
-
     async fn diagnostics(&self) -> zbus::fdo::Result<String> {
         let (devices, adb_server, mount_base, proxy_conns, no_fuse) = {
             let state = self.state.lock();
@@ -2088,7 +1952,6 @@ impl ManagerInterface {
                 .iter()
                 .map(|(id, slot)| DeviceDiag {
                     serial: id.0.clone(),
-                    setup_ok: slot.setup_ok,
                     mounted: slot.mountpoint.is_some(),
                 })
                 .collect();
@@ -2165,10 +2028,6 @@ impl ManagerInterface {
     /// Returns the number of jobs requeued.
     async fn retry_failed(&self) -> zbus::fdo::Result<u64> {
         Ok(self.queue.retry_failed())
-    }
-
-    async fn retry_job(&self, id: u64) -> zbus::fdo::Result<bool> {
-        Ok(self.queue.retry_job(id))
     }
 
     // --- File operations on a device (via the on-device proxy) ---
@@ -2405,23 +2264,8 @@ impl From<DirEntry> for DirEntryDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DuEntry {
-    name: String,
-    size: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DuResult {
-    path: String,
-    avail_bytes: u64,
-    total_bytes: u64,
-    entries: Vec<DuEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeviceDiag {
     serial: String,
-    setup_ok: bool,
     mounted: bool,
 }
 

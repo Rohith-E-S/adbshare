@@ -156,9 +156,6 @@ impl Job {
     pub fn mark_started(&self) {
         *self.started.lock() = Some(Instant::now());
     }
-    pub fn elapsed(&self) -> Option<std::time::Duration> {
-        self.started.lock().map(|i| i.elapsed())
-    }
     pub fn error(&self) -> Option<String> {
         self.error.lock().clone()
     }

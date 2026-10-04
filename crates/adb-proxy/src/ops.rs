@@ -131,9 +131,6 @@ impl FileMode {
     pub fn is_dir(self) -> bool {
         self.0 & Self::S_IFMT == Self::S_IFDIR
     }
-    pub fn is_reg(self) -> bool {
-        self.0 & Self::S_IFMT == Self::S_IFREG
-    }
     pub fn is_symlink(self) -> bool {
         self.0 & Self::S_IFMT == Self::S_IFLNK
     }

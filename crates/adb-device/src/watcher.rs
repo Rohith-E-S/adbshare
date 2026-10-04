@@ -294,10 +294,6 @@ async fn query_adb_server(host: &str, port: u16) -> std::io::Result<Vec<DeviceIn
         out.push(DeviceInfo {
             id: DeviceId(serial),
             state,
-            model: None,
-            product: None,
-            device: None,
-            transport_id: None,
         });
     }
     Ok(out)
@@ -387,10 +383,6 @@ impl WatcherImpl for UsbWatcher {
             current.push(DeviceInfo {
                 id: DeviceId(format!("usb:{:03}:{:03}", bus, addr)),
                 state: DeviceState::Online,
-                model: None,
-                product: None,
-                device: None,
-                transport_id: None,
             });
         }
         let mut events = Vec::new();

@@ -337,8 +337,6 @@ pub struct TreeEnqueueResult {
 pub struct DeviceDiagDto {
     pub serial: String,
     #[serde(default)]
-    pub setup_ok: bool,
-    #[serde(default)]
     pub mounted: bool,
 }
 
@@ -398,14 +396,10 @@ pub fn format_diagnostics(report: &DiagnosticReportDto) -> String {
             lines.push(format!(
                 "Device {}: {}",
                 device.serial,
-                if device.setup_ok {
-                    if device.mounted {
-                        "ready, mounted"
-                    } else {
-                        "ready, FUSE mount unavailable — use in-app browsing"
-                    }
+                if device.mounted {
+                    "ready, mounted"
                 } else {
-                    "setup incomplete — check the helper build and daemon log"
+                    "ready, FUSE mount unavailable — use in-app browsing"
                 },
             ));
         }
@@ -656,21 +650,24 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_cover_missing_adb_and_unready_device() {
+    fn diagnostics_cover_a_missing_adb_and_a_ready_device() {
         let missing: DiagnosticReportDto = serde_json::from_str(
             r#"{"adb_ok":false,"adb_server":"127.0.0.1:5037","no_fuse":true,
-                "devices":[{"serial":"abc","setup_ok":false,"mounted":false}]}"#,
+                "devices":[{"serial":"abc","mounted":false}]}"#,
         )
         .expect("fixture parses");
         let text = format_diagnostics(&missing);
         assert!(text.contains("ADB: not found on PATH"), "{text}");
         assert!(text.contains("Mounts: disabled"), "{text}");
-        assert!(text.contains("setup incomplete"), "{text}");
+        // No adb means no device can have been set up, so the unmounted branch
+        // is all that is left to say about the device.
+        assert!(text.contains("Device abc: ready"), "{text}");
+        assert!(text.contains("use in-app browsing"), "{text}");
 
         let ready: DiagnosticReportDto = serde_json::from_str(
             r#"{"adb_ok":true,"adb_version":"1.0.41","helper_env_present":true,
                 "helper_env_exists":true,"proxy_conns":4,
-                "devices":[{"serial":"abc","setup_ok":true,"mounted":true}]}"#,
+                "devices":[{"serial":"abc","mounted":true}]}"#,
         )
         .expect("fixture parses");
         let text = format_diagnostics(&ready);

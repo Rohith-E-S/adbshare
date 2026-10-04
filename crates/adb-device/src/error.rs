@@ -31,12 +31,6 @@ pub enum AdbError {
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 
-    #[error("serial number mismatch: expected {expected}, got {actual}")]
-    SerialMismatch { expected: String, actual: String },
-
-    #[error("transport not supported on this platform")]
-    UnsupportedTransport,
-
     #[error("{0}")]
     Other(String),
 }

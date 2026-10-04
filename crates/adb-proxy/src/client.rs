@@ -653,13 +653,6 @@ impl std::fmt::Debug for ProxyFile {
 }
 
 impl ProxyFile {
-    pub fn path(&self) -> &str {
-        &self.inner.path
-    }
-    pub fn fd(&self) -> u32 {
-        self.inner.fd
-    }
-
     /// Clone of the live connection, or `Closed` if already closed.
     fn conn(&self) -> Result<ProxyConn> {
         self.inner.conn.lock().clone().ok_or(ProxyError::Closed)

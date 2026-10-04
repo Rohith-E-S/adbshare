@@ -29,6 +29,3 @@ pub const PROXY_BIN_PATH: &str = "/data/local/tmp/adbshare-proxy";
 
 /// Magic port we use for proxy-over-forward.
 pub const DEFAULT_PROXY_PORT: u16 = 31337;
-
-/// Size of the read/write buffer per file in the streaming read/write API.
-pub const STREAM_CHUNK: usize = 256 * 1024;

@@ -23,19 +23,14 @@
 #![warn(missing_debug_implementations)]
 
 pub mod job;
-pub mod mirror;
-pub mod photo_import;
 pub mod progress;
 pub mod queue;
 pub mod verify;
 pub mod worker;
 
 pub use job::{Direction, Job, JobId, JobOptions, JobState};
-pub use mirror::{MirrorEntry, plan_mirror};
-pub use photo_import::{DEFAULT_PHOTO_SRC_DIRS, PhotoImportResult, import_photos};
 pub use progress::{ProgressSnapshot, SpeedSample};
 pub use queue::JobQueue;
-pub use verify::verify_checksum;
 pub use worker::Worker;
 
 pub const DEFAULT_CHUNK: usize = 2 * 1024 * 1024; // 2 MiB

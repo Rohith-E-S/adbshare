@@ -48,7 +48,6 @@ macro_rules! asset_table {
 
 asset_table! {
     // ── chrome ──────────────────────────────────────────────────────────
-    "icons/application-x-executable.svg" => "../assets/icons/application-x-executable.svg",
     "icons/audio-x-generic.svg" => "../assets/icons/audio-x-generic.svg",
     "icons/camera-photo.svg" => "../assets/icons/camera-photo.svg",
     "icons/checkbox-checked.svg" => "../assets/icons/checkbox-checked.svg",
@@ -57,21 +56,15 @@ asset_table! {
     "icons/dialog-warning.svg" => "../assets/icons/dialog-warning.svg",
     "icons/document-edit.svg" => "../assets/icons/document-edit.svg",
     "icons/document-open.svg" => "../assets/icons/document-open.svg",
-    "icons/document-send.svg" => "../assets/icons/document-send.svg",
     "icons/drive-harddisk.svg" => "../assets/icons/drive-harddisk.svg",
     "icons/edit-copy.svg" => "../assets/icons/edit-copy.svg",
     "icons/edit-delete.svg" => "../assets/icons/edit-delete.svg",
     "icons/edit-find.svg" => "../assets/icons/edit-find.svg",
     "icons/edit-paste.svg" => "../assets/icons/edit-paste.svg",
-    "icons/edit-select-all.svg" => "../assets/icons/edit-select-all.svg",
     "icons/edit-undo.svg" => "../assets/icons/edit-undo.svg",
-    "icons/emblem-symbolic-link.svg" => "../assets/icons/emblem-symbolic-link.svg",
     "icons/emblem-synchronizing.svg" => "../assets/icons/emblem-synchronizing.svg",
-    "icons/folder-copy.svg" => "../assets/icons/folder-copy.svg",
     "icons/folder-new.svg" => "../assets/icons/folder-new.svg",
     "icons/folder-upload.svg" => "../assets/icons/folder-upload.svg",
-    "icons/go-down.svg" => "../assets/icons/go-down.svg",
-    "icons/go-down-bold.svg" => "../assets/icons/go-down-bold.svg",
     "icons/go-next.svg" => "../assets/icons/go-next.svg",
     "icons/go-previous.svg" => "../assets/icons/go-previous.svg",
     "icons/go-up.svg" => "../assets/icons/go-up.svg",
@@ -87,19 +80,16 @@ asset_table! {
     "icons/send-to.svg" => "../assets/icons/send-to.svg",
     "icons/sidebar-show.svg" => "../assets/icons/sidebar-show.svg",
     "icons/system-file-manager.svg" => "../assets/icons/system-file-manager.svg",
-    "icons/system-lock.svg" => "../assets/icons/system-lock.svg",
     "icons/system-software-install.svg" => "../assets/icons/system-software-install.svg",
     "icons/text-x-generic.svg" => "../assets/icons/text-x-generic.svg",
     "icons/user-home.svg" => "../assets/icons/user-home.svg",
     "icons/user-trash.svg" => "../assets/icons/user-trash.svg",
     "icons/utilities-terminal.svg" => "../assets/icons/utilities-terminal.svg",
     "icons/video-x-generic.svg" => "../assets/icons/video-x-generic.svg",
-    "icons/view-continuous.svg" => "../assets/icons/view-continuous.svg",
     "icons/view-grid.svg" => "../assets/icons/view-grid.svg",
     "icons/view-list.svg" => "../assets/icons/view-list.svg",
     "icons/view-more.svg" => "../assets/icons/view-more.svg",
     "icons/view-refresh.svg" => "../assets/icons/view-refresh.svg",
-    "icons/window-close.svg" => "../assets/icons/window-close.svg",
     "icons/x-office-document.svg" => "../assets/icons/x-office-document.svg",
 
     // ── full-colour folders ─────────────────────────────────────────────
@@ -465,7 +455,7 @@ mod tests {
                 "{key} still carries a fixed size, which would fight icon()"
             );
         }
-        assert_eq!(chrome, 53, "a chrome icon was added or removed");
+        assert_eq!(chrome, 43, "a chrome icon was added or removed");
     }
 
     /// Every full-colour asset has to reach `img()`.

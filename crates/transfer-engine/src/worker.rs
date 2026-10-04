@@ -25,11 +25,6 @@ impl Worker {
         }
     }
 
-    pub fn with_chunk(mut self, n: usize) -> Self {
-        self.chunk_size = n;
-        self
-    }
-
     /// Run a job to completion. Updates job state and progress.
     pub async fn run(self: Arc<Self>, job: Job) -> Result<(), ProxyError> {
         if job.is_cancelled() {

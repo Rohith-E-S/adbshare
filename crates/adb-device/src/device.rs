@@ -25,7 +25,6 @@ pub enum DeviceState {
     Recovery,
     Sideload,
     Bootloader,
-    Disconnected,
     Unknown,
 }
 
@@ -33,18 +32,4 @@ pub enum DeviceState {
 pub struct DeviceInfo {
     pub id: DeviceId,
     pub state: DeviceState,
-    pub model: Option<String>,
-    pub product: Option<String>,
-    pub device: Option<String>,
-    pub transport_id: Option<u32>,
-}
-
-impl DeviceInfo {
-    pub fn display_name(&self) -> String {
-        self.model
-            .clone()
-            .or_else(|| self.product.clone())
-            .map(|m| format!("{} ({})", m, self.id.0))
-            .unwrap_or_else(|| self.id.0.clone())
-    }
 }

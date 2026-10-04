@@ -87,15 +87,6 @@ impl JobQueue {
         job.id
     }
 
-    pub fn next_pending(&self) -> Option<Job> {
-        let mut q = self.pending.lock();
-        q.pop_front()
-    }
-
-    pub fn mark_running(&self, job: Job) {
-        self.in_flight.lock().push(job);
-    }
-
     pub fn mark_done(&self, job: Job) {
         let mut inflight = self.in_flight.lock();
         inflight.retain(|j| j.id != job.id);
@@ -108,10 +99,6 @@ impl JobQueue {
         // `try_dispatch` loop re-checks capacity and starts pending jobs.
         // Best-effort: a closed receiver simply means nobody is dispatching.
         let _ = self.notify.send(());
-    }
-
-    pub fn has_capacity(&self) -> bool {
-        self.in_flight.lock().len() < self.parallelism
     }
 
     pub fn snapshot(&self) -> QueueSnapshot {
