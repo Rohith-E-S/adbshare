@@ -171,11 +171,7 @@ impl JobInfo {
             human_size(self.bytes_total)
         };
         let done = human_size(self.bytes_done);
-        let pct = self
-            .bytes_total
-            .checked_div(1)
-            .map(|total| self.bytes_done * 100 / total)
-            .unwrap_or(0);
+        let pct = (self.fraction() * 100.0).round() as u64;
 
         let (state, _) = self.state_pill();
         let mut parts = vec![state.to_string(), format!("{done}/{total} ({pct}%)")];
@@ -506,6 +502,30 @@ mod tests {
             error: None,
             device: None,
         }
+    }
+
+    #[test]
+    fn an_unknown_total_does_not_panic_the_status_line() {
+        // A pull whose device stat failed carries a total of 0 (the worker
+        // proceeds with an unknown size rather than failing the job). The
+        // status line used to divide by that 0 and take the process down; the
+        // percentage now comes from fraction(), which guards it.
+        let mut j = job("Running");
+        j.bytes_total = 0;
+        j.bytes_done = 0;
+        let text = j.status_text();
+        assert!(text.contains("(0%)"), "{text}");
+
+        j.bytes_done = 4096;
+        assert_eq!(j.fraction(), 0.0, "no total means no progress bar");
+        assert!(j.status_text().contains("(0%)"), "{}", j.status_text());
+    }
+
+    #[test]
+    fn status_text_reports_a_percentage_that_matches_the_fraction() {
+        let j = job("Running");
+        assert_eq!(j.fraction(), 0.5);
+        assert!(j.status_text().contains("(50%)"), "{}", j.status_text());
     }
 
     #[test]

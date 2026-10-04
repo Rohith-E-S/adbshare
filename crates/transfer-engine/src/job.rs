@@ -189,9 +189,22 @@ impl Job {
     /// Cooperative pause/resume: the worker parks between chunks while set.
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
+        // Only a job that was still going can become paused. A job that already
+        // completed, failed or was cancelled keeps the state it reached --
+        // relabelling it would make the UI offer Resume for a finished
+        // transfer, and resuming it would then rewind the label to Running.
+        if matches!(self.state(), JobState::Pending | JobState::Running) {
+            self.set_state(JobState::Paused);
+        }
     }
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Relaxed);
+        // Only step back to Running if the job was actually paused. A cancelled
+        // or finished job keeps the state it reached, and the worker's own
+        // set_state calls win once it drains the park.
+        if self.state() == JobState::Paused {
+            self.set_state(JobState::Running);
+        }
     }
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)

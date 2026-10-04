@@ -1534,14 +1534,20 @@ pub fn grid_hit_test(
     at: Point<Pixels>,
     item_count: usize,
 ) -> Option<(usize, usize)> {
-    let stride: f32 = (geometry.tile.width + px(GRID_GAP)).into();
-    if stride <= 0.0 || geometry.columns == 0 {
+    // The two axes have different pitches: a tile is wider than it is tall
+    // because the caption sits under the icon, so the row stride is the tile
+    // *height* plus the gap. Dividing dy by the horizontal stride drifted the
+    // row index by one every few rows, so a rubber-band drag in grid view
+    // selected the wrong row.
+    let stride_x: f32 = (geometry.tile.width + px(GRID_GAP)).into();
+    let stride_y: f32 = (geometry.tile.height + px(GRID_GAP)).into();
+    if stride_x <= 0.0 || stride_y <= 0.0 || geometry.columns == 0 {
         return None;
     }
     let dx: f32 = (at.x - geometry.origin.x).into();
     let dy: f32 = (at.y - geometry.origin.y).into();
-    let col = (dx / stride).floor();
-    let row = (dy / stride).floor();
+    let col = (dx / stride_x).floor();
+    let row = (dy / stride_y).floor();
     if col < 0.0 || row < 0.0 {
         return None;
     }
@@ -1555,7 +1561,7 @@ pub fn grid_hit_test(
     }
     let tile_w: f32 = geometry.tile.width.into();
     let tile_h: f32 = geometry.tile.height.into();
-    if dx % stride > tile_w || dy % stride > tile_h {
+    if dx % stride_x > tile_w || dy % stride_y > tile_h {
         return None;
     }
     Some((start, (start + 1).min(item_count)))
@@ -2789,7 +2795,7 @@ mod tests {
             columns: 3,
         };
 
-        // The stride is the tile plus its gap: 108 wide, 108 tall.
+        // The stride is the tile plus its gap on each axis: 108 wide, 88 tall.
         assert_eq!(
             grid_hit_test(geometry, gpui::point(px(10.), px(10.)), 9),
             Some((0, 1)),
@@ -2805,6 +2811,35 @@ mod tests {
             Some((8, 9)),
             "the last tile clamps to the item count"
         );
+    }
+
+    #[test]
+    fn grid_hit_test_uses_the_row_pitch_not_the_column_width() {
+        // A tile is wider than it is tall (the caption sits under the icon), so
+        // the vertical stride is height+gap. Dividing dy by the horizontal
+        // stride instead drifted the row index, and a drag that started on the
+        // first row silently selected a later one.
+        let geometry = GridGeometry {
+            origin: gpui::point(px(0.), px(0.)),
+            tile: Size {
+                width: px(100.),
+                height: px(80.),
+            },
+            columns: 3,
+        };
+        let stride_y = 80.0 + GRID_GAP;
+
+        // Walk down the first column, one tile per row, and the slot must
+        // advance by exactly `columns` each time -- no drifting.
+        for row in 0..6usize {
+            let y = (row as f32) * stride_y + 10.0;
+            let point = gpui::point(px(10.), px(y));
+            assert_eq!(
+                grid_hit_test(geometry, point, 3 * 6),
+                Some((row * 3, row * 3 + 1)),
+                "row {row} at y={y}"
+            );
+        }
     }
 
     #[test]

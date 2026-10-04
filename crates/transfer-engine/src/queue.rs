@@ -331,6 +331,43 @@ mod tests {
         assert!(!queue.retry_job(id), "only terminal completed jobs retry");
     }
 
+    #[test]
+    fn pausing_reports_the_paused_state() {
+        // The GUI picks between its Pause and Resume buttons from the state
+        // string, so a job that parks without saying so could never be
+        // resumed from the UI.
+        let (queue, _rx) = JobQueue::new(1);
+        let id = queue.submit(test_job("pause"));
+        let job = queue.try_dispatch().expect("dispatches");
+        job.set_state(JobState::Running);
+
+        job.pause();
+        assert!(job.is_paused());
+        assert_eq!(job.state(), JobState::Paused, "the GUI must see Paused");
+
+        job.resume();
+        assert!(!job.is_paused());
+        assert_eq!(job.state(), JobState::Running, "resume steps back");
+        let _ = id;
+    }
+
+    #[test]
+    fn resuming_a_finished_job_does_not_rewind_its_state() {
+        let (queue, _rx) = JobQueue::new(1);
+        let id = queue.submit(test_job("done"));
+        let job = queue.try_dispatch().expect("dispatches");
+        job.set_state(JobState::Completed);
+
+        job.pause();
+        job.resume();
+        assert_eq!(
+            job.state(),
+            JobState::Completed,
+            "a job that finished while paused keeps the state it reached"
+        );
+        let _ = id;
+    }
+
     #[tokio::test]
     async fn mark_done_wakes_dispatcher() {
         let (queue, mut rx) = JobQueue::new(1);

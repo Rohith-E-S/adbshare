@@ -233,7 +233,15 @@ impl Worker {
                 job.set_state(JobState::Skipped);
                 return Ok(());
             }
-            (Some(st), OverwriteMode::Resume) if st.len() < job.bytes_total() => {
+            // `bytes_total` is 0 when the device stat failed (see above), and
+            // `st.len() < 0` is never true, so the bound alone sent every
+            // unknown-total resume down the truncating arm below and destroyed
+            // the partial file. With no total to compare against, resume
+            // anyway: the read loop stops when the remote read comes back
+            // empty, which is how an unknown total is discovered.
+            (Some(st), OverwriteMode::Resume)
+                if job.bytes_total() == 0 || st.len() < job.bytes_total() =>
+            {
                 // Continue from the end of the partial local file. The remote
                 // read loop below starts at the same offset.
                 offset = st.len();
