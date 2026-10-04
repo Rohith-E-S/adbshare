@@ -176,23 +176,35 @@ jobs:
           toolchain: '1.88.0'
 
       - name: Check the workspace on the MSRV
-        run: cargo check --workspace --locked
+        # `cargo +1.88.0`, not a bare `cargo check`. rust-toolchain.toml pins
+        # channel 1.98.1, and that file overrides whatever default
+        # dtolnay/rust-toolchain set, so a bare `cargo check` type-checked
+        # against 1.98.1 -- this job was green without ever testing the MSRV.
+        # The explicit +toolchain is the only thing that wins over the file.
+        run: cargo +1.88.0 check --workspace --locked
 
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      # rustsec/audit-check reports its findings by creating a check run, which
+      # needs checks:write. The workflow default is contents:read, so without
+      # this the action fails with "Resource not accessible by integration --
+      # create-a-check-run" *after* the audit itself has already passed. That
+      # was invisible while the step carried continue-on-error.
+      checks: write
     steps:
       - uses: actions/checkout@v4
 
       # RustSec advisory check against Cargo.lock. Blocking now that the
-      # dependency tree has been triaged: `.cargo/audit.toml` records every
-      # finding that was investigated and accepted (rsa's unpatched Marvin
-      # advisory, which the ADB signing protocol makes unavoidable, and two
-      # git2 unsound advisories reachable only through gpui's dev-only
-      # test-support feature). That file also sets `deny = ["unsound"]`, so a
-      # new vulnerability or a new unsound advisory fails this job and has to
-      # be triaged rather than absorbed. `unmaintained` stays advisory: those
-      # crates are upstream gpui transitive deps whose set churns per release.
+      # dependency tree has been triaged: `.cargo/audit.toml` records the one
+      # finding that was investigated and accepted -- rsa's unpatched Marvin
+      # advisory, which ADB's RSA-2048 signing protocol makes unavoidable and
+      # which the advisory itself says is fine for local use. That file also
+      # sets `deny = ["unsound"]`, so a new vulnerability or a new unsound
+      # advisory fails this job and has to be triaged rather than absorbed.
+      # `unmaintained` stays advisory: those crates are upstream gpui
+      # transitive deps whose set churns per release.
       - name: Dependency audit
         uses: rustsec/audit-check@v2
         with:
