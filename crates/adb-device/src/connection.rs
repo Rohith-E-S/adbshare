@@ -155,6 +155,24 @@ impl AsyncWrite for Stream {
     }
 }
 
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // `poll_shutdown` is the polite path, but a stream is very often
+        // dropped without one — an error propagating through `?`, or a caller
+        // that just goes out of scope. Nothing else removes the demux entry or
+        // tells the device the stream is gone, so without this the entry in
+        // `AdbConnection::streams` pinned its 256-slot channel and every
+        // buffered `Bytes` until the device happened to send another WRTE for
+        // that id, which for an idle stream may be never.
+        //
+        // Taking the sender is idempotent with `poll_shutdown`: whichever runs
+        // first wins, and the other finds `None`.
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(self.id);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AdbConnection {
     serial: String,
