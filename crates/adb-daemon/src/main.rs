@@ -522,6 +522,34 @@ async fn setup(
         anyhow::bail!("adb forward failed: {status}");
     }
 
+    // From here the forward exists. Everything below can still fail, and a
+    // failed setup inserts no DeviceSlot — so the `Removed` handler has
+    // nothing to clean up with and the forward would outlive this attempt,
+    // holding a host port bound by adb. Release it explicitly on failure.
+    match finish_setup(device.clone(), mountpoint, proxy_conns, host_port).await {
+        Ok(pair) => Ok(pair),
+        Err(e) => {
+            warn!(
+                device = device.as_str(),
+                host_port,
+                error = ?e,
+                "setup failed after the forward was created; releasing it"
+            );
+            teardown_device(device.as_str(), host_port).await;
+            Err(e)
+        }
+    }
+}
+
+/// Everything in [`setup`] that happens after `adb forward` has succeeded.
+async fn finish_setup(
+    device: DeviceId,
+    mountpoint: Option<PathBuf>,
+    proxy_conns: usize,
+    host_port: u16,
+) -> anyhow::Result<(ProxyClient, u16)> {
+    let addr = format!("127.0.0.1:{host_port}");
+
     let _ = adb_run(
         &[
             "-s",
@@ -558,7 +586,6 @@ async fn setup(
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let addr = format!("127.0.0.1:{host_port}");
     let mut last_err: Option<String> = None;
     for _ in 0..25 {
         let attempt_err: Option<String>;
