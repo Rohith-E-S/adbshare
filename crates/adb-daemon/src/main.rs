@@ -98,6 +98,19 @@ fn mountpoint_for(mount_base: &std::path::Path, serial: &str, no_fuse: bool) -> 
     }
 }
 
+/// This process's uid, without pulling in a dependency for it.
+fn nix_uid() -> u32 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+        })
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+}
+
 /// Parse an `--adb-server` "host:port" spec. Handles bracketed IPv6 hosts
 /// like `[::1]:5037`, which a naive `split(':')` would shred. Falls back to
 /// the adb default port 5037 when no (valid) port is present.
@@ -110,6 +123,14 @@ fn parse_adb_server(spec: &str) -> (String, u16) {
             .and_then(|p| p.parse().ok())
             .unwrap_or(5037);
         return (host.to_string(), port);
+    }
+    // Unbracketed with more than one colon: a bare IPv6 literal such as `::1`.
+    // `rsplit_once` would split it at the last colon into ("::", "1"), and "1"
+    // is a perfectly good port, so nothing downstream notices the mangling —
+    // the watcher just listens on `tcp:::1:1`, never connects, and device
+    // discovery silently produces no events.
+    if !spec.starts_with('[') && spec.matches(':').count() > 1 {
+        return (spec.to_string(), 5037);
     }
     match spec.rsplit_once(':') {
         Some((host, port)) => (host.to_string(), port.parse().unwrap_or(5037)),
@@ -137,9 +158,27 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let mount_base = cli.mount_base.clone().unwrap_or_else(|| {
+        // Fall back to the *current* uid's runtime dir, not a hardcoded 1000:
+        // with XDG_RUNTIME_DIR unset (a systemd unit that does not pass it, a
+        // non-standard session) any user other than 1000 got "Permission
+        // denied", and the `?` on create_dir_all below made main() return Err
+        // — the daemon exited before ever registering on D-Bus.
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/run/user/1000"));
+            .unwrap_or_else(|| {
+                let uid = nix_uid();
+                let dir = if uid == 0 {
+                    std::env::temp_dir()
+                } else {
+                    PathBuf::from(format!("/run/user/{uid}"))
+                };
+                if std::fs::create_dir_all(&dir).is_err() {
+                    // Last resort: a temp dir is always writable.
+                    std::env::temp_dir()
+                } else {
+                    dir
+                }
+            });
         base.join("adbshare")
     });
     if !cli.no_fuse {
