@@ -160,6 +160,14 @@ async fn main() -> anyhow::Result<()> {
     }));
     let (queue, mut queue_rx) = JobQueue::new(transfer_engine::DEFAULT_PARALLELISM);
     let (adb_host, adb_port) = parse_adb_server(&cli.adb_server);
+    info!(host = %adb_host, port = adb_port, "adb server");
+    if adb_host != "127.0.0.1" || adb_port != 5037 {
+        // Must be set before anything spawns an `adb` process. `set` rather than
+        // `get_or_init` so a second call is a loud bug, not a silent no-op.
+        ADB_SERVER
+            .set(Some((adb_host.clone(), adb_port)))
+            .expect("ADB_SERVER set once during startup");
+    }
     let watcher = DeviceWatcher::from_adb_server(&adb_host, adb_port);
     let mut events = watcher.subscribe();
     let state_clone = state.clone();
@@ -309,10 +317,33 @@ const ADB_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run `adb <args>` with a hard timeout so a hung device or adb server can't
 /// stall the single watcher task. Returns the command's exit status.
+/// The ADB server that every `adb` invocation must talk to, from
+/// `--adb-server`. `None` means "the adb default", in which case no `-H`/`-P`
+/// is passed at all.
+///
+/// Set once during startup, before any device work begins. The device watcher
+/// was given the parsed host/port, but every actual `adb` call used a bare
+/// `adb`, so a non-default server was watched and never used: `push` reported
+/// "device not found" and no device ever came up.
+static ADB_SERVER: std::sync::OnceLock<Option<(String, u16)>> = std::sync::OnceLock::new();
+
+/// Build an `adb` command already pointed at the configured server.
+///
+/// Every `adb_command()` in this binary must go through here; a bare
+/// `adb` silently talks to 127.0.0.1:5037 and ignores `--adb-server`.
+fn adb_command() -> Command {
+    let mut cmd = Command::new("adb");
+    if let Some(Some((host, port))) = ADB_SERVER.get() {
+        let port = port.to_string();
+        cmd.arg("-H").arg(host).arg("-P").arg(port);
+    }
+    cmd
+}
+
 async fn adb_run(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::ExitStatus> {
     tokio::time::timeout(
         timeout,
-        Command::new("adb").args(args).kill_on_drop(true).status(),
+        adb_command().args(args).kill_on_drop(true).status(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
@@ -323,7 +354,7 @@ async fn adb_run(args: &[&str], timeout: Duration) -> anyhow::Result<std::proces
 async fn adb_run_output(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::Output> {
     tokio::time::timeout(
         timeout,
-        Command::new("adb").args(args).kill_on_drop(true).output(),
+        adb_command().args(args).kill_on_drop(true).output(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
@@ -572,7 +603,7 @@ async fn finish_setup(
     // log file on the device itself.
     let launch = tokio::time::timeout(
         ADB_CMD_TIMEOUT,
-        Command::new("adb")
+        adb_command()
             .args(["-s", device.as_str(), "shell", &proxy_cmd])
             .kill_on_drop(true)
             .stdout(Stdio::null())
@@ -799,7 +830,7 @@ fn is_wireless_serial(serial: &str) -> bool {
 async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        Command::new("adb")
+        adb_command()
             .args(["-s", serial, "shell", cmd])
             .kill_on_drop(true)
             .output(),
@@ -1392,10 +1423,7 @@ impl ManagerInterface {
         };
         let adb_output = tokio::time::timeout(
             Duration::from_secs(5),
-            Command::new("adb")
-                .arg("version")
-                .kill_on_drop(true)
-                .output(),
+            adb_command().arg("version").kill_on_drop(true).output(),
         )
         .await;
         let (adb_ok, adb_version) = match adb_output {
@@ -1516,7 +1544,7 @@ impl ManagerInterface {
         validate_host_port(address)?;
         let out = tokio::time::timeout(
             Duration::from_secs(10),
-            Command::new("adb")
+            adb_command()
                 .args(["connect", address])
                 .kill_on_drop(true)
                 .output(),
@@ -1546,7 +1574,7 @@ impl ManagerInterface {
         }
         let out = tokio::time::timeout(
             Duration::from_secs(60),
-            Command::new("adb")
+            adb_command()
                 .args(["pair", address, code])
                 .kill_on_drop(true)
                 .output(),
@@ -1587,7 +1615,7 @@ impl ManagerInterface {
         let cmd = if is_device_path {
             if path.starts_with("/data/local/tmp/") {
                 let escaped_path = path.replace('\'', "'\\''");
-                Command::new("adb")
+                adb_command()
                     .args([
                         "-s",
                         device,
@@ -1601,13 +1629,13 @@ impl ManagerInterface {
                 let script = format!(
                     "tmp=\"/data/local/tmp/adbshare_$$.apk\" && cp '{escaped_path}' \"$tmp\" && pm install -r \"$tmp\"; res=$?; rm -f \"$tmp\"; exit $res"
                 );
-                Command::new("adb")
+                adb_command()
                     .args(["-s", device, "shell", &script])
                     .kill_on_drop(true)
                     .output()
             }
         } else {
-            Command::new("adb")
+            adb_command()
                 .args(["-s", device, "install", "-r", path])
                 .kill_on_drop(true)
                 .output()
