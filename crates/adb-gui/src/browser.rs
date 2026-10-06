@@ -373,6 +373,8 @@ pub struct Browser {
     /// forever. A `UniformListScrollHandle` is the handle `uniform_list`
     /// actually owns, and it tracks items properly.
     list_scroll: UniformListScrollHandle,
+    /// Selection a rubber-band drag builds on top of, captured on mouse-down.
+    drag_base: BTreeSet<usize>,
 
     // ── Navigation history ─────────────────────────────────────────────────
     back: Vec<PathBuf>,
@@ -462,6 +464,7 @@ impl Browser {
             hovered_drop_folder: None,
             scroll: ScrollHandle::new(),
             list_scroll: UniformListScrollHandle::new(),
+            drag_base: BTreeSet::new(),
             grid_geometry: GridGeometry::default(),
             list_geometry: ListGeometry::default(),
             viewport_x: 0.0,
@@ -1506,10 +1509,37 @@ impl Browser {
             .visible
             .iter()
             .any(|ix| self.row_contains(*ix, event.position));
+        // Remember what to build rubber-band selections from, so `on_drag_move`
+        // does not have to re-derive it. A drag that started on a tile keeps
+        // the current selection as its base rather than wiping the highlight on
+        // the first mouse-move, which read as "the drag dropped my
+        // multi-selection".
+        self.drag_base = if self.drag_extend || on_item {
+            self.selection.clone()
+        } else {
+            BTreeSet::new()
+        };
         if !self.drag_extend && !on_item {
             self.selection.clear();
         }
         cx.notify();
+    }
+
+    /// The slots covered by the rubber band at `at`.
+    ///
+    /// Rows and tiles are laid out in order, so one hit test yields the whole
+    /// selected span. The previous code instead asked "is this row under the
+    /// pointer?" once per row, and each of those did a linear scan of `visible`
+    /// to recover the row's slot — quadratic per mouse-move event, on the UI
+    /// thread inside prepaint.
+    fn slots_under(&self, at: Point<Pixels>) -> Option<(usize, usize)> {
+        match self.view_mode {
+            ViewMode::Grid => grid_hit_test(self.grid_geometry, at, self.visible.len()),
+            ViewMode::List => {
+                let row = list_hit_test(self.list_geometry, at)?;
+                Some((row, row + 1))
+            }
+        }
     }
 
     fn on_drag_move(
@@ -1522,15 +1552,10 @@ impl Browser {
             return;
         }
         self.drag_current = Some(event.position);
-        let base = if self.drag_extend {
-            self.selection.clone()
-        } else {
-            BTreeSet::new()
-        };
-        self.selection = base;
-        for index in self.visible.clone() {
-            if self.row_contains(index, event.position) {
-                self.selection.insert(index);
+        self.selection = self.drag_base.clone();
+        if let Some((start, end)) = self.slots_under(event.position) {
+            for slot in start..end.min(self.visible.len()) {
+                self.selection.insert(self.visible[slot]);
             }
         }
         cx.notify();
@@ -1539,6 +1564,7 @@ impl Browser {
     fn on_drag_end(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.drag_anchor = None;
         self.drag_current = None;
+        self.drag_base.clear();
         cx.notify();
     }
 
@@ -1547,11 +1573,8 @@ impl Browser {
         let Some(slot) = self.visible.iter().position(|ix| *ix == index) else {
             return false;
         };
-        match self.view_mode {
-            ViewMode::Grid => grid_hit_test(self.grid_geometry, at, self.visible.len())
-                .is_some_and(|(start, end)| (start..end).contains(&slot)),
-            ViewMode::List => list_hit_test(self.list_geometry, at).is_some_and(|row| row == slot),
-        }
+        self.slots_under(at)
+            .is_some_and(|(start, end)| (start..end).contains(&slot))
     }
 }
 
