@@ -31,8 +31,18 @@ pub struct DirEntry {
 
 impl DirEntry {
     /// True for anything a folder-drawing icon should be used for.
+    ///
+    /// `is_dir` alone, and deliberately not `is_dir || is_symlink`. Both entry
+    /// producers already resolve a symlink's target: the daemon stats anything
+    /// that comes back as a symlink and fills in `is_dir`, and local mode uses
+    /// `fs::metadata`, which follows. So a symlink to a directory arrives with
+    /// `is_dir = true`, and the only thing `is_symlink` added was the false
+    /// positive: a symlink to a *file* was treated as a folder, so it drew a
+    /// folder icon, double-click tried to list it and reported "Could not open
+    /// folder", Ctrl+U enqueued a tree push, and Save-to-computer took the
+    /// `copy_tree` path and failed with ENOTDIR.
     pub fn looks_like_dir(&self) -> bool {
-        self.is_dir || self.is_symlink
+        self.is_dir
     }
 
     /// Lowercase extension, empty when there is none.
