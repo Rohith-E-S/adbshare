@@ -459,6 +459,11 @@ async fn setup(
         {
             Ok(st) if st.success() => {
                 push_status = Some(st);
+                // A transport error from an earlier attempt must not be
+                // reported against this successful push: the loop can time
+                // out while the device is still authorising and then succeed
+                // on a later try.
+                push_err = None;
                 break;
             }
             Ok(st) => {
