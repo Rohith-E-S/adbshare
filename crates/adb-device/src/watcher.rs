@@ -92,7 +92,20 @@ impl DeviceWatcher {
                                 return;
                             }
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                        // Stop as soon as the receiver is dropped. The loop's
+                        // only other exit was a failed `tx.send`, which needs an
+                        // event to happen first — so a consumer that subscribed
+                        // and then dropped the receiver while the device list was
+                        // stable left this thread polling once a second forever,
+                        // holding an Arc to the watcher and a whole tokio runtime
+                        // (reactor + timer + blocking pool). Re-subscribing N
+                        // times leaked N threads and N runtimes; the netstat
+                        // variant also re-ran `adb start-server` and a TCP connect
+                        // per poll from each of them.
+                        tokio::select! {
+                            _ = tx.closed() => return,
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(1000)) => {}
+                        }
                         let _ = &mut last;
                     }
                 });

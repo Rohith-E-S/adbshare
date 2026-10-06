@@ -58,6 +58,10 @@ pub struct StreamTransport {
 /// Maximum ADB payload we are willing to buffer when reading a message body.
 const MAX_PAYLOAD: usize = 1024 * 1024;
 
+/// Budget for the whole CNXN/AUTH handshake, so a device that stops answering
+/// produces an error instead of a task that never returns.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl std::fmt::Debug for StreamTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamTransport")
@@ -124,18 +128,7 @@ impl StreamTransport {
         writer.flush().await?;
         Ok(())
     }
-}
-
-#[async_trait]
-impl Transport for StreamTransport {
-    fn kind(&self) -> TransportKind {
-        self.kind
-    }
-    fn serial(&self) -> &str {
-        &self.serial
-    }
-
-    async fn open(&self) -> Result<AdbConnection> {
+    async fn open_inner(&self) -> Result<AdbConnection> {
         let mut writer = self.writer.lock().await;
         let banner = format!("adbshare::{}::{}", env!("CARGO_PKG_VERSION"), self.serial);
         let connect = Message::new(
@@ -157,7 +150,20 @@ impl Transport for StreamTransport {
         // AUTH SIGNATURE, and if the device still doesn't know us, with
         // AUTH RSAPUBLICKEY so the user can authorize this host. The
         // handshake ends when the device sends CNXN.
+        // adbd's `adbd_auth_confirm_key` returns without sending anything when
+        // there is no framework fd to prompt, and a rejected signature makes it
+        // ask again. Without a bound this either awaits a reply that never
+        // comes — leaking the socket, the USB handle and the pump thread — or
+        // re-signs forever, each round a full PKCS#8 parse plus an RSA-2048
+        // sign. Three attempts is what the protocol needs: token, and at most
+        // one rejection before the user authorises the key.
+        const MAX_AUTH_ATTEMPTS: u32 = 3;
+        let mut auth_attempts: u32 = 0;
         while msg.command == crate::packet::Command::Auth {
+            auth_attempts += 1;
+            if auth_attempts > MAX_AUTH_ATTEMPTS {
+                return Err(AdbError::Unauthorized);
+            }
             let key = self.key.as_ref().ok_or(AdbError::Unauthorized)?;
             if msg.arg0 != crate::packet::AUTH_TOKEN {
                 return Err(AdbError::InvalidResponse(format!(
@@ -216,6 +222,27 @@ impl Transport for StreamTransport {
             self.writer.clone(),
         )
         .await
+    }
+}
+
+#[async_trait]
+impl Transport for StreamTransport {
+    fn kind(&self) -> TransportKind {
+        self.kind
+    }
+    fn serial(&self) -> &str {
+        &self.serial
+    }
+
+    async fn open(&self) -> Result<AdbConnection> {
+        // A hard deadline over the whole handshake. Every read in here is a bare
+        // `read_exact`, and a device that stops talking — an unauthorised phone
+        // whose framework never answers, a cable pulled mid-handshake — would
+        // otherwise await forever, leaking the socket, the USB handle and the
+        // pump thread rather than returning an error the caller can act on.
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.open_inner())
+            .await
+            .map_err(|_| AdbError::Timeout)?
     }
 }
 
@@ -345,7 +372,13 @@ fn open_usb_pump(
         .name("adb-usb-pump".into())
         .spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
-            let read_timeout = std::time::Duration::from_millis(2);
+            // The device is idle far more often than it has something to say,
+            // so a short read timeout would mean one timed-out libusb call
+            // every 2 ms — roughly 500 syscalls a second per connected device,
+            // forever. Time out long enough that an idle device costs almost
+            // nothing, and keep a deadline so a live one still gets serviced
+            // promptly.
+            let read_timeout = std::time::Duration::from_millis(200);
             let write_timeout = std::time::Duration::from_millis(5_000);
             'pump: loop {
                 // Drain ALL pending outgoing writes before blocking on a read.
@@ -355,11 +388,38 @@ fn open_usb_pump(
                 loop {
                     match rx_from_app.try_recv() {
                         Ok(chunk) => {
-                            if let Err(e) =
-                                handle_for_thread.write_bulk(out_ep, &chunk, write_timeout)
-                            {
-                                tracing::error!(error = ?e, "adb-usb-pump: write_bulk failed");
-                                break 'pump;
+                            // `write_bulk` returns how many bytes it accepted,
+                            // and a short write is legal: the transfer can finish
+                            // before the whole buffer when it spans several URBs
+                            // or the endpoint FIFO fills. Discarding the count
+                            // (the old `if let Err(..)`) silently dropped the
+                            // tail of an ADB frame, so the 24-byte header claimed
+                            // more payload than arrived and the reader
+                            // desynchronised — surfacing much later as a magic
+                            // mismatch on an unrelated frame, with no error
+                            // anywhere near the cause.
+                            let mut written = 0usize;
+                            while written < chunk.len() {
+                                match handle_for_thread.write_bulk(
+                                    out_ep,
+                                    &chunk[written..],
+                                    write_timeout,
+                                ) {
+                                    Ok(0) => {
+                                        tracing::error!(
+                                            "adb-usb-pump: write_bulk made no progress"
+                                        );
+                                        break 'pump;
+                                    }
+                                    Ok(n) => written += n,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = ?e,
+                                            "adb-usb-pump: write_bulk failed"
+                                        );
+                                        break 'pump;
+                                    }
+                                }
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -382,7 +442,9 @@ fn open_usb_pump(
                             break;
                         }
                     }
-                    Err(rusb::Error::Timeout) => {}
+                    Err(rusb::Error::Timeout) => {
+                        // Idle: already spent `read_timeout` waiting, so loop.
+                    }
                     Err(e) => {
                         tracing::error!(error = ?e, "adb-usb-pump: read_bulk failed");
                         break;
