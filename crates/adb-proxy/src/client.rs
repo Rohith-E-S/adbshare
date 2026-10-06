@@ -472,14 +472,44 @@ impl ProxyClient {
         res
     }
 
+    /// Entries requested per `ListDir` round trip. Must be <= the device's
+    /// `LISTDIR_PAGE`; a bigger request is served as a full page and the loop
+    /// simply takes more trips.
+    const LISTDIR_PAGE: u32 = 16384;
+
+    /// Whole directory, paging until the device reports it has nothing left.
+    ///
+    /// The device sends one page per request: it used to send the entire
+    /// listing in one frame, so a directory past the frame cap (~118k entries)
+    /// made the host close the connection and the directory became unlistable.
     pub async fn listdir(&self, path: &str) -> Result<Vec<DirEntry>> {
+        let mut all = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let page = self.listdir_page(path, offset).await?;
+            let got = page.len() as u32;
+            all.extend(page);
+            // A short page means the directory ended. `offset` advances by the
+            // number the device *emitted*, which is what its own skip counter
+            // counts, so entries it could not lstat do not desynchronise the
+            // walk.
+            if got < Self::LISTDIR_PAGE {
+                return Ok(all);
+            }
+            offset += got;
+        }
+    }
+
+    async fn listdir_page(&self, path: &str, offset: u32) -> Result<Vec<DirEntry>> {
         let (conn, _permit) = self.acquire().await?;
         let res = async {
             let mut args = Vec::new();
             args.extend_from_slice(&(path.len() as u32).to_le_bytes());
             args.extend_from_slice(path.as_bytes());
+            args.extend_from_slice(&offset.to_le_bytes());
+            args.extend_from_slice(&Self::LISTDIR_PAGE.to_le_bytes());
             let resp = conn.request(Op::ListDir, &args).await?;
-            parse_dir_entries(&resp)
+            parse_dir_page(&resp)
         }
         .await;
         self.release(conn);
@@ -858,8 +888,19 @@ impl Drop for ProxyFile {
     }
 }
 
-fn parse_dir_entries(data: &[u8]) -> Result<Vec<DirEntry>> {
-    let mut entries = Vec::new();
+/// One `ListDir` page: `[count u32]` then that many entries. The count is
+/// cross-checked against the buffer so a truncated page is rejected instead of
+/// silently yielding a short directory.
+fn parse_dir_page(data: &[u8]) -> Result<Vec<DirEntry>> {
+    if data.len() < 4 {
+        return Err(ProxyError::Invalid("listdir count".into()));
+    }
+    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    parse_dir_entries(&data[4..], count)
+}
+
+fn parse_dir_entries(data: &[u8], expect: usize) -> Result<Vec<DirEntry>> {
+    let mut entries = Vec::with_capacity(expect.min(4096));
     let mut i = 0;
     while i < data.len() {
         if i + 4 > data.len() {
@@ -884,6 +925,12 @@ fn parse_dir_entries(data: &[u8]) -> Result<Vec<DirEntry>> {
             .ok_or_else(|| ProxyError::Invalid("dir entry stat".into()))?;
         i += 60;
         entries.push(DirEntry { name, stat });
+    }
+    if entries.len() != expect {
+        return Err(ProxyError::Invalid(format!(
+            "listdir page: header said {expect} entries, buffer held {}",
+            entries.len()
+        )));
     }
     Ok(entries)
 }

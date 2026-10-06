@@ -410,16 +410,35 @@ fn dispatch(op: u8, args: &[u8], conn: u64, owned: &OwnedFds) -> Vec<u8> {
             }
         }
         0x06 => match read_path(args) {
-            Some((path, _)) => match do_listdir(&path) {
-                Ok(data) => {
-                    out.push(0);
-                    out.extend_from_slice(&data);
+            // `[path][offset u32][max_entries u32]`. Paging is not an
+            // optimisation: the whole listing used to go out in one frame, so a
+            // directory big enough to exceed the host's frame cap (~118k entries
+            // at ~71 bytes each) made the host treat the reply as an oversized
+            // frame and close the connection, and the directory could not be
+            // listed at all. A 130k-entry directory measured 9,230,001 bytes
+            // against an 8,388,609-byte ceiling.
+            Some((path, rest)) => {
+                // A short arg block means an older host: fall back to one safe
+                // page rather than an unbounded listing.
+                let (offset, max_entries) = if rest.len() >= 8 {
+                    (
+                        u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize,
+                        u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize,
+                    )
+                } else {
+                    (0, LISTDIR_PAGE)
+                };
+                match do_listdir(&path, offset, max_entries.max(1)) {
+                    Ok(data) => {
+                        out.push(0);
+                        out.extend_from_slice(&data);
+                    }
+                    Err((s, msg)) => {
+                        out.push(s);
+                        out.extend_from_slice(msg.as_bytes());
+                    }
                 }
-                Err((s, msg)) => {
-                    out.push(s);
-                    out.extend_from_slice(msg.as_bytes());
-                }
-            },
+            }
             None => {
                 out.push(0x08);
                 out.extend_from_slice(b"bad path");
@@ -997,15 +1016,32 @@ fn encode_stat(st: &libc::stat) -> Vec<u8> {
     buf
 }
 
-fn do_listdir(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, &'static str)> {
+/// Entries per `ListDir` page. ~71 bytes per entry on a typical directory, so
+/// this is a little over 1 MiB: comfortably inside the frame cap with room to
+/// spare, and few enough round trips that paging a 130k-entry directory costs
+/// about eight requests.
+const LISTDIR_PAGE: usize = 16384;
+
+/// One page of a directory listing: `[count u32]` then `count` entries.
+///
+/// `count` is written last-known-first — it is prepended once the page is
+/// built — so the host can tell an exhausted directory (count 0) from a
+/// partial page and stop, instead of relying on the reply running out.
+fn do_listdir(
+    path: &[u8],
+    offset: usize,
+    max_entries: usize,
+) -> std::result::Result<Vec<u8>, (u8, String)> {
     use std::ffi::CStr;
     let mut cpath = path.to_vec();
     cpath.push(0);
     let dir = unsafe { libc::opendir(cpath.as_ptr() as *const _) };
     if dir.is_null() {
-        return Err((0x01, "opendir"));
+        return Err(stat_error(std::io::Error::last_os_error()));
     }
-    let mut out = Vec::new();
+    let mut body = Vec::new();
+    let mut seen = 0usize;
+    let mut emitted = 0usize;
     loop {
         let ent = unsafe { libc::readdir(dir) };
         if ent.is_null() {
@@ -1015,6 +1051,13 @@ fn do_listdir(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, &'static str)> {
         let name = unsafe { CStr::from_ptr(name_ptr) };
         let name_bytes = name.to_bytes();
         if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        // Skip everything before the requested window. `readdir` has no random
+        // access, so this is O(offset); with a 16k page the total cost of
+        // walking a 130k-entry directory stays well under a second.
+        seen += 1;
+        if seen <= offset {
             continue;
         }
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1028,10 +1071,17 @@ fn do_listdir(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, &'static str)> {
         if r != 0 {
             continue;
         }
-        out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(name_bytes);
-        out.extend_from_slice(&encode_stat(&st));
+        body.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        body.extend_from_slice(name_bytes);
+        body.extend_from_slice(&encode_stat(&st));
+        emitted += 1;
+        if emitted >= max_entries {
+            break;
+        }
     }
     unsafe { libc::closedir(dir) };
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(emitted as u32).to_le_bytes());
+    out.extend_from_slice(&body);
     Ok(out)
 }
