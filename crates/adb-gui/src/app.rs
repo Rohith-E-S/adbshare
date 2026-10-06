@@ -455,16 +455,21 @@ impl AdbShareApp {
                 self.selection = None;
                 self.browser.update(cx, |b, cx| b.set_idle(cx));
 
-                // A single failure is usually just the daemon still starting, so
-                // it is not worth a message. Once it has failed twice the user
-                // needs to be told, because an empty sidebar otherwise reads as
-                // "no phone plugged in" and sends them looking for the cable.
+                // The sidebar distinguishes "daemon unreachable" from "nothing
+                // plugged in" by `daemon_error`, so it has to be set on the
+                // *first* failure: the device list has already been cleared
+                // above, and with it still None the sidebar renders the
+                // onboarding card — "No phone connected, plug in a USB cable" —
+                // while a phone is plugged in and the daemon is merely busy.
+                //
+                // Only the *toast* waits for a repeat, because one failure is
+                // usually just the daemon still starting.
+                let advice = daemon::explain(&err);
+                self.daemon_error = Some(advice);
                 let repeated = self.daemon_failures >= 2;
                 if repeated || had_devices {
                     // The raw D-Bus error tells the user nothing; the sidebar
                     // keeps it for detail but leads with what to do about it.
-                    let advice = daemon::explain(&err);
-                    self.daemon_error = Some(advice);
                     self.toasts.push_with_action(
                         "Cannot reach adb-daemon",
                         ToastTone::Error,
@@ -475,30 +480,6 @@ impl AdbShareApp {
                 return;
             }
         };
-
-        // Announce arrivals and departures before rebuilding the list, so the
-        // toast reads sensibly.
-        let before: Vec<String> = self.devices.iter().map(|d| d.serial.clone()).collect();
-        for serial in &serials {
-            if !before.contains(serial) {
-                let name = self
-                    .devices
-                    .iter()
-                    .find(|d| &d.serial == serial)
-                    .map(|d| d.display_name().to_string())
-                    .unwrap_or_else(|| serial.clone());
-                self.toasts
-                    .push(format!("{name} connected"), ToastTone::Success);
-                crate::notify::send(&format!("{name} connected"), APP_NAME);
-            }
-        }
-        for serial in &before {
-            if !serials.contains(serial) {
-                self.toasts
-                    .push(format!("{serial} disconnected"), ToastTone::Warning);
-                crate::notify::send(&format!("{serial} disconnected"), APP_NAME);
-            }
-        }
 
         // Fan out concurrently. The daemon answers `device_info` per serial, so
         // awaiting them in sequence delayed the sidebar by one round trip per
@@ -547,7 +528,34 @@ impl AdbShareApp {
         if devices == self.devices {
             return;
         }
+        let previous = self.devices.clone();
+        // Announce arrivals and departures now that the friendly names are known.
+        //
+        // This used to run in the caller, against the serial list only. Two
+        // consequences: the name lookup searched `self.devices` for a serial it
+        // did not contain, so it always fell through to the bare serial (the
+        // "Pixel 8 connected" text could never appear, even on a real hotplug);
+        // and on the first poll `before` was empty, so every phone already
+        // plugged in at launch got a toast *and* a desktop notification.
+        let before: Vec<String> = previous.iter().map(|d| d.serial.clone()).collect();
+        let fresh: Vec<(String, String)> = devices
+            .iter()
+            .map(|d| (d.serial.clone(), d.display_name().to_string()))
+            .collect();
         self.devices = devices;
+        for (serial, name) in fresh {
+            if !before.contains(&serial) {
+                self.toasts
+                    .push(format!("{name} connected"), ToastTone::Success);
+                crate::notify::send(&format!("{name} connected"), APP_NAME);
+            }
+        }
+        for serial in &before {
+            if !self.devices.iter().any(|d| d.serial == *serial) {
+                self.toasts
+                    .push(format!("{serial} disconnected"), ToastTone::Warning);
+            }
+        }
         // Pick the first phone for the user, once. The GTK build did this and the
         // rewrite dropped it, so a phone plugged in before launch still showed
         // "Connect your phone" until the user found the sidebar.
@@ -753,7 +761,20 @@ impl AdbShareApp {
                 .await
                 .ok()
                 .filter(|m| !m.is_empty());
-            browser.update(cx, |b, cx| b.set_fuse_mount(mount, cx)).ok();
+            browser
+                .update(cx, |b, cx| {
+                    // Same staleness guard `fetch_dir_at` uses: a reply for a
+                    // device the user has already navigated away from must not
+                    // be applied, or `fuse_mount` points at phone A while the
+                    // browser shows phone B — and everything that opens a file
+                    // through the mount (Open with, Preview, Save as, Open in
+                    // Files) then reaches into the wrong phone.
+                    if b.device() != Some(device.as_str()) {
+                        return;
+                    }
+                    b.set_fuse_mount(mount, cx);
+                })
+                .ok();
         })
         .detach();
     }
@@ -1206,14 +1227,31 @@ impl AdbShareApp {
                 policy,
             )
             .await;
-            me.update(cx, |this, _cx| match result {
-                Ok(outcome) => match tree_result_message("Upload", &outcome) {
-                    Ok(msg) => this.toasts.push(msg, ToastTone::Success),
-                    Err(msg) => this.toasts.push(msg, ToastTone::Error),
-                },
-                Err(err) => this
-                    .toasts
-                    .push(format!("Could not queue {label}: {err}"), ToastTone::Error),
+            me.update(cx, |this, cx| {
+                match result {
+                    // `tree_result_message` returns Ok with the failures
+                    // appended when *some* entries failed, and a toast is
+                    // clamped to a few lines, so the failure list was clipped
+                    // out of view behind a green toast. Anything other than a
+                    // clean run goes to the dialog, as `on_tree_result` does.
+                    Ok(outcome) => match tree_result_message("Upload", &outcome) {
+                        Ok(msg) if outcome.errors.is_empty() => {
+                            this.toasts.push(msg, ToastTone::Success)
+                        }
+                        Ok(msg) | Err(msg) => {
+                            this.dialog = Dialog::Message {
+                                title: "Upload partly finished".into(),
+                                body: msg,
+                                tone: MessageTone::Warning,
+                                extra: None,
+                            }
+                        }
+                    },
+                    Err(err) => this
+                        .toasts
+                        .push(format!("Could not queue {label}: {err}"), ToastTone::Error),
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -1711,13 +1749,16 @@ impl AdbShareApp {
         let me = cx.entity();
         cx.spawn(async move |_this, cx| {
             let result = daemon::retry_failed().await;
-            me.update(cx, |this, _cx| match result {
-                Ok(count) => this
-                    .toasts
-                    .push(format!("Re-queued {count} transfer(s)"), ToastTone::Success),
-                Err(err) => this
-                    .toasts
-                    .push(format!("Could not retry: {err}"), ToastTone::Error),
+            me.update(cx, |this, cx| {
+                match result {
+                    Ok(count) => this
+                        .toasts
+                        .push(format!("Re-queued {count} transfer(s)"), ToastTone::Success),
+                    Err(err) => this
+                        .toasts
+                        .push(format!("Could not retry: {err}"), ToastTone::Error),
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -1790,13 +1831,21 @@ impl AdbShareApp {
         let shown = name.clone();
         cx.spawn(async move |_this, cx| {
             let result = daemon::mkdir(&device, &path).await;
-            me.update(cx, |this, _cx| match result {
-                Ok(()) => this
-                    .toasts
-                    .push(format!("Created {shown}"), ToastTone::Success),
-                Err(err) => this
-                    .toasts
-                    .push(format!("Could not create {shown}: {err}"), ToastTone::Error),
+            me.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this
+                        .toasts
+                        .push(format!("Created {shown}"), ToastTone::Success),
+                    Err(err) => this
+                        .toasts
+                        .push(format!("Could not create {shown}: {err}"), ToastTone::Error),
+                }
+                // Re-read: the local branch above refreshes, and without this
+                // the device branch left the pane showing the listing from
+                // before the user's own Ctrl+N, so the folder they just made was
+                // invisible until they pressed F5.
+                this.refresh_current(cx);
+                cx.notify();
             })
             .ok();
         })
@@ -1858,13 +1907,16 @@ impl AdbShareApp {
                 let shown = name.clone();
                 cx.spawn(async move |_this, cx| {
                     let result = daemon::rename(&device, &from, &to).await;
-                    me.update(cx, |this, _cx| match result {
-                        Ok(()) => this
-                            .toasts
-                            .push(format!("Renamed to {shown}"), ToastTone::Success),
-                        Err(err) => this
-                            .toasts
-                            .push(format!("Could not rename: {err}"), ToastTone::Error),
+                    me.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => this
+                                .toasts
+                                .push(format!("Renamed to {shown}"), ToastTone::Success),
+                            Err(err) => this
+                                .toasts
+                                .push(format!("Could not rename: {err}"), ToastTone::Error),
+                        }
+                        cx.notify();
                     })
                     .ok();
                 })
@@ -1923,6 +1975,9 @@ impl AdbShareApp {
                     this.toasts.push(failures.join("; "), ToastTone::Error);
                 }
                 this.refresh_current(cx);
+                // `refresh_current` only notifies the browser entity, so without
+                // this the "Deleted N item(s)" toast is never rendered.
+                cx.notify();
             })
             .ok();
         })
@@ -2011,13 +2066,16 @@ impl AdbShareApp {
             let Some(target) = targets.into_iter().next() else {
                 return;
             };
-            me.update(cx, |this, _cx| match localfs::copy_file(&source, &target) {
-                Ok(()) => this
-                    .toasts
-                    .push(format!("Saved to {}", target.display()), ToastTone::Success),
-                Err(err) => this
-                    .toasts
-                    .push(format!("Could not save: {err}"), ToastTone::Error),
+            me.update(cx, |this, cx| {
+                match localfs::copy_file(&source, &target) {
+                    Ok(()) => this
+                        .toasts
+                        .push(format!("Saved to {}", target.display()), ToastTone::Success),
+                    Err(err) => this
+                        .toasts
+                        .push(format!("Could not save: {err}"), ToastTone::Error),
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -2150,20 +2208,25 @@ impl AdbShareApp {
         let me = cx.entity();
         cx.spawn(async move |_this, cx| {
             let result = daemon::connect_wireless(&address).await;
-            me.update(cx, |this, _cx| match result {
-                Ok(ok) => {
-                    this.toasts.push(
-                        if ok.trim().is_empty() {
-                            format!("Connected to {address}")
-                        } else {
-                            format!("Connected to {address}: {ok}")
-                        },
-                        ToastTone::Success,
-                    );
+            me.update(cx, |this, cx| {
+                match result {
+                    Ok(ok) => {
+                        this.toasts.push(
+                            if ok.trim().is_empty() {
+                                format!("Connected to {address}")
+                            } else {
+                                format!("Connected to {address}: {ok}")
+                            },
+                            ToastTone::Success,
+                        );
+                    }
+                    // This sets the pairing dialog, so without a notify the
+                    // "Could not connect" error is never drawn.
+                    Err(err) => this.pairing_step(WifiStep::Failed {
+                        message: format!("Could not connect to {address}: {err}"),
+                    }),
                 }
-                Err(err) => this.pairing_step(WifiStep::Failed {
-                    message: format!("Could not connect to {address}: {err}"),
-                }),
+                cx.notify();
             })
             .ok();
         })
