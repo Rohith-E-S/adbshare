@@ -187,30 +187,31 @@ async fn handle_connection(
         }
         let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
         if len > MAX_REQUEST {
-            // Answer rather than hanging up: dropping the connection makes
-            // the caller see "connection closed" and destroys a pooled
-            // connection as collateral. Drain the oversized body first so we
-            // stay framed, then reply InvalidArg.
-            // Some of the body may already be in `buf` from the header read;
-            // count it and then drop the whole buffer, header and body alike.
-            // Leaving the buffered body behind would be parsed as the next
-            // request header and desync the stream.
-            let mut have = buf.len() - 5;
-            buf.clear();
-            let mut chunk = Vec::new();
-            while have < len {
-                match reader.read_buf(&mut chunk).await {
-                    Ok(0) => return,
-                    Ok(n) => have += n,
-                    Err(_) => return,
-                }
-            }
-            buf.clear();
+            // Answer, then hang up.
+            //
+            // Recovering the stream after an oversized frame is not possible
+            // with any confidence: `read_buf` fills whatever spare capacity the
+            // buffer has, so a read can return bytes belonging to the *next*
+            // request, and there is no way to tell how many of the buffered
+            // bytes were body and how many were lookahead. Measured, the surplus
+            // was non-deterministic (4331, 11704 and 28271 bytes across runs of
+            // the same 9 MiB frame), and keeping the surplus desynchronised the
+            // stream — the device then parsed the leftover as dozens of bogus
+            // zero-length requests. Keeping it and closing is equally broken.
+            //
+            // Draining first was also worse than useless against a hostile
+            // length field: it grew a scratch buffer to whatever `len` claimed,
+            // up to 4 GiB, where this code allocates nothing.
+            //
+            // So: reply with a clear error and drop the connection. The host
+            // client rejects oversized frames before sending them (see
+            // `ProxyConn::request`), so this path is only reachable from a peer
+            // that is already misbehaving, and the one thing we cannot do is
+            // guess where its next frame starts.
             wlog(format!(
-                "[{:?}] request too big: {} > {}",
+                "[{:?}] request too big: {} > {}; replying and closing",
                 addr, len, MAX_REQUEST
             ));
-            // Reuse `dispatch`'s framing: [len u32 LE][status u8][body].
             let msg = format!("request too big: {} bytes", len);
             let mut out = Vec::with_capacity(1 + msg.len());
             out.push(0x08); // InvalidArg
@@ -218,10 +219,9 @@ async fn handle_connection(
             let mut resp = Vec::with_capacity(out.len() + 4);
             resp.extend_from_slice(&(out.len() as u32).to_le_bytes());
             resp.extend_from_slice(&out);
-            if writer.write_all(&resp).await.is_err() {
-                return;
-            }
-            continue;
+            let _ = writer.write_all(&resp).await;
+            let _ = writer.flush().await;
+            return;
         }
         while buf.len() < 5 + len {
             match reader.read_buf(&mut buf).await {
