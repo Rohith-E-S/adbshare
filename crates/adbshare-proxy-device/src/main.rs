@@ -104,8 +104,41 @@ async fn handle_connection(stream: tokio::net::TcpStream, addr: std::net::Socket
         }
         let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
         if len > MAX_REQUEST {
-            wlog(format!("[{:?}] too big {}", addr, len));
-            return;
+            // Answer rather than hanging up: dropping the connection makes
+            // the caller see "connection closed" and destroys a pooled
+            // connection as collateral. Drain the oversized body first so we
+            // stay framed, then reply InvalidArg.
+            // Some of the body may already be in `buf` from the header read;
+            // count it and then drop the whole buffer, header and body alike.
+            // Leaving the buffered body behind would be parsed as the next
+            // request header and desync the stream.
+            let mut have = buf.len() - 5;
+            buf.clear();
+            let mut chunk = Vec::new();
+            while have < len {
+                match reader.read_buf(&mut chunk).await {
+                    Ok(0) => return,
+                    Ok(n) => have += n,
+                    Err(_) => return,
+                }
+            }
+            buf.clear();
+            wlog(format!(
+                "[{:?}] request too big: {} > {}",
+                addr, len, MAX_REQUEST
+            ));
+            // Reuse `dispatch`'s framing: [len u32 LE][status u8][body].
+            let msg = format!("request too big: {} bytes", len);
+            let mut out = Vec::with_capacity(1 + msg.len());
+            out.push(0x08); // InvalidArg
+            out.extend_from_slice(msg.as_bytes());
+            let mut resp = Vec::with_capacity(out.len() + 4);
+            resp.extend_from_slice(&(out.len() as u32).to_le_bytes());
+            resp.extend_from_slice(&out);
+            if writer.write_all(&resp).await.is_err() {
+                return;
+            }
+            continue;
         }
         while buf.len() < 5 + len {
             match reader.read_buf(&mut buf).await {

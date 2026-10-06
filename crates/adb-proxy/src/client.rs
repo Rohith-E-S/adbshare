@@ -54,6 +54,14 @@ pub type Result<T> = std::result::Result<T, ProxyError>;
 
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 
+/// Largest request body we will put on the wire. Matches the device proxy's
+/// own `MAX_REQUEST`. Enforced here so an oversized write fails as
+/// `TooLarge` instead of being silently dropped by the device — which
+/// surfaces as "connection closed" and takes a pooled connection with it.
+/// fuser advertises `max_write` of 16 MiB, so this is genuinely reachable
+/// from a large FUSE write.
+const MAX_REQUEST: usize = 8 * 1024 * 1024;
+
 /// Upper bound for a single RPC round-trip. Without it a hung device proxy
 /// blocks FUSE ops (and transfers) forever.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -226,6 +234,16 @@ impl ProxyConn {
         if self.is_closed() || self.is_poisoned() {
             return Err(ProxyError::Closed);
         }
+        // Check before touching the socket: the device cannot recover from an
+        // oversized frame, and sending it would poison this connection.
+        if args.len() > MAX_REQUEST {
+            return Err(ProxyError::TooLarge(args.len()));
+        }
+        // The length field is 32-bit; a longer slice would frame as a bogus
+        // size rather than fail.
+        let Ok(len) = u32::try_from(args.len()) else {
+            return Err(ProxyError::TooLarge(args.len()));
+        };
         // Serialize requests on this connection: lock held for the duration
         // of the request + response, so no two requests interleave.
         let _guard = self.inner.req_lock.lock().await;
@@ -233,7 +251,7 @@ impl ProxyConn {
         // Frame: [op u8][len u32 LE][args]
         let mut frame = BytesMut::with_capacity(5 + args.len());
         frame.extend_from_slice(&[op as u8]);
-        frame.extend_from_slice(&(args.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&len.to_le_bytes());
         frame.extend_from_slice(args);
 
         // The reader task pushes every received frame onto `resp_tx` in
