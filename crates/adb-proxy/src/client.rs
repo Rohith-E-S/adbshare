@@ -436,6 +436,11 @@ impl ProxyClient {
             return Err(ProxyError::Invalid("open response short".into()));
         }
         let fd = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+        // Hand the connection back. `ProxyFile` no longer holds one, so
+        // dropping it here without releasing would shrink the pool by one on
+        // every open — after `max_conns` opens the pool is empty and each
+        // acquire dials a fresh connection to the device.
+        self.release(conn);
         Ok(ProxyFile {
             inner: Arc::new(ProxyFileInner {
                 client: self.clone(),

@@ -46,26 +46,86 @@ async fn main() -> ExitCode {
     };
     wlog(format!("listening on 127.0.0.1:{} (loopback only)", port));
 
+    // Shared by every connection: fd -> owning connection id.
+    let owned = std::sync::Arc::new(OwnedFds::default());
+
     loop {
         wlog("[main] waiting for connection".to_string());
         match listener.accept().await {
             Ok((stream, addr)) => {
                 wlog(format!("accepted from {:?}", addr));
-                tokio::spawn(handle_connection(stream, addr));
+                let conn = next_conn_id();
+                tokio::spawn(handle_connection(stream, addr, conn, owned.clone()));
             }
             Err(e) => wlog(format!("accept: {}", e)),
         }
     }
 }
 
-/// Arms a watchdog that force-closes the client socket if no request is
-/// completed within `IDLE_TIMEOUT`. Sending on the returned sender resets
-/// the timer; dropping it disarms the watchdog. Implemented with a plain
-/// thread + `libc::shutdown` because this binary is built without tokio's
-/// `time` feature.
-fn spawn_idle_watchdog(fd: i32) -> std::sync::mpsc::Sender<()> {
+/// Monotonic connection ids, so each socket can be told apart in the fd table
+/// and in the log.
+fn next_conn_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// A connection's open file descriptors, so the idle watchdog can tell a
+/// genuinely idle connection from one that is holding files open.
+///
+/// Fds are process-global, so this records which connection opened each one.
+/// It is deliberately *not* used to close fds when a connection goes away: a
+/// client may still be holding a `ProxyFile` whose fd was opened over a
+/// connection that has since been replaced, so closing here would break a
+/// live file. Reclaiming them is the client's job, via `Op::Close`.
+#[derive(Debug, Default)]
+struct OwnedFds {
+    /// fd -> owning connection id.
+    by_conn: std::sync::Mutex<std::collections::HashMap<u32, u64>>,
+}
+
+impl OwnedFds {
+    fn track(&self, fd: u32, conn: u64) {
+        self.by_conn.lock().unwrap().insert(fd, conn);
+    }
+    fn untrack(&self, fd: u32) {
+        self.by_conn.lock().unwrap().remove(&fd);
+    }
+    fn count_for(&self, conn: u64) -> usize {
+        self.by_conn
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|o| **o == conn)
+            .count()
+    }
+}
+
+/// Handle to a connection's idle watchdog.
+///
+/// Two jobs: re-arm on activity, and close the socket if the connection goes
+/// quiet for `IDLE_TIMEOUT` *while holding no files*. A client that has a
+/// file open is not idle — `less`, a media player, or an editor can hold a
+/// descriptor for hours — and killing it makes every later read on that
+/// handle fail permanently with no way to reopen.
+///
+/// Implemented with a plain thread + `libc::shutdown` because this binary is
+/// built without tokio's `time` feature.
+struct IdleWatchdog {
+    /// Activity: re-arm the timer.
+    tx: std::sync::mpsc::Sender<()>,
+}
+
+impl IdleWatchdog {
+    fn touch(&self) {
+        let _ = self.tx.send(());
+    }
+}
+
+fn spawn_idle_watchdog(fd: i32, conn: u64, fds: std::sync::Arc<OwnedFds>) -> IdleWatchdog {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let _ = std::thread::Builder::new()
+    let watch_fds = fds.clone();
+    match std::thread::Builder::new()
         .name("idle-watchdog".into())
         .spawn(move || {
             loop {
@@ -73,6 +133,19 @@ fn spawn_idle_watchdog(fd: i32) -> std::sync::mpsc::Sender<()> {
                     Ok(()) => continue, // activity: reset the timer
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let held = watch_fds.count_for(conn);
+                        if held > 0 {
+                            // Legitimately holding files open: keep waiting rather
+                            // than pulling the rug out. Re-check on the same
+                            // cadence so a later idle period still times out.
+                            wlog(format!(
+                                "[fd {}] idle {}s but holding {} open fd(s); keeping alive",
+                                fd,
+                                IDLE_TIMEOUT.as_secs(),
+                                held
+                            ));
+                            continue;
+                        }
                         wlog(format!("[fd {}] idle timeout, closing connection", fd));
                         // Interrupts any pending async read on this socket.
                         unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
@@ -80,13 +153,23 @@ fn spawn_idle_watchdog(fd: i32) -> std::sync::mpsc::Sender<()> {
                     }
                 }
             }
-        });
-    tx
+        }) {
+        Ok(_) => {}
+        // No watchdog thread: the connection then has no idle backstop. Log
+        // it rather than pretending it is armed.
+        Err(e) => wlog(format!("[fd {}] idle watchdog failed to start: {}", fd, e)),
+    }
+    IdleWatchdog { tx }
 }
 
-async fn handle_connection(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) {
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    addr: std::net::SocketAddr,
+    conn: u64,
+    owned: std::sync::Arc<OwnedFds>,
+) {
     use std::os::fd::AsRawFd;
-    let watchdog = spawn_idle_watchdog(stream.as_raw_fd());
+    let watchdog = spawn_idle_watchdog(stream.as_raw_fd(), conn, owned.clone());
     let (mut reader, mut writer) = stream.into_split();
     let mut buf = Vec::with_capacity(64 * 1024);
     wlog(format!("[{:?}] open", addr));
@@ -157,11 +240,20 @@ async fn handle_connection(stream: tokio::net::TcpStream, addr: std::net::Socket
         let args = buf[5..5 + len].to_vec();
         buf.drain(..5 + len);
         wlog(format!("[{:?}] op={:#x} len={}", addr, op, len));
+        // A request in flight is activity, even before it completes.
+        watchdog.touch();
 
         // The dispatch handlers use blocking libc calls (pread/pwrite/
         // readdir/stat/...); run them on the blocking pool so they cannot
         // stall the async runtime.
-        let response = match tokio::task::spawn_blocking(move || dispatch(op, &args)).await {
+        // Cloned per iteration: the closure would otherwise move `owned` out
+        // of it, which the next iteration still needs.
+        let owned_for_dispatch = owned.clone();
+        let response = match tokio::task::spawn_blocking(move || {
+            dispatch(op, &args, conn, &owned_for_dispatch)
+        })
+        .await
+        {
             Ok(response) => response,
             Err(e) => {
                 wlog(format!("[{:?}] dispatch task failed: {}", addr, e));
@@ -178,15 +270,17 @@ async fn handle_connection(stream: tokio::net::TcpStream, addr: std::net::Socket
         }
 
         // Completed request: reset the idle timer.
-        let _ = watchdog.send(());
+        watchdog.touch();
     }
 }
 
-fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
+fn dispatch(op: u8, args: &[u8], conn: u64, owned: &OwnedFds) -> Vec<u8> {
     let mut out = Vec::new();
     match op {
         0x01 => match handle_open(args) {
             Ok(fd) => {
+                // Remember who owns it so `Op::Close` and teardown can find it.
+                owned.track(fd, conn);
                 out.push(0u8);
                 out.extend_from_slice(&fd.to_le_bytes());
             }
@@ -203,6 +297,7 @@ fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
                 let fd = u32::from_le_bytes([args[0], args[1], args[2], args[3]]);
                 let r = unsafe { libc::close(fd as i32) };
                 if r == 0 {
+                    owned.untrack(fd);
                     out.push(0);
                 } else {
                     out.push(0x07);
