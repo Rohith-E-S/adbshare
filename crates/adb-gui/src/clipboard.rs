@@ -25,15 +25,52 @@ pub fn mirror_to_system(cx: &App, entries: &[DirEntry], from_dir: &Path) {
     if paths.is_empty() {
         return;
     }
-    let text = paths
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
+    // A newline in a filename is legal on Linux, and the format is
+    // line-oriented: copying `report\nfinal.txt` wrote two lines, and pasting
+    // it back produced two paths that do not exist. Percent-encode the whole
+    // selection as `file://` URIs when any path would break a line, which
+    // `decode` already understands. The common case — no newline anywhere —
+    // keeps emitting bare paths, so nothing that reads the clipboard as text
+    // changes behaviour.
+    let needs_escaping = paths.iter().any(|p| {
+        let s = p.to_string_lossy();
+        s.contains('\n') || s.contains('\r')
+    });
+    let text = if needs_escaping {
+        paths
+            .iter()
+            .map(|p| encode_uri(p))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
         text,
         PATH_MIME.to_string(),
     ));
+}
+
+/// A `file://` URI for `path`, percent-encoding everything outside the RFC 3986
+/// unreserved set plus `/`.
+///
+/// `%` itself has to be escaped: `decode` percent-decodes a URI path, so a
+/// literal `%20` in a filename would otherwise come back as a space.
+fn encode_uri(path: &Path) -> String {
+    let mut out = String::from("file://");
+    for byte in path.to_string_lossy().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// Read a path list back off the system clipboard.

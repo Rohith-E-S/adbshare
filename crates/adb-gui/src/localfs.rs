@@ -209,7 +209,24 @@ pub fn trash(path: &Path) -> Result<PathBuf, String> {
     let (target, trash_name) = unique_name(&files_dir, &stem);
     let info_target = info_dir.join(format!("{trash_name}.trashinfo"));
 
-    let absolute = fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Resolve the *directory*, not the entry. `canonicalize` on the entry
+    // follows a final symlink, which broke it two ways: trashing a link
+    // recorded its target's path, so "Restore" put the link back where the
+    // target lived instead of where the link was, and trashing a *dangling*
+    // link failed outright with ENOENT — the one kind of file most worth
+    // clearing out. Canonicalising the parent still resolves `..` and relative
+    // prefixes; the last component is joined verbatim.
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{}: no file name", path.display()))?
+        .to_os_string();
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::env::current_dir().map_err(|e| format!("no current directory: {e}"))?,
+    };
+    let absolute = fs::canonicalize(&dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .join(file_name);
     let now = chrono::Local::now();
     let info = format!(
         "[Trash Info]\nPath={}\nDeletionDate={}\n",

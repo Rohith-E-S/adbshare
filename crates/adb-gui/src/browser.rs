@@ -1018,12 +1018,20 @@ impl Browser {
         if self.visible.is_empty() {
             return false;
         }
+        let len = self.visible.len() as isize;
         let current = self
             .focused
             .and_then(|ix| self.visible.iter().position(|v| *v == ix))
-            .map(|pos| pos as isize)
-            .unwrap_or(-1);
-        let next = (current + delta).rem_euclid(self.visible.len() as isize) as usize;
+            .map(|pos| pos as isize);
+        // With nothing focused, `current` is None. Treating it as -1 made Up
+        // land on `len - 2`: (-1 + -1) mod len, so the first press of the Up
+        // arrow skipped the last row instead of selecting it. Down happened to
+        // come out right at 0, which is why only one direction looked broken.
+        let next = match current {
+            Some(pos) => (pos + delta).rem_euclid(len) as usize,
+            None if delta < 0 => (len - 1) as usize,
+            None => 0,
+        };
         let index = self.visible[next];
         self.focused = Some(index);
         if !extend {
@@ -1054,6 +1062,14 @@ impl Browser {
         self.selection.retain(|ix| visible.contains(ix));
         if self.focused.is_some_and(|ix| !visible.contains(&ix)) {
             self.focused = None;
+        }
+        // The anchor has to be dropped on the same terms. `extend_range` looks
+        // the anchor up in `visible` and returns without touching anything when
+        // it is not there, so a filter that hid the anchor turned Shift+click
+        // into a silent no-op: the row under the cursor got focus and the
+        // selection never changed, which reads as a dead click.
+        if self.extend_anchor.is_some_and(|ix| !visible.contains(&ix)) {
+            self.extend_anchor = None;
         }
     }
 
@@ -1280,7 +1296,8 @@ impl Browser {
 
     fn open_focused(&mut self, _: &OpenFocused, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(entry) = self.focused_entry()
-            && let Some(outcome) = self.open_index(self.index_of(&entry))
+            && let Some(index) = self.index_of(&entry)
+            && let Some(outcome) = self.open_index(index)
         {
             cx.emit(outcome.into_event());
         }
@@ -1459,11 +1476,18 @@ impl Browser {
         }
     }
 
-    fn index_of(&self, entry: &DirEntry) -> usize {
+    /// Where `entry` sits in the current listing, or `None` if it is no longer
+    /// there.
+    ///
+    /// This used to fall back to `0`, so a focus left pointing at an entry that
+    /// a refresh had since removed made Enter open the *first* file in the
+    /// directory: the user activated a name they could still see highlighted
+    /// and got something else entirely. There is no sensible index to fall
+    /// back to, so the caller does nothing instead.
+    fn index_of(&self, entry: &DirEntry) -> Option<usize> {
         self.entries
             .iter()
             .position(|candidate| candidate.name == entry.name)
-            .unwrap_or(0)
     }
 
     // ── Rubber-band selection ──────────────────────────────────────────────

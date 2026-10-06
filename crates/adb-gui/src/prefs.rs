@@ -104,13 +104,15 @@ impl Preferences {
             tracing::warn!("could not create {}: {err}", parent.display());
             return;
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(err) = std::fs::write(&path, text) {
-                    tracing::warn!("could not write {}: {err}", path.display());
-                }
+        let text = match serde_json::to_string_pretty(self) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::warn!("could not serialise preferences: {err}");
+                return;
             }
-            Err(err) => tracing::warn!("could not serialise preferences: {err}"),
+        };
+        if let Err(err) = write_atomically(&path, text.as_bytes()) {
+            tracing::warn!("could not write {}: {err}", path.display());
         }
     }
 
@@ -146,6 +148,47 @@ pub struct ViewPreferences {
 }
 
 /// `~/.config/adbshare/gui.json`, or the XDG equivalent.
+/// Write `bytes` to `path` so a reader never sees a half-written file.
+///
+/// `fs::write` truncates in place and then writes, so a crash, a full disk or a
+/// kill between the two left the preferences truncated — usually empty, which
+/// then failed to parse and silently reset every setting to its default. Write a
+/// sibling temp file, flush it to disk, and `rename` it over the target: within
+/// one directory the rename is atomic, so the file is either the old contents
+/// or the new ones.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    // Same directory as the target, so the rename cannot cross a filesystem
+    // (which would make it a copy, and non-atomic).
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        // Without the flush the rename can land before the data does, which
+        // defeats the point on a machine that loses power.
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    // Best effort: persist the directory entry too. Not all platforms allow
+    // opening a directory for this, and failing to should not fail the save.
+    if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or(path)) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 fn config_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("adbshare").join("gui.json"))
 }
