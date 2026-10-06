@@ -110,6 +110,7 @@ enum ProxyRequest {
     Rmdir(String, Reply<()>),
     Rename(String, String, Reply<()>),
     Truncate(String, u64, Reply<()>),
+    Fstat(ProxyFile, Reply<Stat>),
 }
 
 impl SyncProxy {
@@ -200,6 +201,10 @@ impl SyncProxy {
                                 let r = client.truncate(&path, size).await;
                                 let _ = s.send(r);
                             }
+                            ProxyRequest::Fstat(file, s) => {
+                                let r = file.stat().await;
+                                let _ = s.send(r);
+                            }
                         }
                     }
                 });
@@ -254,6 +259,11 @@ impl SyncProxy {
     }
     fn close(&self, file: ProxyFile) -> std::result::Result<(), ProxyError> {
         self.call(|tx| ProxyRequest::Close(file, tx))
+    }
+    /// Attributes of the file `file` actually has open, via `fstat` on the
+    /// device-side fd.
+    fn fstat(&self, file: ProxyFile) -> std::result::Result<Stat, ProxyError> {
+        self.call(|tx| ProxyRequest::Fstat(file, tx))
     }
     fn mkdir(&self, path: &str, mode: u32) -> std::result::Result<(), ProxyError> {
         self.call(|tx| ProxyRequest::Mkdir(path.to_string(), mode, tx))
@@ -443,7 +453,7 @@ impl Filesystem for Adbfs {
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let path = self.ino_to_path.lock().get(&ino).cloned();
         let path = match path {
             Some(p) => p,
@@ -452,6 +462,40 @@ impl Filesystem for Adbfs {
                 return;
             }
         };
+        // An fh means "describe the file that is open". `read`/`write` go
+        // through the device fd and so keep referring to the original inode
+        // after an unlink or a replace, whereas a path-based stat would report
+        // whatever now occupies the path. fstat also bypasses the TTL cache,
+        // whose entry is keyed by path.
+        //
+        // Note the Linux kernel does not currently hand us an fh for the
+        // fstat() of an open file (measured: getattr arrives with fh=None even
+        // past the 2s attr TTL), so in practice this branch is taken only when
+        // a caller does supply one. It is here because the FUSE contract says
+        // an fh takes precedence, and silently ignoring it would be wrong the
+        // moment a caller does pass it.
+        //
+        // Clone the handle out so the `open_files` lock is not held across the
+        // round trip below.
+        let open = fh.and_then(|fh| {
+            self.open_files
+                .lock()
+                .get(&fh)
+                .map(|open| open.proxy.clone())
+        });
+        if let Some(file) = open {
+            match self.proxy.fstat(file) {
+                Ok(stat) => {
+                    let attr = self.attr_from_stat(ino, stat);
+                    reply.attr(&TTL, &attr);
+                    return;
+                }
+                Err(e) => {
+                    reply.error(Self::proxy_to_errno(e));
+                    return;
+                }
+            }
+        }
         if let Some(stat) = self.cache.get(&path) {
             let attr = self.attr_from_stat(ino, stat);
             reply.attr(&TTL, &attr);
@@ -909,7 +953,7 @@ impl Filesystem for Adbfs {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -930,7 +974,8 @@ impl Filesystem for Adbfs {
         };
         if let Some(s) = size {
             // Truncate is the one setattr operation the proxy protocol
-            // supports; propagate failures instead of swallowing them.
+            // supports, and it is path-based: there is no ftruncate op. The
+            // returned attributes below are still taken from the open fd.
             if let Err(e) = self.proxy.truncate(&path_str, s) {
                 reply.error(Self::proxy_to_errno(e));
                 return;
@@ -945,7 +990,19 @@ impl Filesystem for Adbfs {
             reply.error(Errno::ENOSYS);
             return;
         }
-        match self.proxy.stat(&path_str) {
+        // As in `getattr`: an fh means describe the open file, not whatever
+        // now occupies the path.
+        let open = fh.and_then(|fh| {
+            self.open_files
+                .lock()
+                .get(&fh)
+                .map(|open| open.proxy.clone())
+        });
+        let stat = match open {
+            Some(file) => self.proxy.fstat(file),
+            None => self.proxy.stat(&path_str),
+        };
+        match stat {
             Ok(stat) => {
                 self.cache.put(path, stat);
                 let attr = self.attr_from_stat(ino, stat);

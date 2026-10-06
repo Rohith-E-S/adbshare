@@ -658,6 +658,24 @@ impl ProxyFile {
         res
     }
 
+    /// `fstat` on this handle's device-side fd.
+    ///
+    /// Describes the file that is actually open, which a path-based `stat`
+    /// cannot do once the file has been unlinked or replaced: the fd keeps
+    /// referring to the original inode while the path now resolves to
+    /// something else entirely.
+    pub async fn stat(&self) -> Result<Stat> {
+        let fd = self.fd()?;
+        let (conn, _permit) = self.inner.client.acquire().await?;
+        let res = async {
+            let resp = conn.request(Op::Fstat, &fd.to_le_bytes()).await?;
+            Stat::decode(&resp).ok_or_else(|| ProxyError::Invalid("fstat decode".into()))
+        }
+        .await;
+        self.inner.client.release(conn);
+        res
+    }
+
     pub async fn close(self) -> Result<()> {
         // Claim the fd first so a concurrent clone cannot close it twice.
         let fd = self.inner.fd.lock().take().ok_or(ProxyError::Closed)?;

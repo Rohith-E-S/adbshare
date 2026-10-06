@@ -21,6 +21,10 @@ pub enum Op {
     Utime = 0x10,
     DiskUsage = 0x11,
     CopyFile = 0x12,
+    /// `fstat` on an already-open fd. Separate from `Stat` (0x05) because
+    /// `getattr` has to describe the *open file*, which a path lookup cannot
+    /// do once the file has been unlinked or replaced underneath us.
+    Fstat = 0x13,
 }
 
 #[repr(u8)]

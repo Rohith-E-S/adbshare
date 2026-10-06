@@ -264,6 +264,23 @@ fn dispatch(op: u8, args: &[u8]) -> Vec<u8> {
                 out.extend_from_slice(b"bad path");
             }
         },
+        0x13 => {
+            if args.len() < 4 {
+                out.push(0x08);
+                out.extend_from_slice(b"short fstat");
+            } else {
+                let fd = i32::from_le_bytes([args[0], args[1], args[2], args[3]]);
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let r = unsafe { libc::fstat(fd, &mut st) };
+                if r != 0 {
+                    out.push(0x07);
+                    out.extend_from_slice(b"fstat");
+                } else {
+                    out.push(0);
+                    out.extend_from_slice(&encode_stat(&st));
+                }
+            }
+        }
         0x06 => match read_path(args) {
             Some((path, _)) => match do_listdir(&path) {
                 Ok(data) => {
