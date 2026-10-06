@@ -349,8 +349,20 @@ impl Adbfs {
         if ino == INodeNo::ROOT {
             return;
         }
-        if let Some(path) = self.ino_to_path.lock().remove(&ino) {
-            self.path_to_ino.lock().remove(&path);
+        // Both maps have to move together, and in the order `ino_for` and the
+        // rename handler already take them: path_to_ino, then ino_to_path.
+        //
+        // Doing it as two statements left a window in which a concurrent
+        // `ino_for` (from lookup/create/mkdir/readdir) could still read the
+        // path_to_ino entry and hand the kernel an inode whose forward mapping
+        // was already gone — after which every getattr/open/readdir for that
+        // nodeid answers EINVAL, and the next lookup allocates a *different*
+        // inode for the same path. That window was unreachable while fuser ran
+        // a single event-loop thread, but mount.rs now sets n_threads = 4.
+        let mut p2i = self.path_to_ino.lock();
+        let mut i2p = self.ino_to_path.lock();
+        if let Some(path) = i2p.remove(&ino) {
+            p2i.remove(&path);
         }
     }
 
