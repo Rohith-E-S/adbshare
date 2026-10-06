@@ -329,6 +329,11 @@ impl From<JobDto> for JobInfo {
 pub struct TreeEnqueueResult {
     #[serde(default)]
     pub enqueued: Vec<u64>,
+    /// Files `copy_tree` copied on the device without going through the queue,
+    /// so it has no job ids. Counted separately rather than reported as
+    /// invented ids, which used to collide with real queue ids.
+    #[serde(default)]
+    pub copied: usize,
     #[serde(default)]
     pub errors: Vec<String>,
 }
@@ -418,10 +423,12 @@ pub fn format_diagnostics(report: &DiagnosticReportDto) -> String {
 /// success is reported as `Ok` with the failures appended, because the user
 /// still needs to know what did not transfer.
 pub fn tree_result_message(action: &str, result: &TreeEnqueueResult) -> Result<String, String> {
-    if result.enqueued.is_empty() && !result.errors.is_empty() {
+    // `copy_tree` copies on the device and never queues, so total the two.
+    let total = result.enqueued.len() + result.copied;
+    if total == 0 && !result.errors.is_empty() {
         return Err(result.errors.join("\n"));
     }
-    let mut message = format!("{action} queued {} file(s)", result.enqueued.len());
+    let mut message = format!("{action} queued {total} file(s)");
     if !result.errors.is_empty() {
         message.push_str("\n\nSome entries failed:\n");
         message.push_str(&result.errors.join("\n"));

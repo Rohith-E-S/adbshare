@@ -1369,16 +1369,20 @@ impl ManagerInterface {
                     .push(format!("{src}: directory nesting too deep"));
                 continue;
             }
-            if out.enqueued.len() > 10_000 {
-                out.errors.push("too many files (limit 10000)".into());
-                break;
-            }
             let _ = client.mkdir(&dst, 0o755).await;
             let entries = client
                 .listdir(&src)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(format!("list {src}: {e}")))?;
             for entry in entries {
+                // Per entry, not per directory: checked only at the top of the
+                // loop it never fired for a single wide directory, so one bus
+                // call could drive unbounded `copy_file` round trips.
+                if out.copied + out.errors.len() > 10_000 {
+                    out.errors.push("too many files (limit 10000)".into());
+                    return serde_json::to_string(&out)
+                        .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")));
+                }
                 if entry.stat.mode.is_symlink() {
                     continue;
                 }
@@ -1388,7 +1392,7 @@ impl ManagerInterface {
                     stack.push((src_child, dst_child, depth + 1));
                 } else {
                     match client.copy_file(&src_child, &dst_child).await {
-                        Ok(()) => out.enqueued.push(out.enqueued.len() as u64 + 1),
+                        Ok(()) => out.copied += 1,
                         Err(e) => out.errors.push(format!("copy {src_child}: {e}")),
                     }
                 }
@@ -1743,6 +1747,13 @@ struct DiagnosticReport {
 struct TreeEnqueueResult {
     #[serde(default)]
     enqueued: Vec<u64>,
+    /// Files copied synchronously by `copy_tree`. That handler performs the
+    /// copies on the device via `Op::CopyFile` and never touches the queue, so
+    /// it has no job ids to report — it used to invent `1..n`, which collided
+    /// with real queue ids (`JobQueue::next_id` also starts at 1) and so made
+    /// `cancel_job`/`pause_job` on one of these act on an unrelated transfer.
+    #[serde(default)]
+    copied: usize,
     #[serde(default)]
     errors: Vec<String>,
 }
