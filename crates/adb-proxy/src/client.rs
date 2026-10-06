@@ -763,8 +763,14 @@ fn parse_dir_entries(data: &[u8]) -> Result<Vec<DirEntry>> {
         if i + name_len + 60 > data.len() {
             return Err(ProxyError::Invalid("dir entry payload".into()));
         }
-        let name = String::from_utf8(data[i..i + name_len].to_vec())
-            .map_err(|_| ProxyError::Invalid("dir entry utf8".into()))?;
+        // Linux filenames are arbitrary byte strings, and Android media folders are a
+        // common home for Shift-JIS/CP437 names that are not valid UTF-8. Decoding
+        // strictly made one such name fail the whole listing — the directory became
+        // unlistable (EIO on FUSE readdir) and the daemon's recursive copy failed on
+        // it. Decode lossily instead, so a bad name renders as U+FFFD and its
+        // neighbours are still usable. Same rationale as the GUI's own
+        // `to_string_lossy` on paths.
+        let name = String::from_utf8_lossy(&data[i..i + name_len]).into_owned();
         i += name_len;
         let stat = Stat::decode(&data[i..i + 60])
             .ok_or_else(|| ProxyError::Invalid("dir entry stat".into()))?;
