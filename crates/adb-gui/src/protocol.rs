@@ -359,6 +359,8 @@ pub struct DiagnosticReportDto {
     #[serde(default)]
     pub helper_env_exists: bool,
     #[serde(default)]
+    pub auth_key_path: String,
+    #[serde(default)]
     pub devices: Vec<DeviceDiagDto>,
 }
 
@@ -372,6 +374,9 @@ pub fn format_diagnostics(report: &DiagnosticReportDto) -> String {
         lines.push("ADB: not found on PATH — install android-tools and retry.".to_string());
     }
     lines.push(format!("ADB server: {}", report.adb_server));
+    if !report.auth_key_path.is_empty() {
+        lines.push(format!("Auth key: {}", report.auth_key_path));
+    }
     if report.helper_env_present && report.helper_env_exists {
         lines.push("Phone helper: ADBSHARE_PROXY_BIN points at a file.".to_string());
     } else if report.helper_env_present {

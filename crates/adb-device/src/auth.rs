@@ -27,11 +27,22 @@ use zeroize::Zeroize;
 use crate::error::{AdbError, Result};
 
 /// 2048-bit RSA key used for ADB authentication.
-#[derive(Debug)]
 pub struct AdbKey {
     pkcs8_der: Vec<u8>,
     ssh_pub: Vec<u8>,
     path: PathBuf,
+}
+
+/// Redacted: `pkcs8_der` is raw private key material and `Drop` zeroizes it,
+/// so a derived `Debug` would undo that hygiene the moment anyone logs the
+/// key with `{:?}` or `tracing::info!(?key, ..)`.
+impl std::fmt::Debug for AdbKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdbKey")
+            .field("path", &self.path)
+            .field("pkcs8_der", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl AdbKey {

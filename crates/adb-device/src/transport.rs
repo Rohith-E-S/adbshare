@@ -225,6 +225,10 @@ impl Transport for StreamTransport {
 pub struct TcpTransport {
     pub serial: String,
     pub addr: String,
+    /// RSA key for the AUTH handshake. adbd sends `AUTH TOKEN` in reply to
+    /// `CNXN` unless it has already authorised this host, so a transport
+    /// without a key can only ever connect to a device that needs no auth.
+    pub key: Option<Arc<crate::auth::AdbKey>>,
 }
 
 #[async_trait]
@@ -239,11 +243,12 @@ impl Transport for TcpTransport {
     async fn open(&self) -> Result<AdbConnection> {
         let stream = TcpStream::connect(&self.addr).await?;
         let (r, w) = stream.into_split();
-        let inner = StreamTransport::new(
+        let inner = StreamTransport::with_key(
             TransportKind::Tcp,
             self.serial.clone(),
             Box::new(r),
             Box::new(w),
+            self.key.clone(),
         );
         inner.open().await
     }
@@ -259,6 +264,8 @@ pub struct UsbTransport {
     pub interface_number: u8,
     pub in_endpoint: u8,
     pub out_endpoint: u8,
+    /// RSA key for the AUTH handshake. See [`TcpTransport::key`].
+    pub key: Option<Arc<crate::auth::AdbKey>>,
 }
 
 #[async_trait]
@@ -283,7 +290,13 @@ impl Transport for UsbTransport {
             let _ = tx.send(result);
         });
         let (reader, writer) = rx.await.map_err(|_| AdbError::Disconnected)??;
-        let inner = StreamTransport::new(TransportKind::Usb, self.serial.clone(), reader, writer);
+        let inner = StreamTransport::with_key(
+            TransportKind::Usb,
+            self.serial.clone(),
+            reader,
+            writer,
+            self.key.clone(),
+        );
         inner.open().await
     }
 }

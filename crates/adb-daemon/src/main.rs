@@ -72,6 +72,12 @@ struct State {
     mount_base: PathBuf,
     proxy_conns: usize,
     no_fuse: bool,
+    /// Host RSA identity, loaded once at startup. The daemon drives every
+    /// device through the `adb` binary, which does its own ADB auth from
+    /// `~/.android/adbkey`, so this is not needed for the `adb` path — but it
+    /// must be held rather than dropped, so an in-process transport
+    /// (`TcpTransport`/`UsbTransport`) has a key to authenticate with.
+    auth_key: Option<Arc<adb_device::AdbKey>>,
 }
 
 /// Mountpoint for a device under `mount_base`, or None if the serial can't be
@@ -141,14 +147,15 @@ async fn main() -> anyhow::Result<()> {
     }
     info!(?mount_base, no_fuse = cli.no_fuse, "mount base");
 
-    let _key = adb_device::load_or_create_key()?;
-    info!("auth key ready");
+    let key = adb_device::load_or_create_key()?;
+    info!(path = ?key.path(), "auth key ready");
 
     let state = Arc::new(Mutex::new(State {
         adb_server: cli.adb_server.clone(),
         mount_base: mount_base.clone(),
         proxy_conns: cli.proxy_conns,
         no_fuse: cli.no_fuse,
+        auth_key: Some(Arc::new(key)),
         ..State::default()
     }));
     let (queue, mut queue_rx) = JobQueue::new(transfer_engine::DEFAULT_PARALLELISM);
@@ -1310,7 +1317,7 @@ impl ManagerInterface {
     }
 
     async fn diagnostics(&self) -> zbus::fdo::Result<String> {
-        let (devices, adb_server, mount_base, proxy_conns, no_fuse) = {
+        let (devices, adb_server, mount_base, proxy_conns, no_fuse, auth_key_path) = {
             let state = self.state.lock();
             let devices = state
                 .devices
@@ -1326,6 +1333,11 @@ impl ManagerInterface {
                 state.mount_base.clone(),
                 state.proxy_conns,
                 state.no_fuse,
+                state
+                    .auth_key
+                    .as_ref()
+                    .map(|k| k.path().to_string_lossy().into_owned())
+                    .unwrap_or_default(),
             )
         };
         let adb_output = tokio::time::timeout(
@@ -1357,6 +1369,7 @@ impl ManagerInterface {
             no_fuse,
             helper_env_present: helper_env.is_some(),
             helper_env_exists: helper_env.as_ref().is_some_and(|p| p.is_file()),
+            auth_key_path,
             devices,
         };
         serde_json::to_string(&report)
@@ -1644,6 +1657,7 @@ struct DiagnosticReport {
     no_fuse: bool,
     helper_env_present: bool,
     helper_env_exists: bool,
+    auth_key_path: String,
     devices: Vec<DeviceDiag>,
 }
 
