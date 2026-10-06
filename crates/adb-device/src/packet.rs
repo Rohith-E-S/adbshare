@@ -14,7 +14,7 @@
 //!  20  magic   (u32, must equal command^0xFFFFFFFF)
 //! ```
 //!
-//! Commands: A_SYNC, A_CNXN, A_OPEN, A_OKAY, A_CLSE, A_WRTE, A_AUTH.
+//! Commands: A_SYNC, A_CNXN, A_OPEN, A_OKAY, A_CLSE, A_WRTE, A_AUTH, A_FAIL.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -38,6 +38,9 @@ pub const A_OKAY: u32 = 0x59414b4f;
 pub const A_CLSE: u32 = 0x45534c43;
 pub const A_WRTE: u32 = 0x45545257;
 pub const A_AUTH: u32 = 0x48545541;
+/// `A_FAIL` is defined by the protocol as all-ones rather than an ASCII tag,
+/// which is why it is easy to leave out: every other command is a four-CC.
+pub const A_FAIL: u32 = 0xFFFF_FFFF;
 
 pub const AUTH_TOKEN: u32 = 1;
 pub const AUTH_SIGNATURE: u32 = 2;
@@ -52,6 +55,11 @@ pub enum Command {
     Close,
     Write,
     Auth,
+    /// The device refused a request. `adbd` answers a failed `OPEN` with this
+    /// and a human-readable reason, so it has to be representable: without it
+    /// the frame failed to decode and was skipped, and the caller sat out its
+    /// whole open timeout instead of learning the request was refused.
+    Fail,
 }
 
 impl Command {
@@ -64,6 +72,7 @@ impl Command {
             A_CLSE => Some(Command::Close),
             A_WRTE => Some(Command::Write),
             A_AUTH => Some(Command::Auth),
+            A_FAIL => Some(Command::Fail),
             _ => None,
         }
     }
@@ -77,6 +86,7 @@ impl Command {
             Command::Close => A_CLSE,
             Command::Write => A_WRTE,
             Command::Auth => A_AUTH,
+            Command::Fail => A_FAIL,
         }
     }
 }

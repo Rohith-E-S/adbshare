@@ -248,6 +248,38 @@ impl AdbConnection {
                             let _ = tx.send(Ok(StreamId(local, remote)));
                         }
                     }
+                    Command::Fail => {
+                        // `adbd` refuses a request with FAIL plus a
+                        // human-readable reason. This used to be unrepresentable
+                        // (A_FAIL was missing from `Command`), so the frame
+                        // failed to decode, was skipped, and the caller waited
+                        // out its entire open timeout for a reply that had
+                        // already arrived — for the very common case of opening
+                        // a path that does not exist.
+                        let local = msg.arg1;
+                        let remote = msg.arg0;
+                        if let Some(tx) = pending_opens_r.lock().remove(&local) {
+                            // FAIL's payload is a 4-byte LE length then the
+                            // message, the same shape as OKAY's.
+                            let reason = if msg.payload.len() > 4 {
+                                let n = u32::from_le_bytes([
+                                    msg.payload[0],
+                                    msg.payload[1],
+                                    msg.payload[2],
+                                    msg.payload[3],
+                                ]) as usize;
+                                let end = (4 + n).min(msg.payload.len());
+                                String::from_utf8_lossy(&msg.payload[4..end]).into_owned()
+                            } else {
+                                String::new()
+                            };
+                            let _ = tx.send(Err(AdbError::Protocol(if reason.is_empty() {
+                                format!("device refused the request (stream {local}/{remote})")
+                            } else {
+                                format!("device refused the request: {reason}")
+                            })));
+                        }
+                    }
                     Command::Close => {
                         let local = msg.arg1;
                         if let Some(tx) = pending_opens_r.lock().remove(&local) {
@@ -290,6 +322,14 @@ impl AdbConnection {
                     }
                     _ => {}
                 }
+            }
+            // The reader is the only thing that can resolve a pending OPEN, so
+            // once it stops every waiter would otherwise sit out its full
+            // timeout against a connection that is already gone. The writer
+            // task drains `streams` on its way out but never touched this map,
+            // despite a comment claiming it did.
+            for (_, tx) in pending_opens_r.lock().drain() {
+                let _ = tx.send(Err(AdbError::Disconnected));
             }
         });
 
