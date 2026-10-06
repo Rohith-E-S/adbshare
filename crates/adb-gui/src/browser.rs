@@ -1380,38 +1380,8 @@ impl Browser {
         }
         let scroll_y: f32 = self.scroll.offset().y.into();
         let visible = (viewport_h / tile_h).ceil() as usize + 1;
-        let columns = self.grid_geometry.columns.max(1);
-        let mut first = ((scroll_y / tile_h).floor() as isize - OVERSCAN as isize).max(0) as usize;
-        let count = visible + OVERSCAN * 2 + 1;
-
-        // Grid rows live inside a windowed, absolutely-positioned container, so
-        // neither scroll handle can address a row: `scroll_to_item` only works
-        // for direct children of the tracked scroller, and this div is not it.
-        // Widening the window so it always contains the focused row is what
-        // makes keyboard navigation visible here — without it the selection
-        // moves off-screen and the viewport never follows.
-        if let Some(row) = self
-            .focused
-            .and_then(|entry| self.visible.iter().position(|v| *v == entry))
-            .map(|slot| slot / columns)
-            .filter(|row| *row < first + count && *row >= first)
-        {
-            // Focus is already inside the rendered window; leave it alone.
-            let _ = row;
-        } else if let Some(row) = self
-            .focused
-            .and_then(|entry| self.visible.iter().position(|v| *v == entry))
-            .map(|slot| slot / columns)
-        {
-            first = if row < first {
-                row
-            } else {
-                // Pull the window's end up to the focused row so it is the
-                // last row rendered.
-                row + 1 - count.min(row + 1)
-            };
-        }
-        (first, count)
+        let first = ((scroll_y / tile_h).floor() as isize - OVERSCAN as isize).max(0) as usize;
+        (first, visible + OVERSCAN * 2 + 1)
     }
 
     /// Scroll the file area to a pixel offset.
@@ -1442,9 +1412,15 @@ impl Browser {
     /// all. `Bottom` therefore scrolls by roughly one row each time the
     /// selection crosses the bottom edge, instead of jumping to the top.
     ///
-    /// Grid mode cannot use either handle — its rows live inside a windowed,
-    /// absolutely-positioned container rather than as children of the scroller —
-    /// so it relies on `visible_row_range` widening to include the focused row.
+    /// Grid mode cannot use either handle, and that is not fixable by widening
+    /// the window. `ScrollHandle::scroll_to_item` addresses a row by *child
+    /// index* of the tracked scroller, so it only works when the scroller has
+    /// one child per logical item — which is exactly what windowing gives up.
+    /// (Widening the window was tried and reverted: grid rows are laid out at
+    /// their true offsets, so rendering the focused row just draws it
+    /// off-screen while dropping the rows that are actually visible, and the
+    /// grid renders blank.) Grid therefore keeps following the pointer, and
+    /// `visible_row_range` follows the scroll offset and nothing else.
     fn scroll_to_slot(&self, slot: usize) {
         match self.view_mode {
             ViewMode::List => {
