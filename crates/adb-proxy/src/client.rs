@@ -54,7 +54,21 @@ pub enum ProxyError {
 
 pub type Result<T> = std::result::Result<T, ProxyError>;
 
+/// Largest *payload* in a single reply.
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+
+/// Ceiling on the whole reply frame, which carries a one-byte status in front
+/// of the payload.
+///
+/// The reader compared the frame length against `MAX_RESPONSE`, so the one
+/// value the device will actually send largest — a read of exactly
+/// `MAX_RESPONSE` bytes, which it explicitly permits — arrived as
+/// `MAX_RESPONSE + 1` and was treated as an oversized frame: the connection
+/// was closed and the data silently dropped. Measured against the device
+/// proxy: a read of `MAX_RESPONSE - 1` came back intact, `MAX_RESPONSE`
+/// closed the connection, and `MAX_RESPONSE + 1` was refused by the device
+/// with a `too big` status. Nothing could ever transfer an 8 MiB chunk.
+const MAX_RESPONSE_FRAME: usize = MAX_RESPONSE + 1;
 
 /// Largest request body we will put on the wire. Matches the device proxy's
 /// own `MAX_REQUEST`. Enforced here so an oversized write fails as
@@ -163,7 +177,7 @@ impl ProxyConn {
                     }
                 }
                 let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                if len > MAX_RESPONSE {
+                if len > MAX_RESPONSE_FRAME {
                     *closed_r.lock() = true;
                     return;
                 }
