@@ -946,6 +946,17 @@ impl Browser {
         self.focused = None;
         // The anchor is an index into the listing that just went away.
         self.extend_anchor = None;
+        // Release the in-flight guard too. The listing being abandoned belongs
+        // to the directory we are leaving, and keeping the flag set made
+        // `begin_load` refuse the *next* fetch — so `navigate()` moved the
+        // browser to the new path, the follow-up fetch was dropped on the
+        // floor, and the pane sat empty with no error and no way back except
+        // F5.
+        //
+        // Two requests can now overlap, which is safe: the completion guard
+        // discards any answer whose path or device is no longer current, so the
+        // newest navigation always wins regardless of arrival order.
+        self.loading = false;
     }
 
     // ── State transforms, kept free of `Context` so they can be tested ─────
