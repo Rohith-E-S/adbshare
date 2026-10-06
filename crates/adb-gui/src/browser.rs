@@ -16,7 +16,8 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, Context, Div, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
     IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollHandle, Size, Window, actions, div, px, relative, uniform_list,
+    Point, Render, ScrollHandle, ScrollStrategy, Size, UniformListScrollHandle, Window, actions,
+    div, px, relative, uniform_list,
 };
 
 use crate::icons::{self, names};
@@ -365,6 +366,14 @@ pub struct Browser {
     /// The row a context menu or rename acts on when nothing is selected.
     focused: Option<usize>,
 
+    /// Scroll handle for the virtualised list. The canvas handle cannot be
+    /// used for `scroll_to_item`: that resolves the index against the tracked
+    /// element's *direct children*, and the canvas has exactly one (the whole
+    /// list), so every index but 0 misses and the request is silently retried
+    /// forever. A `UniformListScrollHandle` is the handle `uniform_list`
+    /// actually owns, and it tracks items properly.
+    list_scroll: UniformListScrollHandle,
+
     // ── Navigation history ─────────────────────────────────────────────────
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
@@ -452,6 +461,7 @@ impl Browser {
             }),
             hovered_drop_folder: None,
             scroll: ScrollHandle::new(),
+            list_scroll: UniformListScrollHandle::new(),
             grid_geometry: GridGeometry::default(),
             list_geometry: ListGeometry::default(),
             viewport_x: 0.0,
@@ -1323,7 +1333,8 @@ impl Browser {
         self.selection.clear();
         self.selection.insert(entry);
         if self.view_mode == ViewMode::List {
-            self.scroll.scroll_to_item(index);
+            self.list_scroll
+                .scroll_to_item(index, ScrollStrategy::Bottom);
         }
         let _ = window;
         cx.notify();
@@ -1366,8 +1377,38 @@ impl Browser {
         }
         let scroll_y: f32 = self.scroll.offset().y.into();
         let visible = (viewport_h / tile_h).ceil() as usize + 1;
-        let first = ((scroll_y / tile_h).floor() as isize - OVERSCAN as isize).max(0) as usize;
-        (first, visible + OVERSCAN * 2 + 1)
+        let columns = self.grid_geometry.columns.max(1);
+        let mut first = ((scroll_y / tile_h).floor() as isize - OVERSCAN as isize).max(0) as usize;
+        let count = visible + OVERSCAN * 2 + 1;
+
+        // Grid rows live inside a windowed, absolutely-positioned container, so
+        // neither scroll handle can address a row: `scroll_to_item` only works
+        // for direct children of the tracked scroller, and this div is not it.
+        // Widening the window so it always contains the focused row is what
+        // makes keyboard navigation visible here — without it the selection
+        // moves off-screen and the viewport never follows.
+        if let Some(row) = self
+            .focused
+            .and_then(|entry| self.visible.iter().position(|v| *v == entry))
+            .map(|slot| slot / columns)
+            .filter(|row| *row < first + count && *row >= first)
+        {
+            // Focus is already inside the rendered window; leave it alone.
+            let _ = row;
+        } else if let Some(row) = self
+            .focused
+            .and_then(|entry| self.visible.iter().position(|v| *v == entry))
+            .map(|slot| slot / columns)
+        {
+            first = if row < first {
+                row
+            } else {
+                // Pull the window's end up to the focused row so it is the
+                // last row rendered.
+                row + 1 - count.min(row + 1)
+            };
+        }
+        (first, count)
     }
 
     /// Scroll the file area to a pixel offset.
@@ -1381,7 +1422,33 @@ impl Browser {
             .focused
             .and_then(|entry| self.visible.iter().position(|v| *v == entry))
         {
-            self.scroll.scroll_to_item(slot);
+            self.scroll_to_slot(slot);
+        }
+    }
+
+    /// Bring the row at `slot` into view.
+    ///
+    /// The two view modes need different handles. `uniform_list` owns a
+    /// `UniformListScrollHandle` and tracks real item indices through it;
+    /// `ScrollHandle::scroll_to_item` resolves against the tracked div's direct
+    /// children, which for the canvas is just the one list, so every index past
+    /// 0 misses and the request is kept and retried without ever scrolling.
+    ///
+    /// `Bottom` rather than `Top`: the uniform handle's `scroll_to_item` is
+    /// non-strict, so a row that is already fully visible does not scroll at
+    /// all. `Bottom` therefore scrolls by roughly one row each time the
+    /// selection crosses the bottom edge, instead of jumping to the top.
+    ///
+    /// Grid mode cannot use either handle — its rows live inside a windowed,
+    /// absolutely-positioned container rather than as children of the scroller —
+    /// so it relies on `visible_row_range` widening to include the focused row.
+    fn scroll_to_slot(&self, slot: usize) {
+        match self.view_mode {
+            ViewMode::List => {
+                self.list_scroll
+                    .scroll_to_item(slot, ScrollStrategy::Bottom);
+            }
+            ViewMode::Grid => {}
         }
     }
 
@@ -2379,6 +2446,7 @@ impl Render for Browser {
                         }),
                     )
                     .h_full()
+                    .track_scroll(self.list_scroll.clone())
                     .into_any_element()
                 }
             }
