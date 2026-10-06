@@ -337,13 +337,13 @@ impl AdbConnection {
         self.streams.lock().insert(local, data_tx);
         self.pending_opens.lock().insert(local, open_tx);
 
-        // Send OPEN frame.
-        let open = Message::new(
-            Command::Open,
-            local,
-            0,
-            Bytes::copy_from_slice(dest.as_bytes()),
-        );
+        // Send OPEN frame. The destination is a NUL-terminated C string on
+        // the wire: adbd overwrites the last payload byte with `\0` instead
+        // of appending one, so shipping it unterminated silently truncates
+        // the service name by one character.
+        let mut payload = dest.as_bytes().to_vec();
+        payload.push(0);
+        let open = Message::new(Command::Open, local, 0, Bytes::from(payload));
         if self.write_tx.send(WriteReq::Frame(open)).await.is_err() {
             self.abort_open(local);
             return Err(AdbError::Disconnected);
