@@ -340,6 +340,20 @@ impl Adbfs {
         }
     }
 
+    /// Drop the path<->inode mapping for `ino`, in both directions.
+    ///
+    /// Only called once the kernel's lookup count for the inode has reached
+    /// zero, which is why `unlink` does not do this: an inode with an open
+    /// handle must stay resolvable.
+    fn forget_ino(&self, ino: INodeNo) {
+        if ino == INodeNo::ROOT {
+            return;
+        }
+        if let Some(path) = self.ino_to_path.lock().remove(&ino) {
+            self.path_to_ino.lock().remove(&path);
+        }
+    }
+
     fn ino_for(&self, path: PathBuf) -> INodeNo {
         let mut p2i = self.path_to_ino.lock();
         if let Some(&ino) = p2i.get(&path) {
@@ -451,6 +465,22 @@ impl Filesystem for Adbfs {
             Err(ProxyError::Status(Status::NotFound, _)) => reply.error(Errno::ENOENT),
             Err(e) => reply.error(Self::proxy_to_errno(e)),
         }
+    }
+
+    /// Reclaim an inode the kernel has dropped.
+    ///
+    /// Without this the node was never given back, so `ino_to_path` and
+    /// `path_to_ino` grew by one `PathBuf` for every distinct path ever looked
+    /// up or listed, for the life of the mount: a `find` over 50k files on a
+    /// phone leaves ~100k paths resident with no way to release them. The
+    /// kernel's `forget` exists for exactly this and the default impl is a
+    /// no-op.
+    ///
+    /// Only safe to drop here, when the kernel's lookup count has reached zero
+    /// — an inode still open elsewhere stays reachable, which is why `unlink`
+    /// deliberately does *not* prune.
+    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
+        self.forget_ino(ino);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -610,6 +640,14 @@ impl Filesystem for Adbfs {
         }
         let mode = 0o644;
         let res = self.proxy.open(&path_str, oflags, mode);
+        // O_TRUNC changed the file on the device, so the cached stat and the
+        // parent listing are both stale. Every other mutating path
+        // (`write`, `create`, `unlink`) invalidates; the truncate in `open`
+        // was the one that did not.
+        if oflags.contains(OpenFlags::TRUNC) {
+            self.cache.invalidate(&path);
+            self.invalidate_parent_listing(&path);
+        }
         match res {
             Ok(file) => {
                 let fh = FileHandle(self.next_fh.fetch_add(1, Ordering::Relaxed));
@@ -854,7 +892,7 @@ impl Filesystem for Adbfs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let src = match self.resolve_child(parent, name) {
@@ -879,6 +917,18 @@ impl Filesystem for Adbfs {
             reply.error(Errno::EINVAL);
             return;
         };
+        // `flags` used to be ignored, so RENAME_NOREPLACE (GNU `mv -n`, some
+        // backup tools) silently replaced the destination — losing a file the
+        // caller had explicitly asked to keep. RENAME_EXCHANGE has no proxy op
+        // and was likewise downgraded to a plain overwrite.
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+            reply.error(Errno::ENOSYS);
+            return;
+        }
+        if flags.contains(RenameFlags::RENAME_NOREPLACE) && self.proxy.stat(&dst_str).is_ok() {
+            reply.error(Errno::EEXIST);
+            return;
+        }
         // Was src a directory? Ask *before* the rename, while src still exists;
         // afterwards a fallback stat can only ever come back NotFound, and a
         // directory rename would then skip invalidating its own subtree.
