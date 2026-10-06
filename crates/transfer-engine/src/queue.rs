@@ -242,9 +242,14 @@ impl JobQueue {
         let mut completed = self.completed.lock();
         let mut count: u64 = 0;
         completed.retain(|job| {
-            let mine = job.device.as_deref().is_some_and(|d| d.contains(serial))
-                || job.source.to_string_lossy().contains(serial)
-                || job.destination.to_string_lossy().contains(serial);
+            // Exact match on the device tag only. This used to be a substring
+            // test over the tag *and* both paths, which cross-matched three
+            // ways: serials that are prefixes of one another, a tag that
+            // merely contains the serial, and — worst — the local source or
+            // destination, so a job for `/home/me/ABC123-report.pdf` was
+            // requeued when phone `ABC123` was plugged back in. Replugging one
+            // phone would then resend another phone's transfers.
+            let mine = job.device.as_deref() == Some(serial);
             if mine && job.state() == JobState::Failed {
                 job.reset_for_retry();
                 pending.push_back(job.clone());
