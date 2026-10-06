@@ -100,8 +100,31 @@ pub fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
 ///
 /// Iterative rather than recursive so a deep tree cannot blow the stack.
 /// Symlinks are skipped: following them risks loops and duplicating data
-/// outside the source tree.
+/// outside the source tree. [`move_path`] uses
+/// [`copy_tree_preserving_links`] instead, where skipping them would be
+/// destructive.
 pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<usize> {
+    copy_tree_inner(src, dst, LinkHandling::Skip)
+}
+
+/// Like [`copy_tree`], but recreates symlinks as symlinks rather than
+/// skipping them, and does not follow them when deciding what to copy.
+///
+/// Copying is allowed to drop symlinks; *moving* is not, because the source
+/// tree is deleted afterwards. Skipping a symlink there loses it outright,
+/// with no error — which hit any tree containing `node_modules/.bin/*` or
+/// similar.
+fn copy_tree_preserving_links(src: &Path, dst: &Path) -> io::Result<usize> {
+    copy_tree_inner(src, dst, LinkHandling::Recreate)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LinkHandling {
+    Skip,
+    Recreate,
+}
+
+fn copy_tree_inner(src: &Path, dst: &Path, links: LinkHandling) -> io::Result<usize> {
     // Copying a tree into itself would walk the destination it is still
     // creating, so `copy_file`'s per-file guard would never be reached.
     if dst.starts_with(src) {
@@ -125,6 +148,23 @@ pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<usize> {
             let entry = entry?;
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
+                if links == LinkHandling::Skip {
+                    continue;
+                }
+                if copied >= MAX_COPY_FILES {
+                    return Err(io::Error::other(format!(
+                        "too many files (limit {MAX_COPY_FILES})"
+                    )));
+                }
+                // Recreate the link itself. `read_link` does not follow it,
+                // so a link into a loop is copied as a link, not expanded.
+                let target = fs::read_link(entry.path())?;
+                let link = to.join(entry.file_name());
+                if let Some(parent) = link.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                std::os::unix::fs::symlink(&target, &link)?;
+                copied += 1;
                 continue;
             }
             let target = to.join(entry.file_name());
@@ -212,8 +252,16 @@ pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
         Err(err) if err.raw_os_error() == Some(18) => {
             let meta = fs::symlink_metadata(src)?;
             if meta.is_dir() {
-                copy_tree(src, dst)?;
+                // Links have to be preserved here: the source is deleted next,
+                // so anything the copy skipped would be gone for good.
+                copy_tree_preserving_links(src, dst)?;
                 fs::remove_dir_all(src)
+            } else if meta.file_type().is_symlink() {
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+                fs::remove_file(src)
             } else {
                 copy_file(src, dst)?;
                 fs::remove_file(src)
