@@ -37,6 +37,12 @@ pub enum ProxyError {
     #[error("connection pool exhausted")]
     PoolExhausted,
 
+    /// No pooled connection became free in time. Distinct from `Timeout`:
+    /// this says nothing about the device, only that every connection is
+    /// already busy with another request.
+    #[error("no free connection available (pool busy)")]
+    Busy,
+
     #[error("request timed out")]
     Timeout,
 
@@ -51,6 +57,13 @@ const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 /// Upper bound for a single RPC round-trip. Without it a hung device proxy
 /// blocks FUSE ops (and transfers) forever.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Upper bound on waiting for a free pooled connection. Permits are held for
+/// the duration of one round trip, so a saturated pool means every connection
+/// is mid-request — a parallel transfer batch, or a file manager loading many
+/// previews at once. It must not block forever: the FUSE event loop and the
+/// D-Bus handlers wait here with nothing else to bound them.
+const POOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A single TCP connection to the proxy. Cheap to clone (it's an Arc).
 #[derive(Clone)]
@@ -169,16 +182,6 @@ impl ProxyConn {
                 req_lock: tokio::sync::Mutex::new(()),
             }),
         })
-    }
-
-    /// Queue a pre-built frame synchronously (best effort, e.g. from Drop).
-    /// The response, if any, is never consumed — callers must not reuse the
-    /// connection afterwards.
-    fn try_send_frame(&self, frame: Bytes) -> Result<()> {
-        self.inner
-            .write_tx
-            .try_send(frame)
-            .map_err(|_| ProxyError::Closed)
     }
 
     /// Send a pre-built frame and wait for its response. Used by Drop so the
@@ -315,11 +318,9 @@ impl ProxyClient {
     }
 
     async fn acquire(&self) -> Result<(ProxyConn, OwnedSemaphorePermit)> {
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
+        let permit = tokio::time::timeout(POOL_TIMEOUT, self.semaphore.clone().acquire_owned())
             .await
+            .map_err(|_| ProxyError::Busy)?
             .map_err(|_| ProxyError::PoolExhausted)?;
         loop {
             let conn = {
@@ -399,7 +400,7 @@ impl ProxyClient {
     }
 
     pub async fn open(&self, path: &str, flags: OpenFlags, mode: u32) -> Result<ProxyFile> {
-        let (conn, permit) = self.acquire().await?;
+        let (conn, _permit) = self.acquire().await?;
         let mut args = Vec::new();
         args.extend_from_slice(&flags.bits().to_le_bytes());
         args.extend_from_slice(&mode.to_le_bytes());
@@ -420,10 +421,8 @@ impl ProxyClient {
         Ok(ProxyFile {
             inner: Arc::new(ProxyFileInner {
                 client: self.clone(),
-                conn: PlMutex::new(Some(conn)),
-                fd,
+                fd: PlMutex::new(Some(fd)),
                 path: path.to_string(),
-                permit: PlMutex::new(Some(permit)),
             }),
         })
     }
@@ -593,6 +592,15 @@ impl DiskUsage {
 
 /// A handle to a file opened on the device.
 ///
+/// The device-side fd is process-global state, so *any* pooled connection can
+/// service a read/write against it — `Op::Read`/`Op::Write` carry the fd and
+/// offset in the request. This handle therefore does **not** reserve a pooled
+/// connection for its lifetime; each operation borrows one for the duration
+/// of the round trip. Reserving one per open file caps concurrent opens at
+/// the pool size, which deadlocks a FUSE mount: the fifth `open` waits for a
+/// permit that only the `release` of the first four could return, and on a
+/// single event-loop thread that never arrives.
+///
 /// Cloning shares the same underlying file handle: the `Op::Close` is sent
 /// by `close()` or, failing that, when the *last* clone is dropped. Every
 /// error path after `open` therefore releases the device-side fd instead of
@@ -603,16 +611,11 @@ pub struct ProxyFile {
 }
 
 struct ProxyFileInner {
-    /// Pool the connection is returned to when the file closes.
+    /// Pool that connections are borrowed from and returned to.
     client: ProxyClient,
-    /// `None` once the file has been closed.
-    conn: PlMutex<Option<ProxyConn>>,
-    fd: u32,
+    /// Device-side fd, or `None` once the file has been closed.
+    fd: PlMutex<Option<u32>>,
     path: String,
-    /// Pool permit held for the lifetime of the file: each open file counts
-    /// against the client's concurrency limiter instead of silently removing
-    /// a connection from the pool.
-    permit: PlMutex<Option<OwnedSemaphorePermit>>,
 }
 
 impl std::fmt::Debug for ProxyFile {
@@ -625,39 +628,44 @@ impl std::fmt::Debug for ProxyFile {
 }
 
 impl ProxyFile {
-    /// Clone of the live connection, or `Closed` if already closed.
-    fn conn(&self) -> Result<ProxyConn> {
-        self.inner.conn.lock().clone().ok_or(ProxyError::Closed)
+    /// The device-side fd, or `Closed` if this handle has been closed.
+    fn fd(&self) -> Result<u32> {
+        self.inner.fd.lock().ok_or(ProxyError::Closed)
     }
 
     pub async fn read_at(&self, offset: u64, len: u32) -> Result<Bytes> {
-        let conn = self.conn()?;
+        let fd = self.fd()?;
+        let (conn, _permit) = self.inner.client.acquire().await?;
         let mut args = Vec::new();
-        args.extend_from_slice(&self.inner.fd.to_le_bytes());
+        args.extend_from_slice(&fd.to_le_bytes());
         args.extend_from_slice(&offset.to_le_bytes());
         args.extend_from_slice(&len.to_le_bytes());
-        conn.request(Op::Read, &args).await
+        let res = conn.request(Op::Read, &args).await;
+        self.inner.client.release(conn);
+        res
     }
 
     pub async fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
-        let conn = self.conn()?;
+        let fd = self.fd()?;
+        let (conn, _permit) = self.inner.client.acquire().await?;
         let mut args = Vec::new();
-        args.extend_from_slice(&self.inner.fd.to_le_bytes());
+        args.extend_from_slice(&fd.to_le_bytes());
         args.extend_from_slice(&offset.to_le_bytes());
         args.extend_from_slice(&(data.len() as u32).to_le_bytes());
         args.extend_from_slice(data);
-        conn.request(Op::Write, &args).await.map(|_| ())
+        let res = conn.request(Op::Write, &args).await.map(|_| ());
+        self.inner.client.release(conn);
+        res
     }
 
     pub async fn close(self) -> Result<()> {
-        let conn = self.inner.conn.lock().take().ok_or(ProxyError::Closed)?;
+        // Claim the fd first so a concurrent clone cannot close it twice.
+        let fd = self.inner.fd.lock().take().ok_or(ProxyError::Closed)?;
+        let (conn, _permit) = self.inner.client.acquire().await?;
         let mut args = Vec::new();
-        args.extend_from_slice(&self.inner.fd.to_le_bytes());
+        args.extend_from_slice(&fd.to_le_bytes());
         let res = conn.request(Op::Close, &args).await.map(|_| ());
-        // Return the connection to the pool (release() discards it if it is
-        // closed/poisoned or the pool is full) and free the file's permit.
         self.inner.client.release(conn);
-        drop(self.inner.permit.lock().take());
         res
     }
 }
@@ -665,13 +673,13 @@ impl ProxyFile {
 impl Drop for ProxyFile {
     fn drop(&mut self) {
         // Other clones may still be using the file handle; only the last
-        // one out closes it. `conn` being `None` means close() already ran.
+        // one out closes it. `fd` being `None` means close() already ran.
         if Arc::strong_count(&self.inner) != 1 {
             return;
         }
-        let conn = self.inner.conn.lock().take();
-        let Some(conn) = conn else { return };
-        let fd = self.inner.fd;
+        let Some(fd) = self.inner.fd.lock().take() else {
+            return;
+        };
         let client = self.inner.client.clone();
 
         // Build the Close request frame: [op u8][len u32 LE][fd u32 LE].
@@ -685,19 +693,22 @@ impl Drop for ProxyFile {
 
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                // Drop can't await; spawn a task to send the Close properly
-                // (consuming the response so the stream stays in sync) and
-                // then recycle the connection into the pool.
+                // Drop can't await; spawn a task to borrow a connection, send
+                // the Close properly (consuming the response so the stream
+                // stays in sync) and return the connection to the pool.
                 handle.spawn(async move {
-                    let _ = conn.send_frame_and_await(close_frame).await;
-                    client.release(conn);
+                    // If the pool is busy or gone there is nothing to send on;
+                    // the device proxy's watchdog reclaims the fd.
+                    if let Ok((conn, _permit)) = client.acquire().await {
+                        let _ = conn.send_frame_and_await(close_frame).await;
+                        client.release(conn);
+                    }
                 });
             }
             Err(_) => {
-                // No runtime: best-effort synchronous send. The queued frame
-                // still reaches the device before the socket closes, but the
-                // response is never read, so the connection is discarded.
-                let _ = conn.try_send_frame(close_frame);
+                // No runtime, so we cannot borrow a connection to send on.
+                // The device's idle watchdog reclaims the fd.
+                drop(close_frame);
             }
         }
     }

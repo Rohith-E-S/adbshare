@@ -18,12 +18,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adb_device::{DeviceId, DeviceWatcher};
-use adb_proxy::{DEFAULT_PROXY_PORT, PROXY_BIN_PATH, ProxyClient, ops::DirEntry};
+use adb_proxy::{DEFAULT_PROXY_PORT, PROXY_BIN_PATH, ProxyClient, ProxyError, ops::DirEntry};
 use clap::Parser;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zbus::{ConnectionBuilder, interface};
 
 use transfer_engine::{Direction, Job, JobOptions, JobQueue, Worker};
@@ -295,6 +295,9 @@ async fn main() -> anyhow::Result<()> {
 /// proxy binary to the device).
 const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Budget for the liveness probe in `device_healthy`.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How long a device metadata reading is reused before it is gathered again.
 ///
 /// The GUI polls every three seconds; fifteen seconds turns five sets of three
@@ -328,11 +331,26 @@ async fn adb_run_output(args: &[&str], timeout: Duration) -> anyhow::Result<std:
 }
 
 /// True if the pooled client can still serve requests (proxy reachable).
+///
+/// A saturated connection pool is deliberately *not* treated as a dead
+/// device. `--proxy-conns` defaults to `DEFAULT_PARALLELISM`, so a full batch
+/// of transfers saturates the pool, and the probe then never reaches the
+/// network. Reporting "unhealthy" there would tear down a working device and
+/// kill every in-flight transfer with it.
 async fn device_healthy(client: &ProxyClient) -> bool {
-    tokio::time::timeout(Duration::from_secs(3), client.stat("/"))
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
+    match tokio::time::timeout(HEALTH_TIMEOUT, client.stat("/")).await {
+        Ok(Ok(_)) => true,
+        // Busy says nothing about the device; only a real failure does.
+        Ok(Err(ProxyError::Busy)) => {
+            debug!("health check: pool busy, treating device as healthy");
+            true
+        }
+        Ok(Err(e)) => {
+            warn!(error = ?e, "health check failed");
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Handle a device appearing (Added) or changing state (Changed).

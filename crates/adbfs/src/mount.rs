@@ -20,6 +20,14 @@ pub fn run(device: DeviceId, client: ProxyClient, mountpoint: PathBuf) -> Result
         MountOption::NoSuid,
         MountOption::NoExec,
     ];
+    // Unspecified, fuser runs a single event-loop thread, and every callback
+    // then blocks the whole mount on the one serializing proxy thread: one ADB
+    // round trip stalls 100% of the filesystem. Worse, it turns a momentarily
+    // busy connection pool into a deadlock, because the one thread that would
+    // deliver `release` for an already-open file can never run while a new
+    // `open` is waiting on a permit. Each event-loop thread dispatches one
+    // request at a time, so this only helps genuinely concurrent work.
+    config.n_threads = Some(4);
 
     // The SyncProxy thread builds and owns its own tokio runtime; nothing
     // async is needed on this thread.

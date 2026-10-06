@@ -409,6 +409,9 @@ impl Adbfs {
             ProxyError::Status(Status::NoSpace, _) => Errno::ENOSPC,
             ProxyError::Status(Status::NameTooLong, _) => Errno::ENAMETOOLONG,
             ProxyError::Status(Status::InvalidArg, _) => Errno::EINVAL,
+            // The pool is busy, not broken: tell the caller to retry rather
+            // than reporting a hard I/O error.
+            ProxyError::Busy => Errno::EAGAIN,
             _ => Errno::EIO,
         }
     }
