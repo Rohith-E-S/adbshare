@@ -107,14 +107,19 @@ impl AsyncWrite for Stream {
         // mirroring the pattern used by the transport's ChannelWriter.
         match self.write_tx.try_reserve() {
             Ok(permit) => {
-                let chunk = Bytes::copy_from_slice(buf);
-                let len = chunk.len();
+                // adbd rejects any frame whose data_length exceeds the
+                // negotiated max_payload and *terminates the transport* when
+                // it does, taking every other multiplexed stream with it. So
+                // accept at most one payload's worth here and let the caller
+                // (`write_all`) come back for the rest.
+                let take = buf.len().min(MAX_PAYLOAD);
+                let chunk = Bytes::copy_from_slice(&buf[..take]);
                 permit.send(WriteReq::Data {
                     local: self.id.0,
                     remote: self.id.1,
                     payload: chunk,
                 });
-                Poll::Ready(Ok(len))
+                Poll::Ready(Ok(take))
             }
             Err(mpsc::error::TrySendError::Full(())) => {
                 let waker = cx.waker().clone();
