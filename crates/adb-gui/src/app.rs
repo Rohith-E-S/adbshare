@@ -1671,11 +1671,35 @@ impl AdbShareApp {
         }
         let me = cx.entity();
         cx.spawn(async move |_this, cx| {
+            // Count what actually worked. Reporting success unconditionally
+            // told the user their transfers were cancelled even when the daemon
+            // was down and every call had failed.
+            let mut cancelled = 0usize;
+            let mut errors: Vec<String> = Vec::new();
             for id in ids {
-                let _ = daemon::cancel_job(id).await;
+                match daemon::cancel_job(id).await {
+                    Ok(_) => cancelled += 1,
+                    Err(e) => errors.push(format!("job {id}: {e}")),
+                }
             }
             me.update(cx, |this, cx| {
-                this.toasts.push("Transfers cancelled", ToastTone::Info);
+                match (cancelled, errors.is_empty()) {
+                    (_, true) => this.toasts.push(
+                        format!("Cancelled {cancelled} transfer(s)"),
+                        ToastTone::Info,
+                    ),
+                    (0, false) => this.toasts.push(
+                        format!("Could not cancel transfers: {}", errors.join("; ")),
+                        ToastTone::Error,
+                    ),
+                    (n, false) => this.toasts.push(
+                        format!(
+                            "Cancelled {n} transfer(s); {} could not be cancelled",
+                            errors.len()
+                        ),
+                        ToastTone::Warning,
+                    ),
+                }
                 cx.notify();
             })
             .ok();

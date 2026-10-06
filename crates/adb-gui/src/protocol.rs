@@ -136,10 +136,17 @@ pub struct JobInfo {
 }
 
 impl JobInfo {
-    /// True while the job is queued or running, which is what the status bar's
-    /// pause and cancel buttons act on.
+    /// True while the job has not reached a terminal state, which is what the
+    /// status bar's pause/resume and cancel buttons act on.
+    ///
+    /// `Paused` has to be in here. Excluding it made pause a one-way door: the
+    /// buttons filter on this, so a paused job's id never reached the resume or
+    /// cancel request, `toggle_pause` could never see everything-paused (so it
+    /// always issued a pause), a fully paused queue reported "No active
+    /// transfers" and did nothing at all, and the status bar's paused
+    /// indicator — an `all(...)` over this same filter — was dead code.
     pub fn is_active(&self) -> bool {
-        matches!(self.state.as_str(), "Pending" | "Running")
+        matches!(self.state.as_str(), "Pending" | "Running" | "Paused")
     }
 
     /// Completion in `0.0..=1.0` for the progress bar.
