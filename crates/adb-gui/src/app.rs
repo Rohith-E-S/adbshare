@@ -993,7 +993,7 @@ impl AdbShareApp {
         cx: &mut Context<Self>,
     ) {
         match (&snapshot.from_local, &target_device) {
-            (true, _) => {
+            (true, None) => {
                 // Local to local: do it here, the daemon is not involved.
                 match localfs::copy_tree(&source, &destination) {
                     Ok(count) => self.toasts.push(
@@ -1004,6 +1004,17 @@ impl AdbShareApp {
                         .toasts
                         .push(format!("Could not copy: {err}"), ToastTone::Error),
                 }
+            }
+            (true, Some(device)) => {
+                // Local tree onto a phone: an upload, not a local copy. This arm
+                // used to be `(true, _)`, which swallowed this case entirely
+                // and walked the *host* filesystem trying to create
+                // `/sdcard/Download/<name>` — so copying a directory in "This
+                // computer" and pasting it into a phone silently did nothing
+                // useful, while the single-*file* path right above it queued a
+                // proper push. That inconsistency is what made it look like it
+                // worked.
+                self.enqueue_tree(source, destination, device.clone(), cx);
             }
             (false, Some(device)) if source.is_absolute() => {
                 // Device to itself: let the device copy, so nothing round-trips
