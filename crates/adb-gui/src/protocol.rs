@@ -591,7 +591,12 @@ impl<'de> serde::Deserialize<'de> for SortKey {
 /// Built as decorate-sort-undecorate rather than a custom comparator: a
 /// comparator that folds both names allocates twice per comparison, which for
 /// 5,000 entries is well over a hundred thousand allocations for one sort.
-pub fn sort_entries(entries: &mut Vec<DirEntry>, key: SortKey, descending: bool) {
+///
+/// Returns the permutation that was applied: `order[i]` is the index in the
+/// pre-sort slice now living at position `i`. Callers holding indices into
+/// `entries` (the browser's `visible`, `selection` and `focused`) need this to
+/// remap them, otherwise a sort silently repoints them at different files.
+pub fn sort_entries(entries: &mut Vec<DirEntry>, key: SortKey, descending: bool) -> Vec<usize> {
     let mut keyed: Vec<(bool, SortField, usize)> = entries
         .iter()
         .enumerate()
@@ -612,7 +617,9 @@ pub fn sort_entries(entries: &mut Vec<DirEntry>, key: SortKey, descending: bool)
             }
         })
     });
-    apply_permutation(entries, keyed.into_iter().map(|(_, _, index)| index));
+    let order: Vec<usize> = keyed.into_iter().map(|(_, _, index)| index).collect();
+    apply_permutation(entries, order.iter().copied());
+    order
 }
 
 /// The comparable sort field for one entry.

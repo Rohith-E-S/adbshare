@@ -725,10 +725,28 @@ impl Browser {
 
     /// Re-sort the current listing in place.
     ///
-    /// The daemon returns device listings folders-first by name, so the sort
-    /// has to be re-applied here for the other keys to mean anything.
+    /// `visible`, `selection`, `focused` and `extend_anchor` are all indices into
+    /// `entries`, and sorting permutes `entries` under them. They have to move
+    /// with it: select row 1, switch to sorting by size, and Delete would
+    /// otherwise act on whatever file the sort left at row 1 rather than the one
+    /// that was highlighted.
     pub fn apply_sort(&mut self, cx: &mut Context<Self>) {
-        sort_entries(&mut self.entries, self.sort_key, self.sort_descending);
+        let order = sort_entries(&mut self.entries, self.sort_key, self.sort_descending);
+
+        // `order[new] == old`, so invert it to get "where did this index go".
+        let mut moved_to = vec![0usize; order.len()];
+        for (new_index, old_index) in order.iter().enumerate() {
+            moved_to[*old_index] = new_index;
+        }
+        let moved = |index: usize| moved_to.get(index).copied();
+
+        self.selection = self.selection.iter().filter_map(|ix| moved(*ix)).collect();
+        self.extend_anchor = self.extend_anchor.and_then(moved);
+        self.focused = self.focused.and_then(moved);
+        // Rebuilt rather than remapped: the filter membership is unchanged, but
+        // `visible` also has to stay in ascending index order for the focus and
+        // hit-testing maths, which a permutation would not preserve.
+        self.recompute_visible();
         cx.notify();
     }
 
