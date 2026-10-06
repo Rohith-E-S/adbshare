@@ -180,7 +180,12 @@ impl TextField {
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        let target = self.next_boundary(self.selected_range.end);
+        // From the caret, like select_left already does. Using
+        // `selected_range.end` unconditionally ignored `selection_reversed`, so
+        // after Shift+Left the selection was 3..5 reversed with the caret at 3,
+        // and Shift+Right jumped to 5..6 instead of shrinking to 4..5 — three
+        // presses to select one character.
+        let target = self.next_boundary(self.cursor_offset());
         self.select_to(target, cx);
     }
 
@@ -434,10 +439,15 @@ impl EntityInputHandler for TextField {
                 .into();
         self.marked_range =
             (!new_text.is_empty()).then_some(range.start..range.start + new_text.len());
+        // `range_from_utf16` already resolves against the *new* content, so the
+        // only thing to add is the insertion point. Adding `range.end` for the
+        // upper bound inflated it by the length of the replaced text: replacing
+        // 8 bytes with "x" left content "xij" (len 3) with selected_range
+        // 0..11, and the next keystroke then sliced content[11..] and panicked.
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
-            .map(|r| r.start + range.start..r.end + range.end)
+            .map(|r| range.start + r.start..range.start + r.end)
             .unwrap_or_else(|| {
                 let end = range.start + new_text.len();
                 end..end
@@ -470,8 +480,14 @@ impl EntityInputHandler for TextField {
         let bounds = self.last_bounds?;
         let local = bounds.localize(&at)?;
         let line = self.shape(window, cx);
+        // `LineLayout::index_for_x` returns a UTF-8 byte offset (it reports
+        // `ShapedGlyph::index`, an index into the original text). This trait
+        // method is specified in UTF-16 code units, so convert *to* UTF-16;
+        // going the other way clamped the result and put the IME candidate
+        // window at the wrong glyph for any non-ASCII prefix. This is what
+        // gpui's own reference input element does.
         let utf8_index = line.index_for_x(at.x - local.x)?;
-        Some(utf16_to_utf8(&self.content, utf8_index))
+        Some(utf8_to_utf16(&self.content, utf8_index))
     }
 }
 
