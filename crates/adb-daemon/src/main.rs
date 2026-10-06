@@ -379,8 +379,9 @@ static ADB_SERVER: std::sync::OnceLock<Option<(String, u16)>> = std::sync::OnceL
 
 /// Build an `adb` command already pointed at the configured server.
 ///
-/// Every `adb_command()` in this binary must go through here; a bare
-/// `adb` silently talks to 127.0.0.1:5037 and ignores `--adb-server`.
+/// Every adb invocation in this binary must be built here rather than with a
+/// bare `Command::new("adb")`, which silently talks to 127.0.0.1:5037 and
+/// ignores `--adb-server`.
 fn adb_command() -> Command {
     let mut cmd = Command::new("adb");
     if let Some(Some((host, port))) = ADB_SERVER.get() {

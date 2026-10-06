@@ -107,11 +107,17 @@ impl AsyncWrite for Stream {
         // mirroring the pattern used by the transport's ChannelWriter.
         match self.write_tx.try_reserve() {
             Ok(permit) => {
-                // adbd rejects any frame whose data_length exceeds the
-                // negotiated max_payload and *terminates the transport* when
-                // it does, taking every other multiplexed stream with it. So
-                // accept at most one payload's worth here and let the caller
+                // adbd rejects a frame whose data_length exceeds its own
+                // max_payload and *terminates the transport* when it does,
+                // taking every other multiplexed stream with it. So accept at
+                // most one payload's worth here and let the caller
                 // (`write_all`) come back for the rest.
+                //
+                // This is our local `MAX_PAYLOAD`, not the value the device
+                // advertised: CNXN carries it but it is not plumbed through
+                // (see `packet::MAX_PAYLOAD`). Devices that allow more are
+                // simply written to in smaller frames, which is safe; the
+                // failure mode we are avoiding is the opposite one.
                 let take = buf.len().min(MAX_PAYLOAD);
                 let chunk = Bytes::copy_from_slice(&buf[..take]);
                 permit.send(WriteReq::Data {

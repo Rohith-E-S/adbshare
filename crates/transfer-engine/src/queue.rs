@@ -231,9 +231,13 @@ impl JobQueue {
         count
     }
 
-    /// Requeue every `Failed` job whose source/destination paths (or device tag)
-    /// contain `serial` as `Pending` so the dispatcher retries it after a
-    /// replug. Returns the number of jobs requeued.
+    /// Requeue every `Failed` job whose device tag is exactly `serial` as
+    /// `Pending`, so the dispatcher retries it after a replug. Returns the
+    /// number of jobs requeued.
+    ///
+    /// Matching is on the device tag alone and is exact. Neither the paths nor
+    /// a substring test take part: those cross-matched, so replugging one phone
+    /// resent another phone's transfers.
     pub fn retry_failed_for(&self, serial: &str) -> u64 {
         if serial.is_empty() {
             return 0;
