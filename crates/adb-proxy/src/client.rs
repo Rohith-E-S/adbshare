@@ -73,6 +73,11 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// D-Bus handlers wait here with nothing else to bound them.
 const POOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How many times a dropped `ProxyFile` retries borrowing a connection to send
+/// its `Op::Close`. Sends are best-effort from `Drop`, but an abandoned fd
+/// accumulates on the device proxy for as long as it runs.
+const CLOSE_RETRIES: usize = 4;
+
 /// A single TCP connection to the proxy. Cheap to clone (it's an Arc).
 #[derive(Clone)]
 pub struct ProxyConn {
@@ -700,9 +705,17 @@ impl ProxyFile {
     }
 
     pub async fn close(self) -> Result<()> {
-        // Claim the fd first so a concurrent clone cannot close it twice.
-        let fd = self.inner.fd.lock().take().ok_or(ProxyError::Closed)?;
+        // Borrow a connection *before* claiming the fd. Claiming first and then
+        // hitting `?` on the borrow is what leaked: the fd would already be out
+        // of `inner.fd`, so `Drop` would skip it, `self` is consumed so nothing
+        // can retry, and the device-side fd is orphaned for the life of the
+        // device proxy process.
         let (conn, _permit) = self.inner.client.acquire().await?;
+        // Still claim before sending, so a concurrent clone cannot close it too.
+        let Some(fd) = self.inner.fd.lock().take() else {
+            self.inner.client.release(conn);
+            return Err(ProxyError::Closed);
+        };
         let mut args = Vec::new();
         args.extend_from_slice(&fd.to_le_bytes());
         let res = conn.request(Op::Close, &args).await.map(|_| ());
@@ -737,18 +750,44 @@ impl Drop for ProxyFile {
                 // Drop can't await; spawn a task to borrow a connection, send
                 // the Close properly (consuming the response so the stream
                 // stays in sync) and return the connection to the pool.
+                //
+                // `Op::Close` is the only way to release this fd, and nothing on
+                // the device side will do it for us — closing a connection's
+                // fds on teardown would break live handles, since a ProxyFile
+                // outlives the connection it was opened over. So a saturated
+                // pool has to be waited out rather than shrugged off: retry a
+                // bounded number of times, then give up and say so.
                 handle.spawn(async move {
-                    // If the pool is busy or gone there is nothing to send on;
-                    // the device proxy's watchdog reclaims the fd.
-                    if let Ok((conn, _permit)) = client.acquire().await {
-                        let _ = conn.send_frame_and_await(close_frame).await;
-                        client.release(conn);
+                    for attempt in 0..CLOSE_RETRIES {
+                        match client.acquire().await {
+                            Ok((conn, _permit)) => {
+                                let _ = conn.send_frame_and_await(close_frame).await;
+                                client.release(conn);
+                                return;
+                            }
+                            Err(ProxyError::Busy) if attempt + 1 < CLOSE_RETRIES => {
+                                tracing::debug!(attempt, "pool busy sending Op::Close; retrying");
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    100 * (attempt as u64 + 1),
+                                ))
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = ?e,
+                                    "could not send Op::Close; the device-side fd is leaked"
+                                );
+                                return;
+                            }
+                        }
                     }
                 });
             }
             Err(_) => {
-                // No runtime, so we cannot borrow a connection to send on.
-                // The device's idle watchdog reclaims the fd.
+                // No runtime, so nothing can be sent. The caller is on a
+                // thread with no executor; the fd is leaked and only a restart
+                // of the device proxy reclaims it.
+                tracing::debug!("no runtime to send Op::Close on; device-side fd is leaked");
                 drop(close_frame);
             }
         }
