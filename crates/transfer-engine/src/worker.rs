@@ -125,6 +125,7 @@ impl Worker {
         // error is treated as "does not exist" (only a successful stat
         // triggers SkipExisting/Rename handling).
         let existing = self.client.stat(&dest).await.ok();
+
         // True when this job is about to create a brand-new file; a
         // pre-existing destination (Always/SkipExisting/Resume) must never
         // be removed on cancel.
@@ -222,6 +223,20 @@ impl Worker {
         // A successful local stat means the destination exists. A stat
         // error is treated as "does not exist".
         let existing = tokio::fs::metadata(&dest).await.ok();
+        // Validate the source before the destination is created or truncated.
+        // Pull is the direction that opens the *remote* source, and the proxy
+        // protocol is string-based, so a non-UTF-8 path cannot be expressed:
+        // this has to fail the job rather than panic the worker. Checking it
+        // here, rather than immediately before the open, also means a job that
+        // cannot proceed never leaves a 0-byte file behind and never skips the
+        // `created` cleanup that every other error path performs.
+        let Some(source_str) = job.source.to_str() else {
+            return Err(ProxyError::Other(format!(
+                "source path is not valid UTF-8: {}",
+                job.source.to_string_lossy()
+            )));
+        };
+
         // True when this job is about to create a brand-new file; a
         // pre-existing destination (Always/SkipExisting/Resume) must never
         // be removed on cancel.
@@ -276,13 +291,6 @@ impl Worker {
                 .map_err(|e| ProxyError::Other(format!("create destination: {e}")))?,
         };
 
-        // A non-UTF-8 path must fail the job, not panic the worker.
-        let Some(source_str) = job.source.to_str() else {
-            return Err(ProxyError::Other(format!(
-                "source path is not valid UTF-8: {}",
-                job.source.to_string_lossy()
-            )));
-        };
         let src = self.client.open(source_str, OpenFlags::READ, 0).await?;
 
         let outcome: Result<(), ProxyError> = loop {

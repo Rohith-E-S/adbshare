@@ -587,8 +587,17 @@ fn dispatch(op: u8, args: &[u8], conn: u64, owned: &OwnedFds) -> Vec<u8> {
                         libc::readlink(p.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
                     };
                     if n < 0 {
-                        out.push(0x07);
-                        out.extend_from_slice(b"readlink");
+                        // Map the errno like every other path op: a missing
+                        // link must report NotFound, and a name that is not a
+                        // symlink InvalidArg, instead of a blanket IoError.
+                        let err = std::io::Error::last_os_error();
+                        let (status, msg) = if err.raw_os_error() == Some(libc::EINVAL) {
+                            (0x08, err.to_string())
+                        } else {
+                            stat_error(err)
+                        };
+                        out.push(status);
+                        out.extend_from_slice(msg.as_bytes());
                     } else {
                         out.push(0);
                         out.extend_from_slice(&(n as u32).to_le_bytes());
@@ -932,24 +941,43 @@ fn handle_open(args: &[u8]) -> std::result::Result<u32, (u8, &'static str)> {
     }
 }
 
-fn do_stat(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, &'static str)> {
+/// Map a stat/lstat errno onto the wire status byte. ENOENT is the only
+/// "this name does not exist"; everything else keeps its own meaning so
+/// existence probes fail closed instead of mistaking an error for a free name.
+fn stat_error(error: std::io::Error) -> (u8, String) {
+    let status = match error.raw_os_error() {
+        Some(libc::ENOENT) => 0x01,
+        Some(libc::EACCES | libc::EPERM) => 0x02,
+        Some(libc::ENOTDIR) => 0x04,
+        Some(libc::ELOOP) => 0x08,
+        Some(libc::ENAMETOOLONG) => 0x0A,
+        _ => 0x07,
+    };
+    (status, error.to_string())
+}
+
+fn do_stat(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, String)> {
     let mut cpath = path.to_vec();
     cpath.push(0);
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::stat(cpath.as_ptr() as *const _, &mut st) };
     if r != 0 {
-        return Err((0x01, "stat"));
+        // Every failure was reported as NotFound, which is a lie for anything
+        // but a genuinely absent name: EACCES, ENOTDIR, ELOOP and ENAMETOOLONG
+        // all became "not found" too. A caller probing whether a name is free
+        // (FUSE's RENAME_NOREPLACE) read that as "free" and overwrote.
+        return Err(stat_error(std::io::Error::last_os_error()));
     }
     Ok(encode_stat(&st))
 }
 
-fn do_lstat(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, &'static str)> {
+fn do_lstat(path: &[u8]) -> std::result::Result<Vec<u8>, (u8, String)> {
     let mut cpath = path.to_vec();
     cpath.push(0);
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::lstat(cpath.as_ptr() as *const _, &mut st) };
     if r != 0 {
-        return Err((0x01, "lstat"));
+        return Err(stat_error(std::io::Error::last_os_error()));
     }
     Ok(encode_stat(&st))
 }

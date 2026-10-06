@@ -4,6 +4,8 @@
 //! forwarded to the device via `adb forward`). Each connection is a request/
 //! response channel; the host issues RPCs and reads back status + data.
 
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -402,6 +404,54 @@ impl ProxyClient {
             args.extend_from_slice(path.as_bytes());
             let resp = conn.request(Op::Lstat, &args).await?;
             Stat::decode(&resp).ok_or_else(|| ProxyError::Invalid("lstat decode".into()))
+        }
+        .await;
+        self.release(conn);
+        res
+    }
+
+    /// Create a symlink at `link` pointing to `target`.
+    ///
+    /// The device op carries two paths, both raw: a link target is not
+    /// required to be UTF-8 either, and the protocol already transmits the
+    /// bytes, so they are sent unchanged.
+    pub async fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        let (conn, _permit) = self.acquire().await?;
+        let res = async {
+            let (t, l) = (target.as_os_str().as_bytes(), link.as_os_str().as_bytes());
+            if t.len() > MAX_REQUEST || l.len() > MAX_REQUEST {
+                return Err(ProxyError::TooLarge(t.len().max(l.len())));
+            }
+            let mut args = Vec::with_capacity(8 + t.len() + l.len());
+            args.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            args.extend_from_slice(t);
+            args.extend_from_slice(&(l.len() as u32).to_le_bytes());
+            args.extend_from_slice(l);
+            conn.request(Op::Symlink, &args).await.map(|_| ())
+        }
+        .await;
+        self.release(conn);
+        res
+    }
+
+    /// Target of a symlink, as raw bytes: a link target need not be UTF-8.
+    pub async fn readlink(&self, path: &str) -> Result<Vec<u8>> {
+        let (conn, _permit) = self.acquire().await?;
+        let res = async {
+            let mut args = Vec::new();
+            args.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            args.extend_from_slice(path.as_bytes());
+            let resp = conn.request(Op::ReadLink, &args).await?;
+            // Payload is [len u32][target]; the declared length is what the
+            // device wrote, so trust the buffer only as far as it agrees.
+            if resp.len() < 4 {
+                return Err(ProxyError::Invalid("readlink decode".into()));
+            }
+            let n = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]) as usize;
+            match resp.get(4..4 + n) {
+                Some(target) => Ok(target.to_vec()),
+                None => Err(ProxyError::Invalid("readlink length".into())),
+            }
         }
         .await;
         self.release(conn);
@@ -831,5 +881,10 @@ impl FileMode {
     }
     pub fn file() -> Self {
         Self(Self::S_IFREG | 0o644)
+    }
+    /// Symlinks are always mode 0777 on Linux; the kernel ignores the
+    /// permission bits for them.
+    pub fn symlink() -> Self {
+        Self(Self::S_IFLNK | 0o777)
     }
 }

@@ -100,6 +100,9 @@ type Reply<T> = std::sync::mpsc::Sender<std::result::Result<T, ProxyError>>;
 
 enum ProxyRequest {
     Stat(String, Reply<Stat>),
+    Lstat(String, Reply<Stat>),
+    ReadLink(String, Reply<Vec<u8>>),
+    Symlink(Vec<u8>, Vec<u8>, Reply<()>),
     ListDir(String, Reply<Vec<DirEntry>>),
     Open(String, OpenFlags, u32, Reply<ProxyFile>),
     ReadAt(ProxyFile, u64, u32, Reply<bytes::Bytes>),
@@ -159,6 +162,24 @@ impl SyncProxy {
                         match req {
                             ProxyRequest::Stat(path, s) => {
                                 let r = client.stat(&path).await;
+                                let _ = s.send(r);
+                            }
+                            ProxyRequest::Lstat(path, s) => {
+                                let r = client.lstat(&path).await;
+                                let _ = s.send(r);
+                            }
+                            ProxyRequest::ReadLink(path, s) => {
+                                let r = client.readlink(&path).await;
+                                let _ = s.send(r);
+                            }
+                            ProxyRequest::Symlink(target, link, s) => {
+                                use std::os::unix::ffi::OsStrExt;
+                                let r = client
+                                    .symlink(
+                                        Path::new(OsStr::from_bytes(&target)),
+                                        Path::new(OsStr::from_bytes(&link)),
+                                    )
+                                    .await;
                                 let _ = s.send(r);
                             }
                             ProxyRequest::ListDir(path, s) => {
@@ -229,6 +250,17 @@ impl SyncProxy {
 
     fn stat(&self, path: &str) -> std::result::Result<Stat, ProxyError> {
         self.call(|tx| ProxyRequest::Stat(path.to_string(), tx))
+    }
+    /// Does not follow a final symlink. Used where the question is whether the
+    /// *name* is occupied rather than what it resolves to.
+    fn lstat(&self, path: &str) -> std::result::Result<Stat, ProxyError> {
+        self.call(|tx| ProxyRequest::Lstat(path.to_string(), tx))
+    }
+    fn readlink(&self, path: &str) -> std::result::Result<Vec<u8>, ProxyError> {
+        self.call(|tx| ProxyRequest::ReadLink(path.to_string(), tx))
+    }
+    fn symlink(&self, target: &[u8], link: &[u8]) -> std::result::Result<(), ProxyError> {
+        self.call(|tx| ProxyRequest::Symlink(target.to_vec(), link.to_vec(), tx))
     }
     fn listdir(&self, path: &str) -> std::result::Result<Vec<DirEntry>, ProxyError> {
         self.call(|tx| ProxyRequest::ListDir(path.to_string(), tx))
@@ -454,6 +486,14 @@ impl Adbfs {
 }
 
 impl Filesystem for Adbfs {
+    /// FUSE asks for the attributes of a *name*, which is `lstat` semantics.
+    /// The old `stat` followed a final symlink, so every symlink in a listing
+    /// was reported as its target — a link to a 12 MiB file looked like a
+    /// 12 MiB regular file, and a link to a directory reported Directory (so
+    /// `ls -l` showed `d`) — and a *dangling* symlink failed the lookup with
+    /// ENOENT, making it invisible to the file manager even though `readdir`
+    /// had already listed it (that path uses `lstat` and got it right).
+    /// Unlinking such a link was then impossible through the mount.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let path = match self.resolve_child(parent, name) {
             Some(p) => p,
@@ -466,7 +506,7 @@ impl Filesystem for Adbfs {
             reply.error(Errno::EINVAL);
             return;
         };
-        let res = self.proxy.stat(&path_str);
+        let res = self.proxy.lstat(&path_str);
         match res {
             Ok(stat) => {
                 self.cache.put(path.clone(), stat);
@@ -547,7 +587,7 @@ impl Filesystem for Adbfs {
             reply.error(Errno::EINVAL);
             return;
         };
-        let res = self.proxy.stat(&path_str);
+        let res = self.proxy.lstat(&path_str);
         match res {
             Ok(stat) => {
                 self.cache.put(path, stat);
@@ -619,6 +659,71 @@ impl Filesystem for Adbfs {
             let _ = reply.add(child_ino, (n as u64) + 3, kind, &entry.name);
         }
         reply.ok();
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let path = match self.resolve_child(parent, link_name) {
+            Some(p) => p,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        // The link is created for its *name*, so the entry describes the link
+        // itself: lstat, or a symlink would be reported as its target.
+        let stat = match self
+            .proxy
+            .symlink(target.as_os_str().as_bytes(), path.as_os_str().as_bytes())
+        {
+            Ok(()) => self.proxy.lstat(&path.to_string_lossy()).ok(),
+            Err(e) => {
+                reply.error(Self::proxy_to_errno(e));
+                return;
+            }
+        };
+        let ino = self.ino_for(path.clone());
+        let stat = stat.unwrap_or(Stat {
+            mode: FileMode::symlink(),
+            size: target.as_os_str().len() as u64,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            uid: ADB_UID,
+            gid: ADB_GID,
+            nlink: 1,
+            blksize: BLOCK_SIZE,
+            blocks: 0,
+        });
+        self.invalidate_parent_listing(&path);
+        self.cache.put(path, stat);
+        let attr = self.attr_from_stat(ino, stat);
+        reply.entry(&TTL, &attr, Generation(0));
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let path = self.ino_to_path.lock().get(&ino).cloned();
+        let Some(path) = path else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let Some(path_str) = path_to_string(&path) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.proxy.readlink(&path_str) {
+            // A link target is raw bytes on POSIX: it need not be UTF-8, and
+            // rejecting one would make such a link unreadable through the
+            // mount, so the bytes are passed through unchanged.
+            Ok(target) => reply.data(&target),
+            Err(e) => reply.error(Self::proxy_to_errno(e)),
+        }
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: FOpenFlags, reply: ReplyOpen) {
@@ -937,9 +1042,27 @@ impl Filesystem for Adbfs {
             reply.error(Errno::ENOSYS);
             return;
         }
-        if flags.contains(RenameFlags::RENAME_NOREPLACE) && self.proxy.stat(&dst_str).is_ok() {
-            reply.error(Errno::EEXIST);
-            return;
+        if flags.contains(RenameFlags::RENAME_NOREPLACE) {
+            // `lstat`, not `stat`: the question is whether the *name* is taken,
+            // not what it points at. A dangling symlink has no stat-able target
+            // and so reports NotFound, which the old `stat(...).is_ok()` check
+            // read as "free" and then overwrote.
+            //
+            // Fail closed on every other outcome. A busy pool, a timeout, or
+            // EACCES on the parent used to fall through to the rename, which is
+            // exactly the data loss NOREPLACE exists to prevent. Only an
+            // explicit NotFound means the name is free.
+            match self.proxy.lstat(&dst_str) {
+                Ok(_) => {
+                    reply.error(Errno::EEXIST);
+                    return;
+                }
+                Err(ProxyError::Status(Status::NotFound, _)) => {}
+                Err(e) => {
+                    reply.error(Self::proxy_to_errno(e));
+                    return;
+                }
+            }
         }
         // Was src a directory? Ask *before* the rename, while src still exists;
         // afterwards a fallback stat can only ever come back NotFound, and a
@@ -1062,7 +1185,7 @@ impl Filesystem for Adbfs {
         });
         let stat = match open {
             Some(file) => self.proxy.fstat(file),
-            None => self.proxy.stat(&path_str),
+            None => self.proxy.lstat(&path_str),
         };
         match stat {
             Ok(stat) => {

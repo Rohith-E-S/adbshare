@@ -16,6 +16,9 @@ pub enum Op {
     Rmdir = 0x09,
     Rename = 0x0A,
     Truncate = 0x0B,
+    /// `readlink` on a symlink. Returns the raw target bytes, which are not
+    /// required to be UTF-8.
+    ReadLink = 0x0D,
     Symlink = 0x0E,
     Lstat = 0x0F,
     Utime = 0x10,
