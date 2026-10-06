@@ -32,7 +32,14 @@ impl Worker {
             job.set_state(JobState::Cancelled);
             return Ok(());
         }
-        job.set_state(JobState::Running);
+        // Do not stomp a pause that landed while the job was still Pending.
+        // `pause_job` accepts a pending job, and if the dispatcher then
+        // relabelled it Running the UI would show a paused transfer as running
+        // at 0 bytes with no way to tell, while the worker sits parked in
+        // `wait_while_paused` forever.
+        if job.state() != JobState::Paused {
+            job.set_state(JobState::Running);
+        }
         job.mark_started();
         let mut tracker = ProgressTracker::new();
 
@@ -269,10 +276,14 @@ impl Worker {
                 .map_err(|e| ProxyError::Other(format!("create destination: {e}")))?,
         };
 
-        let src = self
-            .client
-            .open(job.source.to_str().unwrap(), OpenFlags::READ, 0)
-            .await?;
+        // A non-UTF-8 path must fail the job, not panic the worker.
+        let Some(source_str) = job.source.to_str() else {
+            return Err(ProxyError::Other(format!(
+                "source path is not valid UTF-8: {}",
+                job.source.to_string_lossy()
+            )));
+        };
+        let src = self.client.open(source_str, OpenFlags::READ, 0).await?;
 
         let outcome: Result<(), ProxyError> = loop {
             if job.is_cancelled() || self.wait_while_paused(job).await {

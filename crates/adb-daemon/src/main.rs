@@ -252,12 +252,23 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let queue_inner = queue_for_workers.clone();
                 tokio::spawn(async move {
+                    // Drop-based, not a trailing statement: a panic inside
+                    // `run` unwinds past a plain `mark_done` call and would
+                    // strand the job in `in_flight` forever. `mark_done` is the
+                    // only thing that removes it, and a stranded slot is
+                    // unrecoverable — `retry_failed` only scans `completed`, so
+                    // the job could not be retried, cancelled or trimmed. After
+                    // `parallelism` such panics the engine stops dispatching
+                    // altogether.
+                    let _done = MarkDoneOnDrop {
+                        queue: queue_inner,
+                        job: job.clone(),
+                    };
                     let worker = Worker::new((*client).clone());
                     let result = Arc::new(worker).run(job.clone()).await;
                     if let Err(e) = result {
                         warn!(?e, id = job.id, "job failed");
                     }
-                    queue_inner.mark_done(job);
                 });
             }
         }
@@ -359,6 +370,19 @@ async fn adb_run_output(args: &[&str], timeout: Duration) -> anyhow::Result<std:
     .await
     .map_err(|_| anyhow::anyhow!("adb {args:?} timed out"))?
     .map_err(|e| anyhow::anyhow!("adb {args:?}: {e}"))
+}
+
+/// Returns a dispatched job to the queue when the worker finishes — or
+/// panics. Named fields so it cannot be constructed by accident.
+struct MarkDoneOnDrop {
+    queue: Arc<JobQueue>,
+    job: Job,
+}
+
+impl Drop for MarkDoneOnDrop {
+    fn drop(&mut self) {
+        self.queue.mark_done(self.job.clone());
+    }
 }
 
 /// True if the pooled client can still serve requests (proxy reachable).
