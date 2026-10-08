@@ -5,25 +5,21 @@
 //! - Sidebar: devices discovered over the session D-Bus, plus place shortcuts.
 //! - Content: a file browser that can point at a phone or at the local disk.
 //!
-//! All backend work goes to `adb-daemon` over the session bus; see [`daemon`].
+//! All backend work goes to `adb-daemon` over the session bus; see [`state::daemon`].
 //! The GUI never talks to ADB directly.
 
 mod app;
-mod browser;
-mod clipboard;
-mod daemon;
-mod dialogs;
-mod filechooser;
+mod state;
+mod views;
+
 mod icons;
-mod localfs;
-mod menu;
-mod notify;
-mod prefs;
+
 mod protocol;
-mod textinput;
+
+mod sysicons;
 mod theme;
-mod toast;
-mod ui;
+
+mod thumbnails;
 
 use clap::Parser;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
@@ -56,13 +52,13 @@ fn main() -> anyhow::Result<()> {
         .run(|cx: &mut App| {
             theme::install(cx);
             cx.set_global(TransferPolicy::default());
-            daemon::start(cx);
+            state::daemon::start(cx);
 
             // Key bindings are app-global, so they are registered once here
             // rather than per view.
             app::install_key_bindings(cx);
-            browser::install_key_bindings(cx);
-            textinput::install_key_bindings(cx);
+            views::browser::install_key_bindings(cx);
+            views::textinput::install_key_bindings(cx);
 
             let bounds = Bounds::centered(None, size(px(WINDOW_W), px(WINDOW_H)), cx);
             cx.open_window(

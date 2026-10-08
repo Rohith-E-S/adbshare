@@ -5,7 +5,7 @@
 //! toasts. Pulling GLib in behind a GPUI window would drag a second main loop
 //! and a second set of platform libraries into the process, so both are done
 //! directly here: the XDG Trash spec is short, and toasts live in
-//! [`crate::toast`].
+//! [`crate::views::toast`].
 
 use std::fs;
 use std::io;

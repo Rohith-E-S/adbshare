@@ -9,7 +9,7 @@
 //! That split is the direct translation of the GTK build, where `FileBrowser`
 //! held the same state and called an `on_event` callback up into `app.rs`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gpui::prelude::*;
@@ -21,10 +21,11 @@ use gpui::{
 };
 
 use crate::icons::{self, names};
-use crate::prefs;
 use crate::protocol::{DirEntry, SortKey, contains_ignore_case, human_size, sort_entries};
+use crate::state::prefs;
 use crate::theme::{self, Themed};
-use crate::ui;
+use crate::thumbnails::{self, Size as ThumbSize, Thumb};
+use crate::views::ui;
 
 /// How entries are laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +403,16 @@ pub struct Browser {
     /// Name of the directory row a drag is currently over, for the drop hint.
     hovered_drop_folder: Option<String>,
 
+    // ── Thumbnails ─────────────────────────────────────────────────────────
+    /// Decoded previews by source path and size. The on-disk cache is the one
+    /// that survives restarts; this holds the decoded PNG so a repaint does not
+    /// re-read and re-decode it, and so entries with no preview are not
+    /// re-requested every frame.
+    thumbs: HashMap<(PathBuf, ThumbSize), Thumb>,
+    /// Paths with no preview, so a failure is asked for once rather than on
+    /// every repaint. The on-disk `fail/` entry is the durable version of this.
+    thumb_missed: HashSet<PathBuf>,
+
     // ── Item-area metrics ───────────────────────────────────────────────────
     //
     // `render` cannot ask the compositor for its own bounds, so the app root
@@ -462,6 +473,8 @@ impl Browser {
                 label: String::new(),
             }),
             hovered_drop_folder: None,
+            thumbs: HashMap::new(),
+            thumb_missed: HashSet::new(),
             scroll: ScrollHandle::new(),
             list_scroll: UniformListScrollHandle::new(),
             drag_base: BTreeSet::new(),
@@ -579,7 +592,7 @@ impl Browser {
     /// Apply the persisted view preferences.
     pub fn apply_preferences(
         &mut self,
-        prefs: crate::prefs::ViewPreferences,
+        prefs: crate::state::prefs::ViewPreferences,
         cx: &mut Context<Self>,
     ) {
         self.zoom = step_zoom(prefs.zoom, 0.0);
@@ -801,12 +814,25 @@ impl Browser {
         y: f32,
         width: f32,
         height: f32,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        let moved = (self.viewport_x - x).abs() > f32::EPSILON
+            || (self.viewport_y - y).abs() > f32::EPSILON;
+        let resized = (self.viewport_width - width).abs() > f32::EPSILON
+            || (self.viewport_height - height).abs() > f32::EPSILON;
         self.viewport_x = x;
         self.viewport_y = y;
         self.viewport_width = width;
         self.viewport_height = height;
+        // The app root reports the browser's box during *its* render, so this
+        // lands after the browser has already drawn with the previous values.
+        // Without a notify the browser keeps drawing the old column count until
+        // something else happened to dirty it — and `pump_thumbnails` derives
+        // its request window from that same stale geometry, so tiles outside it
+        // never got a preview requested at all.
+        if moved || resized {
+            cx.notify();
+        }
     }
 
     /// Install a directory listing, clearing any selection.
@@ -824,6 +850,9 @@ impl Browser {
         self.selection.clear();
         self.focused = None;
         self.extend_anchor = None;
+        // A path in this directory may now hold a different file, or have
+        // finished mounting, so the previous round's misses do not carry over.
+        self.thumb_missed.clear();
         self.recompute_visible();
     }
 
@@ -1039,6 +1068,107 @@ impl Browser {
         }
         self.selection.insert(index);
         true
+    }
+
+    // ── Thumbnails ─────────────────────────────────────────────────────────
+
+    /// The local path a thumbnail would be read from, or `None` if there is
+    /// none.
+    ///
+    /// Thumbnails need a path a subprocess can open, and on the local disk that
+    /// is the obvious one. A phone file becomes one through the device's FUSE
+    /// mount; without FUSE there is no path and no way to read the bytes, so
+    /// the entry keeps its static icon. See [`crate::thumbnails`].
+    fn thumbnail_source(&self, entry: &DirEntry) -> Option<PathBuf> {
+        let device_path = self.current_path.join(&entry.name);
+        if self.local_mode {
+            return Some(device_path);
+        }
+        self.fuse_mount
+            .as_ref()
+            .map(|mount| Path::new(mount).join(device_path))
+    }
+
+    /// Slots the current frame will draw tiles for.
+    ///
+    /// The grid builder and the thumbnail requester both call this, and both
+    /// call it after the geometry above is assigned. They used to compute the
+    /// window separately, from different moments in the frame, and the request
+    /// side ran first with a zero-width viewport — one column — so it asked for
+    /// the first 24 items only. Everything past that kept its placeholder icon
+    /// indefinitely, because nothing about a still view produces another frame.
+    /// One function, one moment, no drift.
+    fn slot_window(&self) -> std::ops::Range<usize> {
+        let count = self.visible.len();
+        let tile_w = self.tile_width();
+        let tile_h = tile_w + GRID_TILE_CAPTION + GRID_GAP;
+        match self.view_mode {
+            ViewMode::Grid => {
+                let columns = self.grid_geometry.columns.max(1);
+                let (first_row, rows) = self.visible_row_range(tile_h);
+                let first = (first_row * columns).min(count);
+                let last = ((first_row + rows) * columns).min(count);
+                first..last.max(first)
+            }
+            ViewMode::List => {
+                let (first, rows) = self.visible_row_range(LIST_ROW_H);
+                let first = first.min(count);
+                let end = (first + rows).min(count);
+                first..end.max(first)
+            }
+        }
+    }
+
+    /// Adopt finished previews and ask for the ones this frame will draw.
+    ///
+    /// Driven from `render`, so it has to be cheap and idempotent:
+    /// `thumbnails::request` ignores paths already queued, and a `None` result
+    /// is remembered so a format with no renderer is asked for once.
+    fn pump_thumbnails(&mut self) {
+        for (key, thumb) in thumbnails::take_finished() {
+            match thumb {
+                Some(thumb) => {
+                    self.thumb_missed.remove(&key.0);
+                    self.thumbs.insert(key, thumb);
+                }
+                // Asked once, not once per frame. `install_entries` clears it,
+                // so a file that became readable in the meantime is retried.
+                None => {
+                    self.thumb_missed.insert(key.0);
+                }
+            }
+        }
+
+        let size = self.thumb_size();
+        for index in self.slot_window() {
+            let Some(entry) = self.entries.get(self.visible[index]) else {
+                continue;
+            };
+            if entry.looks_like_dir() {
+                continue;
+            }
+            // Nothing claims a preview for this extension.
+            if thumbnails::mimes_for(&entry.ext()).is_empty() {
+                continue;
+            }
+            let Some(path) = self.thumbnail_source(entry) else {
+                continue;
+            };
+            if self.thumbs.contains_key(&(path.clone(), size)) || self.thumb_missed.contains(&path)
+            {
+                continue;
+            }
+            thumbnails::request(&path, size);
+        }
+    }
+
+    /// Which thumbnail size the current view wants: the grid draws icons at the
+    /// zoom level, which can exceed the list's 18px by a wide margin.
+    fn thumb_size(&self) -> ThumbSize {
+        match self.view_mode {
+            ViewMode::Grid if self.zoom >= 128.0 => ThumbSize::Large,
+            _ => ThumbSize::Normal,
+        }
     }
 
     /// Apply the search filter and the hidden-file preference.
@@ -1601,7 +1731,7 @@ impl Focusable for Browser {
 
 /// Clamp a zoom change to the supported range.
 ///
-/// The bounds live in [`crate::prefs`] so the persisted value and the live
+/// The bounds live in [`crate::state::prefs`] so the persisted value and the live
 /// clamp can never disagree.
 pub fn step_zoom(current: f32, delta: f32) -> f32 {
     (current + delta).clamp(prefs::ZOOM_RANGE.0, prefs::ZOOM_RANGE.1)
@@ -2048,6 +2178,21 @@ impl Browser {
         });
     }
 
+    fn thumb_for(&self, entry: &DirEntry, size: f32) -> Option<AnyElement> {
+        let path = self.thumbnail_source(entry)?;
+        let thumb = self.thumbs.get(&(path, self.thumb_size()))?.clone();
+        // `Contain`, not `Fill`: the spec's thumbnails keep the source's aspect
+        // (GNOME writes 256x144 for a 16:9 video), so stretching would distort
+        // every preview. `Contain` letterboxes within the tile, which is what a
+        // file manager does.
+        Some(
+            gpui::img(gpui::ImageSource::Image(thumb))
+                .size(px(size))
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+        )
+    }
+
     /// The monochrome glyph for a file. Folders never reach here: they are drawn
     /// full-colour by [`folder_art_for`].
     fn glyph_for(&self, entry: &DirEntry) -> &'static str {
@@ -2144,23 +2289,36 @@ impl Browser {
         let tile_w = icon_size + GRID_TILE_PAD * 2.0;
         let tile_h = tile_w + GRID_TILE_CAPTION;
 
-        let icon_el: AnyElement = match artwork_for(&entry) {
-            Some(art) if !entry.looks_like_dir() => {
-                icons::artwork(art, icon_size).into_any_element()
+        let icon_el: AnyElement = if let Some(thumb) = self.thumb_for(&entry, icon_size) {
+            thumb
+        } else if entry.looks_like_dir() {
+            icons::artwork(folder_art_for(&entry), icon_size).into_any_element()
+        } else if let Some(sys) = crate::sysicons::element(
+            &entry.ext(),
+            entry.mode,
+            icon_size * 0.86,
+            &self.current_path.join(&entry.name),
+        ) {
+            // Ahead of the vendored artwork: a spreadsheet should look like a
+            // spreadsheet and a shell script like a script, which is what the
+            // file manager next to this window draws and what the eight
+            // vendored PNGs never covered. They stay as the last resort for
+            // anything a theme does not have.
+            sys
+        } else {
+            match artwork_for(&entry) {
+                Some(art) => icons::artwork(art, icon_size).into_any_element(),
+                _ => icons::icon(
+                    self.glyph_for(&entry),
+                    icon_size * 0.9,
+                    if selected {
+                        t.text_header
+                    } else {
+                        ui::icon_tint(self.glyph_for(&entry), &t)
+                    },
+                )
+                .into_any_element(),
             }
-            _ if entry.looks_like_dir() => {
-                icons::artwork(folder_art_for(&entry), icon_size).into_any_element()
-            }
-            _ => icons::icon(
-                self.glyph_for(&entry),
-                icon_size * 0.9,
-                if selected {
-                    t.text_header
-                } else {
-                    ui::icon_tint(self.glyph_for(&entry), &t)
-                },
-            )
-            .into_any_element(),
         };
 
         // One div per piece of text rather than a wrapper plus a label: at
@@ -2319,8 +2477,19 @@ impl Browser {
             .when(selected, |d| d.bg(t.hover))
             .when(focused && !selected, |d| d.bg(t.hover))
             .hover(|d| d.bg(if selected { t.pressed } else { t.hover }))
-            .child(if entry.looks_like_dir() {
+            .child(if let Some(thumb) = self.thumb_for(&entry, 18.0) {
+                thumb
+            } else if entry.looks_like_dir() {
                 icons::artwork(folder_art_for(&entry), 18.0).into_any_element()
+            } else if let Some(sys) = crate::sysicons::element(
+                &entry.ext(),
+                entry.mode,
+                16.0,
+                &self.current_path.join(&entry.name),
+            ) {
+                sys
+            } else if let Some(art) = artwork_for(&entry) {
+                icons::artwork(art, 18.0).into_any_element()
             } else {
                 icons::icon(
                     self.glyph_for(&entry),
@@ -2372,7 +2541,10 @@ impl Render for Browser {
         let t = *cx.theme();
         let me = cx.entity();
 
+        // Adopt finished previews and ask for the ones on screen. Also runs on the
+        // empty-state path below, so the pool drains even with nothing browsed.
         if !self.has_device() {
+            self.pump_thumbnails();
             return div()
                 .flex()
                 .flex_col()
@@ -2400,6 +2572,14 @@ impl Render for Browser {
             origin_y: px(item_top),
             row_h: LIST_ROW_H,
         };
+
+        // After the geometry above, not before it. The request window is derived
+        // from `grid_geometry`, which the app root updates *after* this render
+        // has already started, so pumping any earlier asked for the window the
+        // previous frame believed in. On the first frame after a navigation that
+        // is a zero-width viewport, i.e. one column, which left every item past
+        // the 24th permanently un-thumbnailed until something scrolled.
+        self.pump_thumbnails();
 
         let count = self.visible.len();
         let empty_message = if self.entries.is_empty() {
@@ -2430,13 +2610,20 @@ impl Render for Browser {
                     // runs to thousands of files, and building a tile for each
                     // one every frame cost ~160ms at 5,000 entries; windowing
                     // keeps this proportional to the viewport instead.
+                    //
+                    // The slot range comes from `slot_window`, the same call
+                    // `pump_thumbnails` made a few lines ago, so a tile cannot
+                    // be drawn for an item whose preview was never asked for.
                     let (first_row, visible_rows) = self.visible_row_range(tile_h);
                     let total_height = rows as f32 * tile_h + GRID_TILE_PAD;
+                    let slots = self.slot_window();
 
                     let windowed: Vec<AnyElement> = (first_row..first_row + visible_rows)
                         .map(|row| {
-                            let first = row * columns;
-                            let last = (first + columns).min(count);
+                            let row_first = row * columns;
+                            let row_last = (row_first + columns).min(count);
+                            let first = slots.start.max(row_first);
+                            let last = slots.end.min(row_last);
                             div()
                                 .flex()
                                 .gap(px(GRID_GAP))

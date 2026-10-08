@@ -131,6 +131,14 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The tree-operation helpers in adb-daemon carry both of that module's
+      # historical off-by-ones (a file cap that admitted one file too many, a
+      # depth cap one level deeper than documented). They are pure functions,
+      # so this runs here rather than in a new job: same container, same
+      # cache, no Vulkan or display needed.
+      - name: Test
+        run: cargo test --workspace --locked
+
   fmt:
     runs-on: ubuntu-latest
     # rustfmt needs no system libraries — skip the container entirely.

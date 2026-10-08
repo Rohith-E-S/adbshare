@@ -16,7 +16,6 @@ adbfs = { path = "../adbfs" }
 transfer-engine = { path = "../transfer-engine" }
 tokio.workspace = true
 zbus.workspace = true
-zbus_macros.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

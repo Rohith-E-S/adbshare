@@ -162,7 +162,7 @@ impl AssetSource for AdbShareAssets {
 /// The icon names available to [`icon`], without the `icons/` prefix.
 ///
 /// Kept as an enum-free list so a typo in a call site is a `&'static str` that
-/// simply renders nothing; `crate::ui::icon_button` is the intended entry point
+/// simply renders nothing; `crate::views::ui::icon_button` is the intended entry point
 /// and takes one of these.
 /// The chrome icon names, as full asset keys.
 ///

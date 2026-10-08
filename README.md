@@ -7,6 +7,8 @@ Browse your Android phone and move files between it and your Linux computer over
 ## What you can do
 
 - Browse phone storage and local folders in grid or list view.
+- Images, PDFs, videos, audio, and documents show a real preview instead of a generic icon, using the same thumbnailers and cache GNOME Files uses.
+- Files without a preview take their icon from your desktop icon theme, so a spreadsheet, a shell script, a web page, a disc image and an executable each look like what they are.
 - Sort by name, size, or modified, ascending or reversed; folders always first.
 - Navigate with breadcrumbs or type a path; filter the current folder by name.
 - Zoom the grid, and keep the sidebar width, layout, and sort across restarts.
@@ -215,6 +217,7 @@ Use **Install APK…** in the more-options menu, or the APK context action. Drop
 - The transfer queue is in memory and is lost when the daemon exits. Reconnecting can retry work, but reliable byte-offset resumption is not guaranteed.
 - The Transfers popover offers a session-wide conflict policy (skip, replace, keep both) and optional SHA-256 verification for computer ↔ phone transfers, both set from the popover itself. Automatic folder synchronization is not supported.
 - FUSE enables external file opening and dragging phone files out. Without it, use in-app browsing and queued transfers instead.
+- File previews need FUSE too. Every thumbnail is read through a local path, and a phone file only has one via its FUSE mount; with `--no-fuse`, phone previews are skipped and local ones still work. Previews for PDF, video, audio, and office documents come from the thumbnailers installed on your system (`evince`, `ffmpegthumbnailer`, `gsf-office`, …), so those formats need the relevant program present — poppler-utils for PDFs, ffmpeg for video. Images work with no extra software at all. Anything with no thumbnailer keeps its existing icon. Previews are cached in `~/.cache/thumbnails`, shared with every other application on the desktop.
 - Custom/remote ADB server support is incomplete: discovery and subprocess ADB commands do not consistently use the same server options.
 - AUR, Flatpak, and `.deb` packaging are experimental. Package layouts and dependencies are not yet consistently wired up; a phone-compatible proxy may need to be supplied separately. There is no working Flatpak USB-portal setup.
 

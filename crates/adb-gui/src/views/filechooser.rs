@@ -29,7 +29,7 @@ pub type Picked = Option<Vec<PathBuf>>;
 /// Ask for existing files or a directory.
 pub async fn pick(kind: Pick, title: &str) -> Result<Picked, String> {
     let title = title.to_string();
-    crate::daemon::on_tokio(move || async move {
+    crate::state::daemon::on_tokio(move || async move {
         let proxy = FileChooserProxy::new().await.map_err(|e| e.to_string())?;
         let options = OpenFileOptions::default()
             .set_multiple(true)
@@ -50,7 +50,7 @@ pub async fn pick(kind: Pick, title: &str) -> Result<Picked, String> {
 /// Ask where to save a file, with `suggested` pre-filling the name field.
 pub async fn save(title: &str, suggested: &str) -> Result<Picked, String> {
     let (title, suggested) = (title.to_string(), suggested.to_string());
-    crate::daemon::on_tokio(move || async move {
+    crate::state::daemon::on_tokio(move || async move {
         let proxy = FileChooserProxy::new().await.map_err(|e| e.to_string())?;
         let options = SaveFileOptions::default()
             .set_modal(true)

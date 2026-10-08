@@ -19,7 +19,6 @@ dependencies = [
  "tracing-subscriber",
  "transfer-engine",
  "zbus 4.4.0",
- "zbus_macros 4.4.0",
 ]
 
 [[package]]
@@ -56,9 +55,12 @@ dependencies = [
  "async-channel 2.5.0",
  "chrono",
  "clap",
+ "crc32fast",
  "dirs 5.0.1",
  "futures",
  "gpui",
+ "image",
+ "md-5",
  "serde",
  "serde_json",
  "tokio",

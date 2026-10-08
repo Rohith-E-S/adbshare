@@ -13,7 +13,7 @@ use gpui::{AnyElement, IntoElement, Styled, Window, div, px};
 
 use crate::icons::{self, names};
 use crate::theme::Palette;
-use crate::ui;
+use crate::views::ui;
 
 /// How long a toast stays before it can be dismissed.
 const LIFETIME: Duration = Duration::from_secs(4);

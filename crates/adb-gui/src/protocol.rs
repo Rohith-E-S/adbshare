@@ -5,8 +5,7 @@
 //! `adb-daemon`; if you change one side, change both.
 //!
 //! Presentation helpers (`human_size`, `format_capacity`, `format_diagnostics`)
-//! live here too so the views stay free of formatting logic and so the existing
-//! unit tests have somewhere obvious to reach.
+//! live here too so the views stay free of formatting logic.
 
 use std::path::{Path, PathBuf};
 

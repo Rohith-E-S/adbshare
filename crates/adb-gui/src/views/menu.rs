@@ -9,7 +9,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, ElementId, IntoElement, SharedString, Window, div, px};
 
 use crate::theme::Palette;
-use crate::ui;
+use crate::views::ui;
 
 /// One row of a menu.
 #[derive(Debug, Clone, PartialEq, Eq)]

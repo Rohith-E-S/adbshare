@@ -29,18 +29,14 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 parking_lot = "0.12"
-rustix = { version = "0.38", features = ["fs"] }
 bytes = "1.8"
 futures = "0.3"
-pin-project-lite = "0.2"
 clap = { version = "4.5", features = ["derive", "wrap_help", "env"] }
 dirs = "5.0"
 sha2 = "0.10"
 hex = "0.4"
-uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 zbus = { version = "4.4", features = ["tokio"] }
-zbus_macros = "4.4"
 
 # FUSE
 fuser = "0.18"
@@ -48,9 +44,24 @@ fuser = "0.18"
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+# Was 1, which compiles a whole crate as a single LLVM unit — on a 16-core
+# machine that leaves fifteen idle for the entire codegen phase, and it is the
+# dominant cost in an incremental rebuild of a leaf crate. 16 is cargo's own
+# default and thin LTO still merges across crates afterwards, so the runtime
+# difference is a fraction of a percent.
+codegen-units = 16
 strip = "symbols"
 panic = "abort"
 
 [profile.dev]
+# Optimised enough that the GPUI window and the proxy threads are usable when
+# debugging, which at opt-level 0 they are not. This is a deliberate cost: it
+# is the most expensive single setting in the dev profile.
 opt-level = 1
+# Line tables only. Full DWARF is the other large slice of a dev build and buys
+# variable inspection, which needs a debugger attached to a running window —
+# whereas a panic backtrace still resolves to file and line either way.
+debug = "line-tables-only"
+# Keeps debug info out of the binary and lets it be produced in parallel, so the
+# linker has less to chew through.
+split-debuginfo = "unpacked"

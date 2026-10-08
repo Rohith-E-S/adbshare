@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::browser::ViewMode;
+use crate::views::browser::ViewMode;
 
 /// Sidebar width bounds, matching the divider's clamp.
 const SIDEBAR_MIN: f32 = 200.0;

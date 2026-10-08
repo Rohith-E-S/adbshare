@@ -17,9 +17,9 @@ use gpui::{AnyElement, Entity, SharedString, Styled, Window, div, px, relative};
 
 use crate::icons::{self, names};
 use crate::protocol::{DiagnosticReportDto, DirEntry, format_diagnostics, human_size};
-use crate::textinput::TextField;
 use crate::theme::{self, Palette};
-use crate::ui;
+use crate::views::textinput::TextField;
+use crate::views::ui;
 
 /// Width of an ordinary dialog card.
 const CARD_W: f32 = 420.0;

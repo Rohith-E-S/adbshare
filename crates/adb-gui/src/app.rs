@@ -18,24 +18,24 @@ use gpui::{
     Window, actions, div, px, rgba,
 };
 
-use crate::browser::{Browser, BrowserEvent, ViewMode};
-use crate::clipboard;
-use crate::daemon;
-use crate::dialogs::{
-    self, Dialog, DialogResult, MessageTone, WifiStep, default_save_dir, validate_name,
-};
-use crate::filechooser::{self, Pick};
 use crate::icons::{self, names};
-use crate::localfs;
-use crate::menu::{self, MenuItem};
-use crate::prefs::{Preferences, SIDEBAR_RANGE};
 use crate::protocol::{
     ClipboardFiles, DeviceEntry, DirEntry, JobInfo, SortKey, format_capacity, tree_result_message,
 };
-use crate::textinput::{TextField, TextFieldEvent};
+use crate::state::clipboard;
+use crate::state::daemon;
+use crate::state::localfs;
+use crate::state::prefs::{Preferences, SIDEBAR_RANGE};
 use crate::theme::{self, Themed};
-use crate::toast::{ActionId, ToastStack, ToastTone};
-use crate::ui;
+use crate::views::browser::{Browser, BrowserEvent, ViewMode};
+use crate::views::dialogs::{
+    self, Dialog, DialogResult, MessageTone, WifiStep, default_save_dir, validate_name,
+};
+use crate::views::filechooser::{self, Pick};
+use crate::views::menu::{self, MenuItem};
+use crate::views::textinput::{TextField, TextFieldEvent};
+use crate::views::toast::{ActionId, ToastStack, ToastTone};
+use crate::views::ui;
 
 /// The application's name, as it appears in a window title.
 const APP_NAME: &str = "ADBShare";
@@ -69,7 +69,7 @@ actions!(
 ///
 /// Data rather than a bare call so the shortcuts dialog can be checked against
 /// what is actually bound; see `browser::BINDINGS`.
-pub const BINDINGS: &[crate::browser::Binding] = &[
+pub const BINDINGS: &[crate::views::browser::Binding] = &[
     ("f9", || KeyBinding::new("f9", ToggleSidebar, None)),
     // Escape closes whatever is on top, falling back to clearing the selection.
     ("escape", || {
@@ -547,7 +547,7 @@ impl AdbShareApp {
             if !before.contains(&serial) {
                 self.toasts
                     .push(format!("{name} connected"), ToastTone::Success);
-                crate::notify::send(&format!("{name} connected"), APP_NAME);
+                crate::state::notify::send(&format!("{name} connected"), APP_NAME);
             }
         }
         for serial in &before {
@@ -602,7 +602,7 @@ impl AdbShareApp {
         // Add up the active jobs so the status bar can show a bar and a
         // throughput. Rates are summed rather than averaged: each job reports
         // its own current rate, and the aggregate is what the link is doing.
-        let progress = crate::browser::TransferProgress {
+        let progress = crate::views::browser::TransferProgress {
             bytes_done: active.iter().map(|job| job.bytes_done).sum(),
             bytes_total: active.iter().map(|job| job.bytes_total).sum(),
             speed_bps: active.iter().map(|job| job.speed_bps).sum(),
@@ -4001,7 +4001,7 @@ impl Render for AdbShareApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ShowAbout, _w, cx| {
-                this.dialog = crate::dialogs::Dialog::About;
+                this.dialog = crate::views::dialogs::Dialog::About;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ShowDiagnostics, _w, cx| {
@@ -4020,7 +4020,7 @@ impl Render for AdbShareApp {
             .child(self.context_popover(&t, cx))
             .when_some(toasts, |d, toasts| d.child(toasts))
             .when_some(
-                crate::dialogs::render(&self.dialog, &t, on_dialog),
+                crate::views::dialogs::render(&self.dialog, &t, on_dialog),
                 |d, dialog| d.child(dialog),
             )
             .when_some(capture, |d, capture| d.child(capture))

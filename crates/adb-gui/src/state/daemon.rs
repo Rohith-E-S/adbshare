@@ -127,7 +127,7 @@ pub fn start(_cx: &mut gpui::App) {
 /// Run an arbitrary async block on the pinned tokio runtime.
 ///
 /// Used by callers other than the D-Bus client, such as the portal file chooser
-/// in [`crate::filechooser`], which needs the same reactor zbus provides.
+/// in [`crate::views::filechooser`], which needs the same reactor zbus provides.
 pub async fn on_tokio<F, Fut, T>(f: F) -> Result<T, String>
 where
     T: Send + 'static,

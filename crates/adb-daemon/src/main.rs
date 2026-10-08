@@ -1027,6 +1027,63 @@ fn client_for(
 /// cycle or a pathological tree and refuse rather than recurse forever.
 const DELETE_MAX_DEPTH: u32 = 64;
 
+/// Depth cap shared by the three tree operations (`enqueue_tree_push`,
+/// `enqueue_tree_pull`, `copy_tree`). Lower than `DELETE_MAX_DEPTH` because a
+/// delete has to reach every node, while these can stop and report what they
+/// skipped. Matches the limit the README documents.
+const TREE_MAX_DEPTH: u32 = 32;
+
+/// Files a single tree operation may touch, across all of its directories.
+/// A tree can be deep but also *wide*, so this is counted per entry rather
+/// than per directory — checked at the top of the loop it never fired for a
+/// single wide directory, and one bus call could drive unbounded round trips.
+const TREE_MAX_FILES: usize = 10_000;
+
+/// Join one directory listing entry to its parent. Device paths are always
+/// absolute and never end in `/` except for the root, so the trim keeps the
+/// root from becoming `//name`.
+fn child_path(parent: &str, name: &str) -> String {
+    format!("{}/{}", parent.trim_end_matches('/'), name)
+}
+
+/// Validate one path handed to a tree operation by the bus. All three take
+/// caller-supplied absolute paths and none of them get to inspect what the
+/// device does with the result, so the checks live here rather than being
+/// repeated (and forgotten) per handler: absolute, no NUL, and within the
+/// `PATH_MAX` the device's own syscalls would enforce anyway.
+fn check_tree_path(path: &str) -> zbus::fdo::Result<()> {
+    const MAX_PATH: usize = 4096;
+    if !path.starts_with('/') {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "tree paths must be absolute".into(),
+        ));
+    }
+    if path.contains('\0') || path.len() > MAX_PATH {
+        return Err(zbus::fdo::Error::InvalidArgs(format!(
+            "tree paths must be non-NUL and at most {MAX_PATH} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// `Some(reason)` once `count` has reached `TREE_MAX_FILES`. The handlers stop
+/// and serialise what they got, so the partial result reaches the GUI rather
+/// than the whole batch being discarded over one oversized folder.
+fn tree_file_cap_error(count: usize) -> Option<String> {
+    (count >= TREE_MAX_FILES).then(|| format!("too many files (limit {TREE_MAX_FILES})"))
+}
+
+/// `Some(reason)` once a walk has descended past `TREE_MAX_DEPTH`.
+fn tree_depth_error(path: &str, depth: u32) -> Option<String> {
+    (depth >= TREE_MAX_DEPTH).then(|| format!("{path}: directory nesting too deep"))
+}
+
+/// Serialise a tree result. Every handler returns this, including on the
+/// early exit that a cap triggers.
+fn tree_result(out: &TreeEnqueueResult) -> zbus::fdo::Result<String> {
+    serde_json::to_string(out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+}
+
 /// Recursively delete `path` on the device via proxy ops (there is no
 /// server-side `rm -r` in the proxy protocol). `depth` is capped at
 /// `DELETE_MAX_DEPTH`.
@@ -1042,7 +1099,7 @@ async fn delete_recursive(client: &ProxyClient, path: &str, depth: u32) -> anyho
             .map_err(|e| anyhow::anyhow!("{e}"));
     }
     for entry in client.listdir(path).await? {
-        let child = format!("{}/{}", path.trim_end_matches('/'), entry.name);
+        let child = child_path(path, &entry.name);
         Box::pin(delete_recursive(client, &child, depth + 1)).await?;
     }
     client.rmdir(path).await.map_err(|e| anyhow::anyhow!("{e}"))
@@ -1184,11 +1241,7 @@ impl ManagerInterface {
         for e in entries {
             let mut dto = DirEntryDto::from(e);
             if dto.is_symlink && !dto.is_dir {
-                let full = if path == "/" {
-                    format!("/{}", dto.name)
-                } else {
-                    format!("{}/{}", path.trim_end_matches('/'), dto.name)
-                };
+                let full = child_path(path, &dto.name);
                 if let Ok(st) = client.stat(&full).await
                     && st.mode.is_dir()
                 {
@@ -1289,20 +1342,16 @@ impl ManagerInterface {
         verify: bool,
     ) -> zbus::fdo::Result<String> {
         let options = parse_job_options(overwrite, verify)?;
-        if !local_dir.starts_with('/') || !device_dir.starts_with('/') {
-            return Err(zbus::fdo::Error::InvalidArgs(
-                "tree paths must be absolute".into(),
-            ));
-        }
+        check_tree_path(local_dir)?;
+        check_tree_path(device_dir)?;
         let local_base = PathBuf::from(local_dir);
         let device_base = PathBuf::from(device_dir);
         let client = client_for(&self.state, device)?;
         let mut out = TreeEnqueueResult::default();
         let mut stack = vec![(local_base.clone(), device_base.clone(), 0u32)];
         while let Some((local, remote, depth)) = stack.pop() {
-            if depth > 32 {
-                out.errors
-                    .push(format!("{}: directory nesting too deep", local.display()));
+            if let Some(e) = tree_depth_error(&local.display().to_string(), depth) {
+                out.errors.push(e);
                 continue;
             }
             let read = std::fs::read_dir(&local)
@@ -1311,10 +1360,9 @@ impl ManagerInterface {
                 let entry = entry.map_err(|e| {
                     zbus::fdo::Error::Failed(format!("read {}: {e}", local.display()))
                 })?;
-                if out.enqueued.len() > 10_000 {
-                    out.errors.push("too many files (limit 10000)".into());
-                    return serde_json::to_string(&out)
-                        .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")));
+                if let Some(e) = tree_file_cap_error(out.enqueued.len()) {
+                    out.errors.push(e);
+                    return tree_result(&out);
                 }
                 let file_type = entry.file_type().map_err(|e| {
                     zbus::fdo::Error::Failed(format!("stat {}: {e}", entry.path().display()))
@@ -1340,7 +1388,7 @@ impl ManagerInterface {
                 }
             }
         }
-        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+        tree_result(&out)
     }
 
     async fn enqueue_tree_pull(
@@ -1352,11 +1400,8 @@ impl ManagerInterface {
         verify: bool,
     ) -> zbus::fdo::Result<String> {
         let options = parse_job_options(overwrite, verify)?;
-        if !device_dir.starts_with('/') || !local_dir.starts_with('/') {
-            return Err(zbus::fdo::Error::InvalidArgs(
-                "tree paths must be absolute".into(),
-            ));
-        }
+        check_tree_path(device_dir)?;
+        check_tree_path(local_dir)?;
         let local_base = PathBuf::from(local_dir);
         std::fs::create_dir_all(&local_base).map_err(|e| {
             zbus::fdo::Error::Failed(format!("mkdir {}: {e}", local_base.display()))
@@ -1365,9 +1410,8 @@ impl ManagerInterface {
         let mut out = TreeEnqueueResult::default();
         let mut stack = vec![(device_dir.to_string(), local_base, 0u32)];
         while let Some((remote, local, depth)) = stack.pop() {
-            if depth > 32 {
-                out.errors
-                    .push(format!("{remote}: directory nesting too deep"));
+            if let Some(e) = tree_depth_error(&remote, depth) {
+                out.errors.push(e);
                 continue;
             }
             let entries = client
@@ -1375,15 +1419,14 @@ impl ManagerInterface {
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(format!("list {remote}: {e}")))?;
             for entry in entries {
-                if out.enqueued.len() > 10_000 {
-                    out.errors.push("too many files (limit 10000)".into());
-                    return serde_json::to_string(&out)
-                        .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")));
+                if let Some(e) = tree_file_cap_error(out.enqueued.len()) {
+                    out.errors.push(e);
+                    return tree_result(&out);
                 }
                 if entry.stat.mode.is_symlink() {
                     continue;
                 }
-                let remote_child = format!("{}/{}", remote.trim_end_matches('/'), entry.name);
+                let remote_child = child_path(&remote, &entry.name);
                 let local_child = local.join(&entry.name);
                 if entry.stat.mode.is_dir() {
                     std::fs::create_dir_all(&local_child).map_err(|e| {
@@ -1403,7 +1446,7 @@ impl ManagerInterface {
                 }
             }
         }
-        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+        tree_result(&out)
     }
 
     async fn copy_tree(
@@ -1412,13 +1455,8 @@ impl ManagerInterface {
         src_dir: &str,
         dst_dir: &str,
     ) -> zbus::fdo::Result<String> {
-        for path in [src_dir, dst_dir] {
-            if !path.starts_with('/') || path.contains('\0') || path.len() > 4096 {
-                return Err(zbus::fdo::Error::InvalidArgs(
-                    "copy paths must be absolute, non-NUL, and at most 4096 bytes".into(),
-                ));
-            }
-        }
+        check_tree_path(src_dir)?;
+        check_tree_path(dst_dir)?;
         if src_dir == dst_dir {
             return Err(zbus::fdo::Error::InvalidArgs(
                 "source and destination are the same".into(),
@@ -1428,9 +1466,8 @@ impl ManagerInterface {
         let mut out = TreeEnqueueResult::default();
         let mut stack = vec![(src_dir.to_string(), dst_dir.to_string(), 0u32)];
         while let Some((src, dst, depth)) = stack.pop() {
-            if depth > 32 {
-                out.errors
-                    .push(format!("{src}: directory nesting too deep"));
+            if let Some(e) = tree_depth_error(&src, depth) {
+                out.errors.push(e);
                 continue;
             }
             let _ = client.mkdir(&dst, 0o755).await;
@@ -1439,19 +1476,17 @@ impl ManagerInterface {
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(format!("list {src}: {e}")))?;
             for entry in entries {
-                // Per entry, not per directory: checked only at the top of the
-                // loop it never fired for a single wide directory, so one bus
-                // call could drive unbounded `copy_file` round trips.
-                if out.copied + out.errors.len() > 10_000 {
-                    out.errors.push("too many files (limit 10000)".into());
-                    return serde_json::to_string(&out)
-                        .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")));
+                // Copied files count, not just enqueued ids: this handler never
+                // touches the queue.
+                if let Some(e) = tree_file_cap_error(out.copied + out.errors.len()) {
+                    out.errors.push(e);
+                    return tree_result(&out);
                 }
                 if entry.stat.mode.is_symlink() {
                     continue;
                 }
-                let src_child = format!("{}/{}", src.trim_end_matches('/'), entry.name);
-                let dst_child = format!("{}/{}", dst.trim_end_matches('/'), entry.name);
+                let src_child = child_path(&src, &entry.name);
+                let dst_child = child_path(&dst, &entry.name);
                 if entry.stat.mode.is_dir() {
                     stack.push((src_child, dst_child, depth + 1));
                 } else {
@@ -1462,7 +1497,7 @@ impl ManagerInterface {
                 }
             }
         }
-        serde_json::to_string(&out).map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+        tree_result(&out)
     }
 
     async fn diagnostics(&self) -> zbus::fdo::Result<String> {
@@ -1910,4 +1945,51 @@ fn parse_job_options(overwrite: &str, verify: bool) -> zbus::fdo::Result<JobOpti
         },
         ..JobOptions::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These four helpers carry the tree operations' only two off-by-one
+    // risks, and both have been wrong before: the file cap admitted
+    // `TREE_MAX_FILES + 1` and the depth cap one level more than the README
+    // documents. They are pure, so they are worth checking directly rather
+    // than through a device.
+
+    #[test]
+    fn child_path_never_doubles_the_slash() {
+        assert_eq!(
+            child_path("/sdcard/Download", "a.txt"),
+            "/sdcard/Download/a.txt"
+        );
+        // The root is the case a plain `format!("{}/{}")` got wrong.
+        assert_eq!(child_path("/", "a.txt"), "/a.txt");
+        // A caller that already joined a trailing slash must not yield `//`.
+        assert_eq!(child_path("/sdcard/", "a.txt"), "/sdcard/a.txt");
+    }
+
+    #[test]
+    fn file_cap_trips_at_the_limit_not_past_it() {
+        assert!(tree_file_cap_error(TREE_MAX_FILES - 1).is_none());
+        assert!(tree_file_cap_error(TREE_MAX_FILES).is_some());
+        assert!(tree_file_cap_error(TREE_MAX_FILES + 1).is_some());
+    }
+
+    #[test]
+    fn depth_cap_admits_exactly_the_documented_levels() {
+        // Depth 0 is the root itself, so `TREE_MAX_DEPTH` levels of nesting
+        // means the last directory we may descend into is `TREE_MAX_DEPTH - 1`.
+        assert!(tree_depth_error("/a", 0).is_none());
+        assert!(tree_depth_error("/a", TREE_MAX_DEPTH - 1).is_none());
+        assert!(tree_depth_error("/a", TREE_MAX_DEPTH).is_some());
+    }
+
+    #[test]
+    fn tree_paths_must_be_absolute_nul_free_and_bounded() {
+        assert!(check_tree_path("/sdcard/Download").is_ok());
+        assert!(check_tree_path("relative/path").is_err());
+        assert!(check_tree_path("/sdcard/\0evil").is_err());
+        assert!(check_tree_path(&format!("/{}", "x".repeat(4096))).is_err());
+    }
 }
