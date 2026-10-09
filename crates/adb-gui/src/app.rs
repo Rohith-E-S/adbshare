@@ -3509,17 +3509,26 @@ impl AdbShareApp {
         }
 
         rows.push(ui::section_heading("This computer", t).into_any_element());
+        // The browser is already pointed at the disk here, so ask it which
+        // folder is open rather than assuming none is. Every one of these rows
+        // used to pass `active: false`, which left the whole group unlit while
+        // browsing the disk: the phone places above lit up as you moved through
+        // them and the local ones stayed inert, so the sidebar never said where
+        // you were.
+        let local_path = self.browser.read(cx).path().to_path_buf();
+        let browsing_local = self.browser.read(cx).is_local();
         for (label, icon, kind) in [
             ("Home", names::HOME, LocalPlace::Home),
             ("Downloads", names::folders::DOWNLOAD, LocalPlace::Downloads),
             ("Trash", names::TRASH, LocalPlace::Trash),
         ] {
+            let active = kind.resolve().is_some_and(|p| browsing_local && p == local_path);
             rows.push(
                 place_row(
                     t,
                     icon,
                     label,
-                    false,
+                    active,
                     cx.listener(move |this, _e, _w, cx| {
                         if let Some(path) = kind.resolve() {
                             this.select_local(&path, cx);
