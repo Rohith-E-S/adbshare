@@ -113,13 +113,23 @@ pub fn icon_button_disabled(t: &Palette, icon: &'static str, size: f32) -> Div {
 }
 
 /// A rounded container that groups 2–4 icon buttons, matching `.pill-capsule`.
-pub fn capsule(children: impl IntoIterator<Item = AnyElement>) -> impl IntoElement {
+///
+/// It takes the `capsule_bg` / `capsule_border` pair — the theme's
+/// `--toolbar-control` fill and its `--input` outline — because that is what
+/// makes a group of buttons read as one control. Without them the capsules
+/// were invisible containers, so three bare icon groups floated next to the
+/// path bar's filled, bordered pill, which is the only other thing on the bar
+/// that used those tokens.
+pub fn capsule(t: &Palette, children: impl IntoIterator<Item = AnyElement>) -> impl IntoElement {
     div()
         .flex()
         .items_center()
         .h(px(theme::CAPSULE_H))
         .px(px(2.0))
         .rounded(px(theme::RADIUS_CAPSULE))
+        .bg(t.capsule_bg)
+        .border_1()
+        .border_color(t.capsule_border)
         .children(children)
 }
 

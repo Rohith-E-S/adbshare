@@ -2821,7 +2821,7 @@ impl AdbShareApp {
                 ui::capsule_separator(t).into_any_element(),
                 self.nav_button(t, "refresh", names::REFRESH, &browser, cx),
             ]);
-            capsules.push(ui::capsule(buttons).into_any_element());
+            capsules.push(ui::capsule(t, buttons).into_any_element());
         }
 
         // The path bar, which doubles as the search box and the Ctrl+L path
@@ -2831,44 +2831,47 @@ impl AdbShareApp {
         if self.layout.shows_ops() {
             let _browser = self.browser.clone();
             capsules.push(
-                ui::capsule([
-                    ui::icon_button_with_hint(
-                        t,
-                        "new-folder",
-                        names::FOLDER_NEW,
-                        theme::CAPSULE_BTN,
-                        ui::icon_tint(names::FOLDER_NEW, t),
-                        "New folder (Ctrl+N)",
-                        cx.listener(|this, _e, _w, cx| {
-                            this.on_menu_select("new-folder", cx);
-                        }),
-                    )
-                    .into_any_element(),
-                    ui::capsule_separator(t).into_any_element(),
-                    ui::icon_button_with_hint(
-                        t,
-                        "upload",
-                        // A paper plane, not `folder-up`. Paired with a
-                        // `folder-down` next to it the two read as one icon
-                        // mirrored, and a plane is unmistakable at 14px.
-                        names::SEND_TO,
-                        theme::CAPSULE_BTN,
-                        ui::icon_tint(names::SEND_TO, t),
-                        "Send to phone (Ctrl+U)",
-                        cx.listener(|this, _e, _w, cx| this.on_menu_select("upload", cx)),
-                    )
-                    .into_any_element(),
-                    ui::icon_button_with_hint(
-                        t,
-                        "download",
-                        names::DOWNLOAD,
-                        theme::CAPSULE_BTN,
-                        ui::icon_tint(names::DOWNLOAD, t),
-                        "Save to computer (Ctrl+Shift+C)",
-                        cx.listener(|this, _e, _w, cx| this.on_menu_select("download", cx)),
-                    )
-                    .into_any_element(),
-                ])
+                ui::capsule(
+                    t,
+                    [
+                        ui::icon_button_with_hint(
+                            t,
+                            "new-folder",
+                            names::FOLDER_NEW,
+                            theme::CAPSULE_BTN,
+                            ui::icon_tint(names::FOLDER_NEW, t),
+                            "New folder (Ctrl+N)",
+                            cx.listener(|this, _e, _w, cx| {
+                                this.on_menu_select("new-folder", cx);
+                            }),
+                        )
+                        .into_any_element(),
+                        ui::capsule_separator(t).into_any_element(),
+                        ui::icon_button_with_hint(
+                            t,
+                            "upload",
+                            // A paper plane, not `folder-up`. Paired with a
+                            // `folder-down` next to it the two read as one icon
+                            // mirrored, and a plane is unmistakable at 14px.
+                            names::SEND_TO,
+                            theme::CAPSULE_BTN,
+                            ui::icon_tint(names::SEND_TO, t),
+                            "Send to phone (Ctrl+U)",
+                            cx.listener(|this, _e, _w, cx| this.on_menu_select("upload", cx)),
+                        )
+                        .into_any_element(),
+                        ui::icon_button_with_hint(
+                            t,
+                            "download",
+                            names::DOWNLOAD,
+                            theme::CAPSULE_BTN,
+                            ui::icon_tint(names::DOWNLOAD, t),
+                            "Save to computer (Ctrl+Shift+C)",
+                            cx.listener(|this, _e, _w, cx| this.on_menu_select("download", cx)),
+                        )
+                        .into_any_element(),
+                    ],
+                )
                 .into_any_element(),
             );
 
@@ -2877,59 +2880,62 @@ impl AdbShareApp {
             let search_on = self.browser.read(cx).search_active();
             let browser = self.browser.clone();
             capsules.push(
-                ui::capsule([
-                    // Each button sets the layout it names. They used to both
-                    // dispatch the toggle action, which meant the list button
-                    // switched to the grid when pressed while already in the
-                    // list.
-                    ui::icon_button_active_with_hint(
-                        t,
-                        "view-grid",
-                        names::VIEW_GRID,
-                        theme::CAPSULE_BTN,
-                        grid,
-                        "Grid view",
-                        {
-                            let browser = browser.clone();
-                            move |_, _w, cx| {
-                                browser.update(cx, |b, cx| b.set_view_mode(ViewMode::Grid, cx));
-                            }
-                        },
-                    )
-                    .into_any_element(),
-                    ui::icon_button_active_with_hint(
-                        t,
-                        "view-list",
-                        names::VIEW_LIST,
-                        theme::CAPSULE_BTN,
-                        !grid,
-                        "List view (Alt+T)",
-                        {
-                            let browser = browser.clone();
-                            move |_, _w, cx| {
-                                browser.update(cx, |b, cx| b.set_view_mode(ViewMode::List, cx));
-                            }
-                        },
-                    )
-                    .into_any_element(),
-                    ui::capsule_separator(t).into_any_element(),
-                    ui::icon_button_active_with_hint(
-                        t,
-                        "search",
-                        names::EDIT_FIND,
-                        theme::CAPSULE_BTN,
-                        search_on,
-                        "Search this folder (Ctrl+F)",
-                        {
-                            let browser = browser.clone();
-                            let next = !search_on;
-                            move |_, _w, cx| {
-                                browser.update(cx, |b, cx| b.set_search_active(next, cx));
-                            }
-                        },
-                    )
-                    .into_any_element(),
-                ])
+                ui::capsule(
+                    t,
+                    [
+                        // Each button sets the layout it names. They used to both
+                        // dispatch the toggle action, which meant the list button
+                        // switched to the grid when pressed while already in the
+                        // list.
+                        ui::icon_button_active_with_hint(
+                            t,
+                            "view-grid",
+                            names::VIEW_GRID,
+                            theme::CAPSULE_BTN,
+                            grid,
+                            "Grid view",
+                            {
+                                let browser = browser.clone();
+                                move |_, _w, cx| {
+                                    browser.update(cx, |b, cx| b.set_view_mode(ViewMode::Grid, cx));
+                                }
+                            },
+                        )
+                        .into_any_element(),
+                        ui::icon_button_active_with_hint(
+                            t,
+                            "view-list",
+                            names::VIEW_LIST,
+                            theme::CAPSULE_BTN,
+                            !grid,
+                            "List view (Alt+T)",
+                            {
+                                let browser = browser.clone();
+                                move |_, _w, cx| {
+                                    browser.update(cx, |b, cx| b.set_view_mode(ViewMode::List, cx));
+                                }
+                            },
+                        )
+                        .into_any_element(),
+                        ui::capsule_separator(t).into_any_element(),
+                        ui::icon_button_active_with_hint(
+                            t,
+                            "search",
+                            names::EDIT_FIND,
+                            theme::CAPSULE_BTN,
+                            search_on,
+                            "Search this folder (Ctrl+F)",
+                            {
+                                let browser = browser.clone();
+                                let next = !search_on;
+                                move |_, _w, cx| {
+                                    browser.update(cx, |b, cx| b.set_search_active(next, cx));
+                                }
+                            },
+                        )
+                        .into_any_element(),
+                    ],
+                )
                 .into_any_element(),
             );
         }
