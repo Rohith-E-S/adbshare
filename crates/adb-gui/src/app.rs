@@ -2751,17 +2751,24 @@ impl AdbShareApp {
             "On the phone".to_string()
         }));
         if single {
+            // No shortcut: this used to claim Alt+T, which the browser binds to
+            // the grid/list switch — so the labelled key did something else
+            // entirely, and the shortcuts dialog said so. Same action, same
+            // absent hint, as the overflow menu's row.
             items.push(MenuItem::with_icon(
                 "open-terminal",
                 names::TERMINAL,
                 "Open in terminal",
-                Some("Alt+T"),
+                None,
             ));
+            // No shortcut. This row claimed Alt+Return, which nothing binds —
+            // not here, not in `BINDINGS`, not in the shortcuts dialog — so it
+            // promised a key that did nothing.
             items.push(MenuItem::with_icon(
                 "properties",
                 names::DIALOG_INFORMATION,
                 "Properties",
-                Some("Alt+Return"),
+                None,
             ));
         }
         items
