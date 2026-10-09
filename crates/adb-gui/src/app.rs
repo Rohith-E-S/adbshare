@@ -51,6 +51,9 @@ const SIDEBAR_MAX: f32 = SIDEBAR_RANGE.1;
 const COMPACT_BELOW: f32 = 1000.0;
 const NARROW_BELOW: f32 = 760.0;
 const TINY_BELOW: f32 = 520.0;
+/// Width of the transfers popover, which needs room for a job name, a pill, a
+/// progress bar and a monospace status line on one row each.
+const POPOVER_W: f32 = 340.0;
 
 actions!(
     app,
@@ -3239,12 +3242,20 @@ impl AdbShareApp {
 
         let (overwrite, verify) = policy;
         let owner = cx.entity();
-        let rows = ui::surface(t, body)
-            .w(px(340.0))
+        // The scrolling region is a plain box, not a `surface`: the wrapper
+        // below is already the card. Rendering it through `ui::surface` put a
+        // second `--card` fill, its own radius, border and shadow *inside* the
+        // first one, so the popover drew a card within a card — a double hairline
+        // around the job list that no other popover in the app has.
+        let rows = div()
+            .flex()
+            .flex_col()
+            .w(px(POPOVER_W))
             .max_h(px(420.0))
             .id("transfer-list")
             .overflow_y_scroll()
-            .scrollbar_width(px(6.0));
+            .scrollbar_width(px(0.0))
+            .children(body);
 
         ui::on_top(
             div()
@@ -3255,7 +3266,7 @@ impl AdbShareApp {
                     div()
                         .flex()
                         .flex_col()
-                        .w(px(340.0))
+                        .w(px(POPOVER_W))
                         .rounded(px(12.0))
                         .bg(t.card)
                         .border_1()
