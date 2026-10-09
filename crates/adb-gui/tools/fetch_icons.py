@@ -76,6 +76,13 @@ MAPPING = {
     "system-lock": "lock",
     "system-software-install": "download",
     "text-x-generic": "description",
+    # The four text-size rows read as a ladder: smaller, the middle the
+    # palette is built at, larger, and one past that. `format_size` is the
+    # two-sided arrow, so it names the default rather than a direction.
+    "text-decrease": "text_decrease",
+    "format-size": "format_size",
+    "text-increase": "text_increase",
+    "text-largest": "title",
     "user-home": "home",
     "user-trash": "delete",
     "utilities-terminal": "terminal",

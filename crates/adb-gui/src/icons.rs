@@ -65,6 +65,9 @@ asset_table! {
     "icons/emblem-synchronizing.svg" => "../assets/icons/emblem-synchronizing.svg",
     "icons/folder-new.svg" => "../assets/icons/folder-new.svg",
     "icons/folder-upload.svg" => "../assets/icons/folder-upload.svg",
+    // The text-size ladder: smaller, the middle the palette is built at,
+    // larger, and one past that.
+    "icons/format-size.svg" => "../assets/icons/format-size.svg",
     "icons/go-next.svg" => "../assets/icons/go-next.svg",
     "icons/go-previous.svg" => "../assets/icons/go-previous.svg",
     "icons/go-up.svg" => "../assets/icons/go-up.svg",
@@ -81,6 +84,9 @@ asset_table! {
     "icons/sidebar-show.svg" => "../assets/icons/sidebar-show.svg",
     "icons/system-file-manager.svg" => "../assets/icons/system-file-manager.svg",
     "icons/system-software-install.svg" => "../assets/icons/system-software-install.svg",
+    "icons/text-decrease.svg" => "../assets/icons/text-decrease.svg",
+    "icons/text-increase.svg" => "../assets/icons/text-increase.svg",
+    "icons/text-largest.svg" => "../assets/icons/text-largest.svg",
     "icons/text-x-generic.svg" => "../assets/icons/text-x-generic.svg",
     "icons/user-home.svg" => "../assets/icons/user-home.svg",
     "icons/user-trash.svg" => "../assets/icons/user-trash.svg",
@@ -247,6 +253,11 @@ pub mod names {
     pub const STOP: &str = "icons/process-stop.svg";
     pub const TERMINAL: &str = "icons/utilities-terminal.svg";
     pub const TEXT_GENERIC: &str = "icons/text-x-generic.svg";
+    /// The four text-size steps, in menu order.
+    pub const TEXT_SMALLER: &str = "icons/text-decrease.svg";
+    pub const TEXT_DEFAULT: &str = "icons/format-size.svg";
+    pub const TEXT_LARGER: &str = "icons/text-increase.svg";
+    pub const TEXT_LARGEST: &str = "icons/text-largest.svg";
     pub const TRASH: &str = "icons/user-trash.svg";
     pub const VIDEO_GENERIC: &str = "icons/video-x-generic.svg";
     pub const VIEW_GRID: &str = "icons/view-grid.svg";
@@ -383,13 +394,19 @@ pub fn hue(key: &str) -> IconHue {
         | names::GO_UP
         | names::VIEW_GRID
         | names::VIEW_LIST
-        | names::VIEW_MORE
+        |         names::VIEW_MORE
         | names::SIDEBAR_SHOW
         | names::EDIT_COPY
         | names::EDIT_FIND
         | names::EDIT_PASTE
         | names::EDIT_UNDO
-        | names::TEXT_GENERIC => IconHue::Neutral,
+        | names::TEXT_GENERIC
+        // The text-size rows are a setting, not a direction, so they take the
+        // neutral ink the other settings take rather than four different hues.
+        | names::TEXT_SMALLER
+        | names::TEXT_DEFAULT
+        | names::TEXT_LARGER
+        | names::TEXT_LARGEST => IconHue::Neutral,
 
         // Anything this module does not know a name for, which in practice
         // means full-colour artwork — never tinted, so never asked.

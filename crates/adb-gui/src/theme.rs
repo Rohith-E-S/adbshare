@@ -334,7 +334,7 @@ pub fn text_scale_label(step: usize) -> &'static str {
     }
 }
 
-/// The element id of a step's menu row.
+/// The element id of a step's menu row, as `app::on_menu_select` matches it.
 pub fn text_scale_id(step: usize) -> &'static str {
     match step.min(TEXT_SCALES.len() - 1) {
         0 => "text-small",
@@ -352,6 +352,68 @@ pub fn text_scale_step(scale: f32) -> usize {
         .iter()
         .position(|s| (*s - scale).abs() < 0.001)
         .unwrap_or(TEXT_DEFAULT_STEP)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One row per step, and no two rows alike — a duplicated or missing row is
+    /// how a menu ends up with two ticked entries or none.
+    #[test]
+    fn every_step_has_its_own_row() {
+        let mut ids = Vec::new();
+        let mut labels = Vec::new();
+        for step in 0..TEXT_SCALES.len() {
+            ids.push(text_scale_id(step));
+            labels.push(text_scale_label(step));
+        }
+        let ids: std::collections::HashSet<&str> = ids.into_iter().collect();
+        let labels: std::collections::HashSet<&str> = labels.into_iter().collect();
+        assert_eq!(ids.len(), TEXT_SCALES.len(), "duplicate row id");
+        assert_eq!(labels.len(), TEXT_SCALES.len(), "duplicate row label");
+    }
+
+    /// The scales climb and stay inside what the layout can absorb: text is
+    /// sized through `Palette::text`, but every height and padding in the app
+    /// is absolute, so a step too large would put a label outside its own row.
+    #[test]
+    fn steps_climb_and_stay_small() {
+        let mut previous = 0.0;
+        for &scale in TEXT_SCALES {
+            assert!(scale > previous, "{scale} does not follow");
+            assert!(scale <= 1.5, "{scale} would not fit the fixed layout");
+            previous = scale;
+        }
+    }
+
+    /// A scale round-trips to the step it came from, so a stored step and a
+    /// shown tick can never disagree.
+    #[test]
+    fn a_scale_names_its_step() {
+        for step in 0..TEXT_SCALES.len() {
+            assert_eq!(text_scale_step(text_scale(step)), step);
+        }
+    }
+
+    /// An out-of-range step — a hand-edited preferences file, or one written by
+    /// a build with more steps than this one — lands on a real step rather
+    /// than scaling text by an invented number.
+    #[test]
+    fn an_unknown_step_clamps() {
+        let last = TEXT_SCALES.len() - 1;
+        assert_eq!(text_scale(usize::MAX), TEXT_SCALES[last]);
+        assert_eq!(text_scale(0), TEXT_SCALES[0]);
+    }
+
+    /// The scale reaches the sizes the views ask for.
+    #[test]
+    fn text_is_scaled_by_the_palette() {
+        let mut t = Palette::t3_dark();
+        assert_eq!(f32::from(t.text(10.0)), 10.0);
+        t.font_scale = 1.3;
+        assert_eq!(f32::from(t.text(10.0)), 13.0);
+    }
 }
 
 // ── Geometry tokens ──────────────────────────────────────────────────────────

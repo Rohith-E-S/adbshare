@@ -2419,7 +2419,7 @@ impl AdbShareApp {
                     }
                 }
             }
-            // The two view rows the overflow menu carries for narrow windows,
+            // The view rows the overflow menu carries for narrow windows,
             // where the toolbar's view capsule is not on screen.
             "search" => {
                 self.browser.update(cx, |b, cx| b.flip_search(cx));
@@ -2431,6 +2431,18 @@ impl AdbShareApp {
             "view-list" => {
                 self.browser
                     .update(cx, |b, cx| b.set_view_mode(ViewMode::List, cx));
+            }
+            "text-small" | "text-default" | "text-large" | "text-xl" => {
+                // Named rows rather than a parsed step: these four ids are
+                // also the ones the menu shows, so what is on offer and what
+                // is handled are spelled the same way in the same file.
+                let step = match id {
+                    "text-default" => 1,
+                    "text-large" => 2,
+                    "text-xl" => 3,
+                    _ => 0,
+                };
+                self.set_text_step(step, cx);
             }
             "save-as" => self.save_as(cx),
             "open-external" => {
@@ -2634,6 +2646,35 @@ impl AdbShareApp {
                 icon: names::VIEW_LIST,
                 label: "List view".into(),
                 checked: self.browser.read(cx).view_mode() == ViewMode::List,
+            },
+            MenuItem::Heading("Text size".into()),
+            // One step per row, ticked rather than shown as a value: the label
+            // is the setting, the way "Show hidden files" names a state rather
+            // than a number. Distinct icons so the four rows are not four
+            // identical ticks, and so the direction of travel is visible.
+            MenuItem::Check {
+                id: theme::text_scale_id(0),
+                icon: names::TEXT_SMALLER,
+                label: theme::text_scale_label(0).into(),
+                checked: self.text_step == 0,
+            },
+            MenuItem::Check {
+                id: theme::text_scale_id(1),
+                icon: names::TEXT_DEFAULT,
+                label: theme::text_scale_label(1).into(),
+                checked: self.text_step == 1,
+            },
+            MenuItem::Check {
+                id: theme::text_scale_id(2),
+                icon: names::TEXT_LARGER,
+                label: theme::text_scale_label(2).into(),
+                checked: self.text_step == 2,
+            },
+            MenuItem::Check {
+                id: theme::text_scale_id(3),
+                icon: names::TEXT_LARGEST,
+                label: theme::text_scale_label(3).into(),
+                checked: self.text_step == 3,
             },
             MenuItem::Heading("Sort by".into()),
             MenuItem::Separator,
