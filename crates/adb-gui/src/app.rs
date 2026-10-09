@@ -2631,14 +2631,14 @@ impl AdbShareApp {
                     "open-folder",
                     names::folders::OPEN,
                     "Open",
-                    Some("Return"),
+                    Some("Enter"),
                 ));
             } else {
                 items.push(MenuItem::with_icon(
                     "open",
                     names::DOCUMENT_OPEN,
                     "Open",
-                    Some("Return"),
+                    Some("Enter"),
                 ));
             }
         }
