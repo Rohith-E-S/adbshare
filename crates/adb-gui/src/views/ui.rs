@@ -329,6 +329,29 @@ pub fn modal_backdrop() -> Stateful<Div> {
         .block_mouse_except_scroll()
 }
 
+/// The backdrop behind a popover or a context menu.
+///
+/// Overlays that are not modal still have to dismiss: a context menu, the
+/// transfers popover and the overflow menu used to stay open while the user
+/// clicked in the file list underneath them, because the only way out was
+/// Escape, the same button again, or picking a row. They now sit on a
+/// click-swallowing backdrop that closes them, drawn *under* the popover
+/// itself — which paints later, through [`on_top`].
+///
+/// Transparent rather than dimmed, and blocking only the mouse except for the
+/// wheel, so the list can still be scrolled while deciding.
+pub fn popover_backdrop<F>(id: &'static str, dismiss: F) -> Stateful<Div>
+where
+    F: Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+{
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .block_mouse_except_scroll()
+        .on_click(dismiss)
+}
+
 /// Paint the given content above everything already laid out in the tree.
 ///
 /// GPUI has no z-index; paint order comes from tree order, and `deferred`

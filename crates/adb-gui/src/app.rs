@@ -4036,6 +4036,23 @@ impl Render for AdbShareApp {
         };
         let toasts = self.toasts.render(&t, on_toast);
 
+        // One backdrop for every non-modal overlay, drawn before them: paint
+        // order is tree order, so the popovers — which go through `on_top` and
+        // so paint after everything here — still sit above it.
+        let overlays = self.transfers_open || self.overflow_open || self.context_menu.is_some();
+        let dismiss_overlays = {
+            let me = me.clone();
+            move |_event: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
+                me.update(app, |this, cx| {
+                    this.transfers_open = false;
+                    this.overflow_open = false;
+                    this.context_menu = None;
+                    cx.notify();
+                });
+            }
+        };
+        let backdrop = overlays.then(|| ui::popover_backdrop("overlay", dismiss_overlays));
+
         let capture = if self.resizing_sidebar {
             Some(self.resize_capture(window, cx))
         } else {
@@ -4089,6 +4106,9 @@ impl Render for AdbShareApp {
             .child(self.topbar(&t, cx))
             .child(self.search_row(&t, cx))
             .child(body)
+            // Before the overlays, so it paints under them and they stay
+            // clickable.
+            .when_some(backdrop, |d, backdrop| d.child(backdrop))
             .child(self.context_popover(&t, cx))
             .when_some(toasts, |d, toasts| d.child(toasts))
             .when_some(
