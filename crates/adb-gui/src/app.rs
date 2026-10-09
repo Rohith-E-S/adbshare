@@ -3674,7 +3674,13 @@ fn device_card(
         .cursor_pointer()
         // A device card sits on the sidebar, so it takes the lighter surface to
         // read as raised, and the focused border when it is the current device.
-        .bg(if active { t.selected } else { t.canvas })
+        //
+        // `card`, not `canvas`: the onboarding card and the daemon-error card
+        // beside it both sit on `--card`, which is the one step above the pure
+        // black pane. This card was using `--background` instead, so the three
+        // cards in one sidebar rose off it by three different amounts — the
+        // phone sat flatter than the message telling you no phone was found.
+        .bg(if active { t.selected } else { t.card })
         .border_1()
         .border_color(if active {
             t.accent_muted
