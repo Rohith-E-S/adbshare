@@ -2708,9 +2708,13 @@ impl AdbShareApp {
             ));
         }
         if single && !local {
+            // The download glyph, not `edit-paste`: this row saves one file to a
+            // chosen location, which is what every other save route in the app
+            // draws, and a paste icon beside the Copy and Paste rows above it
+            // read as a third clipboard action.
             items.push(MenuItem::with_icon(
                 "save-as",
-                names::EDIT_PASTE,
+                names::DOWNLOAD,
                 "Save as\u{2026}",
                 None,
             ));
