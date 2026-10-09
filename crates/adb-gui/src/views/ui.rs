@@ -77,11 +77,27 @@ pub fn icon_button_active(
 ) -> Stateful<Div> {
     // A toggle shows which half is on by giving that half its colour and
     // leaving the other in body text, so a pair reads as one control.
+    //
+    // "Its colour" is not the icon's own when that colour is grey: the glyphs
+    // in this slot — the two view modes and the magnifier — are all
+    // `IconHue::Neutral`, so the lit half used to be `text_dim` against the
+    // unlit half's `text_muted`: two greys two steps apart, which does not
+    // read as on or off. A neutral glyph lights in `text_header` instead,
+    // the same near-white a selected label wears.
     let tint = if active {
-        t.hue(icons::hue(icon))
+        match icons::hue(icon) {
+            icons::IconHue::Neutral => t.text_header,
+            hue => t.hue(hue),
+        }
     } else {
         t.text_muted
     };
+    // Hover goes one step past the resting state rather than dropping below
+    // it: `hover` under an active button was dimmer than `pressed` at rest, so
+    // pointing at the lit half made it look unlit, and pointing at the dark
+    // half made it look lit.
+    let resting_bg = active.then_some(t.pressed);
+    let hover_bg = if active { t.selected_strong } else { t.hover };
     div()
         .id(id)
         .flex()
@@ -90,8 +106,8 @@ pub fn icon_button_active(
         .size(px(size))
         .rounded(px(theme::RADIUS_CAPSULE_BTN))
         .cursor_pointer()
-        .when(active, |d| d.bg(t.pressed))
-        .hover(|s| s.bg(t.hover))
+        .when_some(resting_bg, |d, bg| d.bg(bg))
+        .hover(move |d| d.bg(hover_bg))
         .child(icons::icon(icon, size * 0.53, tint))
         .on_click(on_click)
 }
