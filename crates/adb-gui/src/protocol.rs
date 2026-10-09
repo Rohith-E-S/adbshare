@@ -477,10 +477,15 @@ impl Global for TransferPolicy {}
 
 // ── Formatting ───────────────────────────────────────────────────────────────
 
-/// `1536` becomes `1.5 K`.
+/// `1536` becomes `1.5 KB`.
+///
+/// Spelled units, not the engineer's `1.5 K`: `format_capacity` already says
+/// `23.4 of 128 GB used`, and the two sit in the same window — a file row
+/// saying `1.5 M` beside a device card saying `128.0 GB` read as two
+/// different kinds of number.
 pub fn human_size(bytes: u64) -> String {
     let mut s = bytes as f64;
-    for unit in ["B", "K", "M", "G", "T"] {
+    for unit in ["B", "KB", "MB", "GB", "TB"] {
         if s < 1024.0 {
             return if unit == "B" {
                 format!("{} {unit}", s as u64)
@@ -490,7 +495,7 @@ pub fn human_size(bytes: u64) -> String {
         }
         s /= 1024.0;
     }
-    format!("{s:.1} P")
+    format!("{s:.1} PB")
 }
 
 /// `(used, total)` becomes `23.4 of 128 GB used`, switching to TB when needed.
