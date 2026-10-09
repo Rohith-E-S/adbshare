@@ -3087,7 +3087,7 @@ impl AdbShareApp {
                     .h(px(26.0))
                     .px(px(8.0))
                     .rounded(px(6.0))
-                    .text_size(px(12.0))
+                    .text_size(t.text(12.0))
                     .cursor_pointer()
                     .text_color(if is_current {
                         t.text_header
@@ -3168,7 +3168,7 @@ impl AdbShareApp {
             .px(px(12.0))
             .rounded(px(theme::RADIUS_CAPSULE))
             .cursor_pointer()
-            .text_sm()
+            .text_size(t.text(14.0))
             .text_color(t.text_dim)
             .hover(|s| s.bg(t.hover).text_color(t.text_header))
             .child(icons::icon(
@@ -3238,7 +3238,7 @@ impl AdbShareApp {
                     ))
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(t.text(14.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(t.text_secondary)
                             .child("No transfers yet"),
@@ -3246,7 +3246,7 @@ impl AdbShareApp {
                     .child(
                         div()
                             .max_w(px(240.0))
-                            .text_size(px(11.0))
+                            .text_size(t.text(11.0))
                             .text_color(t.text_muted)
                             .whitespace_normal()
                             .child(
@@ -3422,7 +3422,7 @@ impl AdbShareApp {
                             .flex()
                             .items_center()
                             .gap(px(6.0))
-                            .text_size(px(12.0))
+                            .text_size(t.text(12.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(t.danger)
                             .child(icons::icon(
@@ -3434,7 +3434,7 @@ impl AdbShareApp {
                     )
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(t.text(10.5))
                             .text_color(t.text_dim)
                             .whitespace_normal()
                             .child(error),
@@ -3446,7 +3446,7 @@ impl AdbShareApp {
                             .flex()
                             .items_center()
                             .gap(px(5.0))
-                            .text_size(px(11.0))
+                            .text_size(t.text(11.0))
                             .text_color(t.text_header)
                             .cursor_pointer()
                             .hover(|s| s.text_color(t.danger))
@@ -3494,7 +3494,7 @@ impl AdbShareApp {
                 .my(px(4.0))
                 .rounded(px(8.0))
                 .cursor_pointer()
-                .text_size(px(12.0))
+                .text_size(t.text(12.0))
                 .text_color(t.text_dim)
                 .hover(|s| s.bg(t.hover).text_color(t.accent))
                 .child(icons::icon(
@@ -3516,7 +3516,7 @@ impl AdbShareApp {
                 div()
                     .px(px(4.0))
                     .pb(px(4.0))
-                    .text_size(px(11.0))
+                    .text_size(t.text(11.0))
                     .text_color(t.text_muted)
                     .whitespace_normal()
                     .child("Select a phone above to browse its folders.")
@@ -3624,7 +3624,7 @@ fn onboarding_card(t: &theme::Palette) -> gpui::Div {
         .border_color(t.border_soft)
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(t.text(12.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(t.text_header)
                 .child("No phone connected"),
@@ -3639,7 +3639,7 @@ fn onboarding_card(t: &theme::Palette) -> gpui::Div {
             .enumerate()
             .map(|(index, step)| {
                 div()
-                    .text_size(px(11.0))
+                    .text_size(t.text(11.0))
                     .text_color(t.text_dim)
                     .whitespace_normal()
                     .child(format!("{}. {step}", index + 1))
@@ -3672,7 +3672,7 @@ fn device_card(
             .flex_1()
             .min_w_0()
             .truncate()
-            .text_size(px(13.0))
+            .text_size(t.text(13.0))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(if active {
                 t.text_header
@@ -3684,6 +3684,7 @@ fn device_card(
     );
     head.push(
         ui::pill(
+            t,
             device.transport_label(),
             if active { t.text_on_light } else { t.text_dim },
             if active {
@@ -3698,6 +3699,7 @@ fn device_card(
         let low = pct <= 20;
         head.push(
             ui::pill(
+                t,
                 format!("{pct}%"),
                 if low { t.danger } else { t.text_dim },
                 t.secondary_bg,
@@ -3740,7 +3742,7 @@ fn device_card(
             .child(
                 div()
                     .mt(px(1.0))
-                    .text_size(px(10.5))
+                    .text_size(t.text(10.5))
                     .text_color(t.text_muted)
                     .child(format_capacity((used, total))),
             );
@@ -3768,7 +3770,7 @@ fn place_row(
         .my(px(1.0))
         .rounded(px(theme::RADIUS_ROW))
         .cursor_pointer()
-        .text_size(px(12.5))
+        .text_size(t.text(12.5))
         .text_color(if active {
             t.text_header
         } else {
@@ -3816,7 +3818,7 @@ fn render_job_card(t: &theme::Palette, job: &JobInfo) -> AnyElement {
                 .gap(px(8.0))
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(t.text(12.0))
                         .text_color(t.text_header)
                         .child(arrow),
                 )
@@ -3825,24 +3827,24 @@ fn render_job_card(t: &theme::Palette, job: &JobInfo) -> AnyElement {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(12.5))
+                        .text_size(t.text(12.5))
                         .text_color(t.text_primary)
                         .child(job.name.clone()),
                 )
-                .child(ui::pill(state_text, fg, bg)),
+                .child(ui::pill(t, state_text, fg, bg)),
         )
         .child(ui::progress_bar(t, job.fraction(), 4.0))
         .child(
             div()
                 .font_family(theme::MONO)
-                .text_size(px(9.5))
+                .text_size(t.text(9.5))
                 .text_color(t.text_muted)
                 .truncate()
                 .child(job.status_text()),
         )
         .child(
             div()
-                .text_size(px(9.5))
+                .text_size(t.text(9.5))
                 .text_color(t.text_muted)
                 .child(caption.to_string()),
         )
@@ -3891,7 +3893,7 @@ fn conflict_policy_row(
         .child(
             div()
                 .flex_1()
-                .text_size(px(11.0))
+                .text_size(t.text(11.0))
                 .text_color(t.text_dim)
                 .child("If the file exists"),
         )
@@ -3906,7 +3908,7 @@ fn conflict_policy_row(
                 .rounded(px(6.0))
                 .bg(t.hover)
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(t.text(11.0))
                 .text_color(t.text_header)
                 .hover(|s| s.bg(t.pressed))
                 .child(policy_label(overwrite))
@@ -3935,7 +3937,7 @@ fn conflict_policy_row(
                 .px(px(7.0))
                 .rounded(px(6.0))
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(t.text(11.0))
                 .text_color(if verify { t.text_header } else { t.text_muted })
                 .hover(|s| s.bg(t.hover))
                 .child(icons::icon(
@@ -3982,7 +3984,7 @@ fn retry_row(t: &theme::Palette, owner: &Entity<AdbShareApp>) -> gpui::Stateful<
         .child(
             div()
                 .flex_1()
-                .text_size(px(11.0))
+                .text_size(t.text(11.0))
                 .text_color(t.text_dim)
                 .child("Retry failed transfers"),
         )

@@ -323,7 +323,7 @@ impl Render for DragGhost {
             .border_1()
             .border_color(t.capsule_border)
             .bg(t.capsule_bg)
-            .text_size(px(11.0))
+            .text_size(t.text(11.0))
             .text_color(t.text_primary)
             .child(self.label.clone())
             .into_any_element()
@@ -1894,7 +1894,7 @@ fn context_bar(browser: &Browser, t: &theme::Palette) -> Div {
                 .min_w_0()
                 .child(
                     div()
-                        .text_size(px(13.0))
+                        .text_size(t.text(13.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(t.text_header)
                         .child(title),
@@ -1921,7 +1921,7 @@ fn empty_state(t: &theme::Palette) -> Div {
         ))
         .child(
             div()
-                .text_size(px(19.0))
+                .text_size(t.text(19.0))
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(t.text_header)
                 .child("Connect your phone"),
@@ -1929,7 +1929,7 @@ fn empty_state(t: &theme::Palette) -> Div {
         .child(
             div()
                 .max_w(px(360.0))
-                .text_size(px(11.5))
+                .text_size(t.text(11.5))
                 .line_height(relative(1.4))
                 .text_color(t.text_secondary)
                 .whitespace_normal()
@@ -2008,14 +2008,14 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(11.5))
+                .text_size(t.text(11.5))
                 .text_color(t.text_dim)
                 .child(text),
         )
         .when(running, |d| {
             d.child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(t.text(11.0))
                     .text_color(if browser.transfers_paused {
                         t.warning
                     } else {
@@ -2380,7 +2380,7 @@ impl Browser {
             // The box is now the full width of the tile, so the text inside it
             // needs centring or names sit against the tile's left edge.
             .text_center()
-            .text_size(px(11.5))
+            .text_size(t.text(11.5))
             .font_weight(if entry.looks_like_dir() {
                 gpui::FontWeight::MEDIUM
             } else {
@@ -2403,7 +2403,7 @@ impl Browser {
                 .min_w_0()
                 .text_center()
                 .font_family(theme::MONO)
-                .text_size(px(9.5))
+                .text_size(t.text(9.5))
                 .text_color(t.text_muted)
                 .truncate()
                 .child(human_size(entry.size))
@@ -2553,7 +2553,7 @@ impl Browser {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_sm()
+                    .text_size(t.text(14.0))
                     .text_color(if selected {
                         t.text_header
                     } else {
@@ -2640,7 +2640,7 @@ impl Render for Browser {
                 .items_center()
                 .justify_center()
                 .size_full()
-                .text_size(px(12.0))
+                .text_size(t.text(12.0))
                 .text_color(t.text_muted)
                 .child(empty_message)
                 .into_any_element()

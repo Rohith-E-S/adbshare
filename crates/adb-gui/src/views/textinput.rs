@@ -713,7 +713,7 @@ impl Render for TextField {
             .bg(rgba(0x0000004D))
             .border_1()
             .border_color(if focused { t.text_dim } else { t.border })
-            .text_sm()
+            .text_size(t.text(14.0))
             .when(self.mono, |d| d.font_family(theme::MONO))
             .child(
                 div()

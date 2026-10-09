@@ -194,7 +194,7 @@ where
             div()
                 .flex_1()
                 .min_w_0()
-                .text_sm()
+                .text_size(t.text(14.0))
                 .text_color(t.text_primary)
                 .line_clamp(3)
                 .child(toast.message.clone()),
@@ -210,7 +210,7 @@ where
                     .h(px(24.0))
                     .px(px(10.0))
                     .rounded(px(6.0))
-                    .text_size(px(11.0))
+                    .text_size(t.text(11.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(t.text_header)
                     .bg(t.hover)

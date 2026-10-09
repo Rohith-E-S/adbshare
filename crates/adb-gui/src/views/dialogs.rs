@@ -651,7 +651,7 @@ fn header(t: &Palette, icon: &'static str, accent: gpui::Rgba, title: &str) -> g
         .child(icons::icon(icon, 18.0, accent))
         .child(
             div()
-                .text_lg()
+                .text_size(t.text(18.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(t.text_header)
                 .child(title.to_string()),
@@ -663,7 +663,7 @@ fn body_text(t: &Palette, text: &str) -> gpui::Div {
     div()
         .px(px(18.0))
         .pb(px(16.0))
-        .text_sm()
+        .text_size(t.text(14.0))
         .text_color(t.text_primary)
         .line_height(relative(1.45))
         .whitespace_normal()
@@ -791,7 +791,7 @@ where
             div()
                 .px(px(18.0))
                 .pb(px(12.0))
-                .text_sm()
+                .text_size(t.text(14.0))
                 .text_color(t.text_dim)
                 .whitespace_normal()
                 .child(hint.to_string())
@@ -831,7 +831,7 @@ fn detail_table(t: &Palette, rows: Vec<(&str, String)>, label_w: f32) -> AnyElem
                     div()
                         .w(px(label_w))
                         .flex_shrink_0()
-                        .text_sm()
+                        .text_size(t.text(14.0))
                         .text_color(t.text_muted)
                         .child(label.to_string()),
                 )
@@ -839,7 +839,7 @@ fn detail_table(t: &Palette, rows: Vec<(&str, String)>, label_w: f32) -> AnyElem
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_sm()
+                        .text_size(t.text(14.0))
                         .text_color(t.text_primary)
                         .whitespace_normal()
                         .child(value),
@@ -1072,7 +1072,7 @@ where
                 .px(px(18.0))
                 .pb(px(16.0))
                 .font_family(theme::MONO)
-                .text_size(px(11.0))
+                .text_size(t.text(11.0))
                 .line_height(relative(1.5))
                 .text_color(t.text_primary)
                 .whitespace_normal()
@@ -1178,7 +1178,7 @@ where
             div()
                 .px(px(18.0))
                 .pt(px(12.0))
-                .text_size(px(10.0))
+                .text_size(t.text(10.0))
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(t.text_muted)
                 .child(group.to_uppercase())
@@ -1195,14 +1195,14 @@ where
                     .child(
                         div()
                             .flex_1()
-                            .text_sm()
+                            .text_size(t.text(14.0))
                             .text_color(t.text_primary)
                             .child(*label),
                     )
                     .child(
                         div()
                             .font_family(theme::MONO)
-                            .text_size(px(11.0))
+                            .text_size(t.text(11.0))
                             .text_color(t.text_dim)
                             .child(*keys),
                     )
@@ -1331,14 +1331,14 @@ where
                 )
                 .child(
                     div()
-                        .text_xl()
+                        .text_size(t.text(20.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(t.text_header)
                         .child("ADBShare"),
                 )
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(t.text(14.0))
                         .text_color(t.text_dim)
                         .child("Browse and transfer files over ADB"),
                 )
@@ -1352,7 +1352,7 @@ where
             div()
                 .px(px(18.0))
                 .pb(px(12.0))
-                .text_size(px(9.0))
+                .text_size(t.text(9.0))
                 .font_family(theme::MONO)
                 .text_color(t.text_muted)
                 .child(icons::YARU_ATTRIBUTION)

@@ -45,7 +45,7 @@
 //! Dark only, as the previous GTK build was. A light palette is one more
 //! constructor here plus a branch in [`install`].
 
-use gpui::{App, Global, Rgba, rgba};
+use gpui::{App, Global, Rgba, px, rgba};
 
 /// The full set of colour tokens used across the UI.
 ///
@@ -53,7 +53,6 @@ use gpui::{App, Global, Rgba, rgba};
 /// auditable rather than a matter of taste.
 #[derive(Clone, Copy)]
 pub struct Palette {
-    // ── Surfaces ───────────────────────────────────────────────────────────
     /// `--background`. The file area, and the window behind everything.
     pub canvas: Rgba,
     /// `--toolbar-background`, which the theme points back at `background`.
@@ -145,9 +144,29 @@ pub struct Palette {
     pub tooltip_text: Rgba,
     /// The border around a tooltip, `--input`.
     pub tooltip_border: Rgba,
+
+    /// How much text is scaled by, from [`set_font_scale`].
+    ///
+    /// A field rather than a constant because every size in the app is laid
+    /// out in absolute pixels — GPUI has no cascade to hang a text size on —
+    /// so the only place a scale can be applied is where a size is chosen.
+    /// That is [`Palette::text`], and it has to read this value.
+    pub font_scale: f32,
 }
 
 impl Palette {
+    /// The size a run of text is drawn at.
+    ///
+    /// Every text size in the app goes through this one accessor — the
+    /// `px(11.0)` that used to be written at each of ~45 call sites — so the
+    /// overflow menu's text-size rows have a single lever, and none of those
+    /// sites can quietly opt out of it. A `Palette` is copied into every
+    /// renderer at the top of its render, so the scale is read fresh each
+    /// frame rather than being captured once.
+    pub fn text(&self, size: f32) -> gpui::Pixels {
+        px(size * self.font_scale)
+    }
+
     /// The colour an icon of this hue wears.
     ///
     /// Four of the six families already exist in the palette as its semantic
@@ -249,6 +268,9 @@ impl Palette {
             tooltip: rgba(0x171717F2),
             tooltip_text: rgba(0xF5F5F5FF),
             tooltip_border: rgba(0xFFFFFF14),
+
+            // No scale until a preference says otherwise; see [`set_font_scale`].
+            font_scale: TEXT_SCALES[TEXT_DEFAULT_STEP],
         }
     }
 }
@@ -272,6 +294,64 @@ impl Themed for App {
 /// Install the palette as the app-wide theme. Called once from `main`.
 pub fn install(app: &mut App) {
     app.set_global(Theme(Palette::t3_dark()));
+}
+
+/// Set the text scale [`Palette::text`] sizes by.
+///
+/// Writes the global rather than threading the scale through every renderer,
+/// for the same reason the palette itself is a global: a view deep in the tree
+/// needs it and has no `Context` of its own to ask.
+pub fn set_font_scale(app: &mut App, scale: f32) {
+    app.global_mut::<Theme>().0.font_scale = scale;
+}
+
+// ── Text size steps ───────────────────────────────────────────────────────────
+//
+// Discrete steps rather than a slider: the sizes are chosen so a step changes
+// what is legible without rearranging the layout, which a free value cannot
+// promise. Step 1 is the default and the palette is built at it, so a value
+// outside this table is a corrupted preference and gets clamped back to the
+// nearest end rather than trusted.
+
+/// The scales the user can pick, as an index into [`TEXT_SCALES`].
+pub const TEXT_DEFAULT_STEP: usize = 1;
+
+/// Every text-size step, in menu order.
+pub const TEXT_SCALES: &[f32] = &[0.9, 1.0, 1.15, 1.3];
+
+/// The scale for a stored step, clamped to the table.
+pub fn text_scale(step: usize) -> f32 {
+    TEXT_SCALES[step.min(TEXT_SCALES.len() - 1)]
+}
+
+/// The row label for a step, for the overflow menu.
+pub fn text_scale_label(step: usize) -> &'static str {
+    match step.min(TEXT_SCALES.len() - 1) {
+        0 => "Small",
+        2 => "Large",
+        3 => "Extra large",
+        _ => "Default",
+    }
+}
+
+/// The element id of a step's menu row.
+pub fn text_scale_id(step: usize) -> &'static str {
+    match step.min(TEXT_SCALES.len() - 1) {
+        0 => "text-small",
+        2 => "text-large",
+        3 => "text-xl",
+        _ => "text-default",
+    }
+}
+
+/// The step a scale names, for restoring a row's tick.
+pub fn text_scale_step(scale: f32) -> usize {
+    // Within a hair of a step is that step; anything else is the default,
+    // which is also what a hand-edited preference gets.
+    TEXT_SCALES
+        .iter()
+        .position(|s| (*s - scale).abs() < 0.001)
+        .unwrap_or(TEXT_DEFAULT_STEP)
 }
 
 // ── Geometry tokens ──────────────────────────────────────────────────────────

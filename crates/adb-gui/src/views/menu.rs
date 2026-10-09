@@ -137,7 +137,7 @@ where
                 .px(px(12.0))
                 .pt(px(8.0))
                 .pb(px(2.0))
-                .text_size(px(10.0))
+                .text_size(t.text(10.0))
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(t.text_muted)
                 .child(text.clone())

@@ -172,7 +172,7 @@ pub fn danger_button(
         .h(px(32.0))
         .px(px(14.0))
         .rounded(px(8.0))
-        .text_sm()
+        .text_size(t.text(14.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(t.text_inverse)
         .bg(t.danger_border)
@@ -208,7 +208,7 @@ pub fn button(
         .h(px(32.0))
         .px(px(14.0))
         .rounded(px(8.0))
-        .text_sm()
+        .text_size(t.text(14.0))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .text_color(if primary {
@@ -255,7 +255,7 @@ pub fn led(color: Rgba) -> Div {
 
 /// A small text badge, matching `.usb-badge` / `.battery-pill` /
 /// `.transfer-state-pill`.
-pub fn pill(text: impl Into<gpui::SharedString>, fg: Rgba, bg: Rgba) -> Div {
+pub fn pill(t: &Palette, text: impl Into<gpui::SharedString>, fg: Rgba, bg: Rgba) -> Div {
     div()
         .flex()
         .items_center()
@@ -263,7 +263,7 @@ pub fn pill(text: impl Into<gpui::SharedString>, fg: Rgba, bg: Rgba) -> Div {
         .px(px(7.0))
         .rounded(px(theme::RADIUS_PILL))
         .bg(bg)
-        .text_size(px(9.0))
+        .text_size(t.text(9.0))
         .font_weight(FontWeight::BOLD)
         .text_color(fg)
         .child(text.into())
@@ -290,7 +290,7 @@ pub fn tone_colors(t: &Palette, tone: StateTone) -> (Rgba, Rgba) {
 pub fn mono(text: impl Into<gpui::SharedString>, t: &Palette) -> Div {
     div()
         .font_family(theme::MONO)
-        .text_size(px(10.5))
+        .text_size(t.text(10.5))
         .text_color(t.text_dim)
         .child(text.into())
 }
@@ -302,7 +302,7 @@ pub fn section_heading(text: impl Into<gpui::SharedString>, t: &Palette) -> Div 
         .items_end()
         .h(px(24.0))
         .px(px(4.0))
-        .text_size(px(11.0))
+        .text_size(t.text(11.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.text_muted)
         .child(text.into().to_uppercase())
@@ -312,7 +312,7 @@ pub fn section_heading(text: impl Into<gpui::SharedString>, t: &Palette) -> Div 
 pub fn shortcut_label(t: &Palette, text: &str, accent: bool) -> Div {
     div()
         .font_family(theme::MONO)
-        .text_size(px(11.0))
+        .text_size(t.text(11.0))
         .text_color(if accent { t.text_dim } else { t.text_muted })
         .child(text.to_string())
 }
@@ -412,7 +412,7 @@ pub fn menu_row(
         .px(px(12.0))
         .py(px(7.0))
         .cursor_pointer()
-        .text_sm()
+        .text_size(t.text(14.0))
         .text_color(if danger { t.danger } else { fg })
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
         .when_some(icon, |d, icon| {
@@ -448,7 +448,7 @@ pub fn menu_check(
         .px(px(12.0))
         .py(px(7.0))
         .cursor_pointer()
-        .text_sm()
+        .text_size(t.text(14.0))
         .text_color(t.text_secondary)
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
         .child(icons::icon_or_art(
@@ -505,7 +505,7 @@ impl Render for Tooltip {
             .border_1()
             .border_color(t.tooltip_border)
             .shadow_lg()
-            .text_size(px(11.0))
+            .text_size(t.text(11.0))
             .line_height(relative(1.35))
             .whitespace_normal()
             .child(self.label.clone())
