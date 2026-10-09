@@ -1326,6 +1326,19 @@ impl Browser {
         }
     }
 
+    /// Show or hide the search strip, and hand the caret to it when it opens.
+    ///
+    /// Public for the same reason [`Self::set_view_mode`] is: the overflow menu
+    /// carries a search row, because `Layout::Compact` hides the toolbar's view
+    /// capsule and a mouse would otherwise have no way to search at all.
+    pub fn flip_search(&mut self, cx: &mut Context<Self>) {
+        let next = !self.search_active;
+        self.set_search_active(next, cx);
+        if next {
+            cx.emit(BrowserEvent::FocusSearch);
+        }
+    }
+
     /// Show or hide the search strip. See [`Self::step_back`] for why this is
     /// public.
     pub fn set_search_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -1433,12 +1446,10 @@ impl Browser {
         }
     }
 
+    /// Show or hide the search strip. See [`Self::flip_view_mode`] for why the
+    /// public counterpart exists.
     fn toggle_search(&mut self, _: &ToggleSearch, _: &mut Window, cx: &mut Context<Self>) {
-        let next = !self.search_active;
-        self.set_search_active(next, cx);
-        if next {
-            cx.emit(BrowserEvent::FocusSearch);
-        }
+        self.flip_search(cx);
     }
 
     fn focus_previous(&mut self, _: &FocusPrevious, window: &mut Window, cx: &mut Context<Self>) {

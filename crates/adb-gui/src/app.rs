@@ -2378,6 +2378,19 @@ impl AdbShareApp {
                     }
                 }
             }
+            // The two view rows the overflow menu carries for narrow windows,
+            // where the toolbar's view capsule is not on screen.
+            "search" => {
+                self.browser.update(cx, |b, cx| b.flip_search(cx));
+            }
+            "view-grid" => {
+                self.browser
+                    .update(cx, |b, cx| b.set_view_mode(ViewMode::Grid, cx));
+            }
+            "view-list" => {
+                self.browser
+                    .update(cx, |b, cx| b.set_view_mode(ViewMode::List, cx));
+            }
             "save-as" => self.save_as(cx),
             "open-external" => {
                 // "Open in Files" means the folder being browsed, not whatever
@@ -2492,7 +2505,15 @@ impl AdbShareApp {
     }
 
     /// The overflow menu, for the current state.
-    fn overflow_items(&self, show_hidden: bool, sort: (SortKey, bool)) -> Vec<MenuItem> {
+    ///
+    /// `cx` is read-only: the rows describe what the browser is currently
+    /// doing, so they have to ask it.
+    fn overflow_items(
+        &self,
+        cx: &gpui::App,
+        show_hidden: bool,
+        sort: (SortKey, bool),
+    ) -> Vec<MenuItem> {
         // Generated from the enum, so a new sort key cannot be added to the
         // model and then forgotten here.
         let sort_rows: Vec<MenuItem> = SortKey::values()
@@ -2544,13 +2565,36 @@ impl AdbShareApp {
                 "Connection diagnostics…",
                 None,
             ),
-            MenuItem::Heading("Sort by".into()),
+            // The view group, so the toolbar's view capsule is not the only
+            // route to search and the grid/list switch: `Layout::Compact`
+            // hides that capsule entirely, and below 1000px a mouse had no
+            // way to reach either of them.
+            MenuItem::Heading("View".into()),
+            MenuItem::Check {
+                id: "search",
+                icon: names::EDIT_FIND,
+                label: "Search this folder".into(),
+                checked: self.browser.read(cx).search_active(),
+            },
             MenuItem::Check {
                 id: "show-hidden",
                 icon: names::OBJECT_SELECT,
                 label: "Show hidden files".into(),
                 checked: show_hidden,
             },
+            MenuItem::Check {
+                id: "view-grid",
+                icon: names::VIEW_GRID,
+                label: "Grid view".into(),
+                checked: self.browser.read(cx).view_mode() == ViewMode::Grid,
+            },
+            MenuItem::Check {
+                id: "view-list",
+                icon: names::VIEW_LIST,
+                label: "List view".into(),
+                checked: self.browser.read(cx).view_mode() == ViewMode::List,
+            },
+            MenuItem::Heading("Sort by".into()),
             MenuItem::Separator,
             MenuItem::with_icon(
                 "shortcuts",
@@ -3219,7 +3263,7 @@ impl AdbShareApp {
             self.browser.read(cx).sort_key(),
             self.browser.read(cx).sort_descending(),
         );
-        let items = self.overflow_items(show_hidden, sort);
+        let items = self.overflow_items(cx, show_hidden, sort);
         let me = cx.entity();
         let card = menu::render(t, &items, 260.0, move |id, _window, app| {
             me.update(app, |this, cx| this.on_menu_select(id, cx));
