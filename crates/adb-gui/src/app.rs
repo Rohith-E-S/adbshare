@@ -54,6 +54,19 @@ const TINY_BELOW: f32 = 520.0;
 /// Width of the transfers popover, which needs room for a job name, a pill, a
 /// progress bar and a monospace status line on one row each.
 const POPOVER_W: f32 = 340.0;
+/// How far a top-bar popover is inset from the window's right edge.
+///
+/// Both popovers hang under the top bar, whose last child — the overflow
+/// button — is `CAPSULE_H` wide and is separated from the capsule before it
+/// by the top bar's `gap`. The overflow menu anchors on the bar's own
+/// padding, and the transfers popover clears the overflow button as well, so
+/// it lands under its own button. Both insets are expressed in the same terms
+/// — bar padding, then button span plus gap — instead of one being a number
+/// plucked out of the layout, which is how the transfers menu ended up 44px
+/// in with nothing to explain the 44.
+const POPOVER_RIGHT: f32 = 8.0;
+const POPOVER_RIGHT_UNDER_BUTTON: f32 =
+    POPOVER_RIGHT + theme::CAPSULE_H + POPOVER_RIGHT;
 
 actions!(
     app,
@@ -3261,7 +3274,7 @@ impl AdbShareApp {
             div()
                 .absolute()
                 .top(px(theme::TOPBAR_H - 2.0))
-                .right(px(44.0))
+                .right(px(POPOVER_RIGHT_UNDER_BUTTON))
                 .child(
                     div()
                         .flex()
@@ -3301,7 +3314,7 @@ impl AdbShareApp {
             div()
                 .absolute()
                 .top(px(theme::TOPBAR_H - 2.0))
-                .right(px(8.0))
+                .right(px(POPOVER_RIGHT))
                 .child(card),
         )
         .into_any_element()
