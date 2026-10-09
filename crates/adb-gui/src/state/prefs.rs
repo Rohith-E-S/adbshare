@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::theme;
 use crate::views::browser::ViewMode;
 
 /// Sidebar width bounds, matching the divider's clamp.
@@ -45,6 +46,11 @@ pub struct Preferences {
     pub sort_key: crate::protocol::SortKey,
     /// Whether that order is reversed.
     pub sort_descending: bool,
+    /// Which text-size step is in use, as an index into [`theme::TEXT_SCALES`].
+    ///
+    /// An index rather than the scale itself, so a row's tick and the stored
+    /// value are the same number and cannot drift apart.
+    pub text_step: u8,
 }
 
 impl Default for Preferences {
@@ -57,6 +63,7 @@ impl Default for Preferences {
             show_hidden: false,
             sort_key: crate::protocol::SortKey::default(),
             sort_descending: false,
+            text_step: theme::TEXT_DEFAULT_STEP as u8,
         }
     }
 }
@@ -73,7 +80,17 @@ impl Preferences {
             self.zoom = ZOOM_DEFAULT;
         }
         self.zoom = self.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        // A hand-edited or forward-incompatible file can name a step that no
+        // longer exists; clamping puts it on the nearest real one rather than
+        // drawing text at an arbitrary scale.
+        let steps = theme::TEXT_SCALES.len() as u8;
+        self.text_step = self.text_step.min(steps - 1);
         self
+    }
+
+    /// The text-size step in use, as an index into [`theme::TEXT_SCALES`].
+    pub fn text_step(&self) -> usize {
+        self.text_step as usize
     }
 
     /// Read the preferences, falling back to the defaults on any problem.

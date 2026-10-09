@@ -236,6 +236,11 @@ pub struct AdbShareApp {
     /// implying no phone is plugged in.
     daemon_error: Option<String>,
     focus: FocusHandle,
+    /// Which text-size step is in use, as an index into [`theme::TEXT_SCALES`].
+    ///
+    /// Mirrored into the palette global by [`Self::set_text_step`]; that is the
+    /// value the views actually read.
+    text_step: usize,
     /// The last preferences written out, so a save only happens on a real
     /// change.
     saved: Preferences,
@@ -253,6 +258,10 @@ impl AdbShareApp {
             let browser = this.browser.clone();
             browser.update(cx, |b, cx| b.apply_preferences(view_prefs, cx));
         });
+        // Text is sized through the palette, and the palette is a global every
+        // renderer reads, so the stored text step has to land there before the
+        // first frame rather than waiting for something to change it.
+        theme::set_font_scale(cx, theme::text_scale(saved.text_step()));
         Self::wire_up(&view, cx);
         view
     }
@@ -294,6 +303,7 @@ impl AdbShareApp {
             daemon_failures: 0,
             daemon_error: None,
             focus: cx.focus_handle(),
+            text_step: saved.text_step(),
             saved: saved.clone(),
             subscriptions: Vec::new(),
         }
@@ -310,6 +320,7 @@ impl AdbShareApp {
             show_hidden: browser.show_hidden(),
             sort_key: browser.sort_key(),
             sort_descending: browser.sort_descending(),
+            text_step: self.text_step as u8,
         }
     }
 
@@ -326,6 +337,21 @@ impl AdbShareApp {
         }
         current.save();
         self.saved = current;
+    }
+
+    /// Choose a text-size step and scale everything that draws text by it.
+    ///
+    /// The palette is a GPUI global and every renderer copies it at the top of
+    /// its render, so writing the scale there is what makes the change land on
+    /// the next frame in all of them at once — there is no event to send and no
+    /// view that owns "the text".
+    fn set_text_step(&mut self, step: usize, cx: &mut Context<Self>) {
+        self.text_step = step.min(theme::TEXT_SCALES.len() - 1);
+        theme::set_font_scale(cx, theme::text_scale(self.text_step));
+        // Rides the same path as every other preference: the poll tick notices
+        // the change and writes it out.
+        self.persist_if_changed(cx);
+        cx.notify();
     }
 
     /// Show or hide the sidebar, if this window width can show it at all.
