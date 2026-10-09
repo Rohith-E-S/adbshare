@@ -432,7 +432,14 @@ pub struct Browser {
     drag_extend: bool,
 
     // ── Status line ────────────────────────────────────────────────────────
+    /// What the pane is showing: "Browsing Pixel 8", an error, or empty.
+    ///
+    /// Distinct from `job_text`, which reports the transfer queue. They were
+    /// one field, so whichever wrote last won and the other was silenced —
+    /// and an empty queue claimed the folder had no items.
     status_text: String,
+    /// The transfer queue's summary, or empty when nothing has been queued.
+    job_text: String,
     active_jobs: usize,
     /// Aggregate bytes moved by the active jobs, for the status bar's bar.
     progress: TransferProgress,
@@ -488,6 +495,7 @@ impl Browser {
             drag_current: None,
             drag_extend: false,
             status_text: String::new(),
+            job_text: String::new(),
             active_jobs: 0,
             progress: TransferProgress::default(),
             loading: false,
@@ -918,8 +926,14 @@ impl Browser {
         if !unchanged {
             // Rewriting the label on every 600ms poll would make it flicker, so
             // it is only touched when the state actually changes.
-            self.status_text = if total == 0 {
-                "0 item(s)".to_string()
+            //
+            // Its own line, not `status_text`: that field means "what the pane
+            // is showing", and the status bar falls back to the item count when
+            // it is empty. Putting the transfer count in it made an empty queue
+            // write "0 item(s)" there, which then read as "this folder is empty"
+            // over a folder full of files.
+            self.job_text = if total == 0 {
+                String::new()
             } else {
                 format!("{active} of {total} transfer(s) active")
             };
@@ -1964,14 +1978,20 @@ fn transfer_bar(browser: &Browser, t: &theme::Palette) -> AnyElement {
 
 fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) -> AnyElement {
     let running = browser.active_jobs > 0;
-    // A listing in flight outranks the item count: the count is the previous
-    // directory's until the answer lands, so showing it would be a lie.
+    // A listing in flight outranks everything: the count is the previous
+    // directory's until the answer lands, so showing it would be a lie. After
+    // that the queue's own summary wins, because "1 of 3 transfer(s) active"
+    // is what just happened; then whatever the pane is doing — an error, or the
+    // greeting left by selecting a device; and only when there is nothing to
+    // say does the item count speak for itself.
     let text = if browser.loading {
         "Loading…".to_string()
-    } else if browser.status_text.is_empty() {
-        format!("{} item(s)", browser.visible.len())
-    } else {
+    } else if !browser.job_text.is_empty() {
+        browser.job_text.clone()
+    } else if !browser.status_text.is_empty() {
         browser.status_text.clone()
+    } else {
+        format!("{} item(s)", browser.visible.len())
     };
 
     div()
