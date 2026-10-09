@@ -2816,12 +2816,17 @@ impl AdbShareApp {
             let mut buttons: Vec<AnyElement> = Vec::new();
             if self.layout.shows_sidebar() {
                 buttons.push(
-                    ui::icon_button(
+                    ui::icon_button_with_hint(
                         t,
                         "toggle-sidebar",
                         names::SIDEBAR_SHOW,
                         theme::CAPSULE_BTN,
                         ui::icon_tint(names::SIDEBAR_SHOW, t),
+                        if self.sidebar_visible {
+                            "Hide sidebar (F9)"
+                        } else {
+                            "Show sidebar (F9)"
+                        },
                         cx.listener(|this, _e, _w, cx| {
                             this.toggle_sidebar(cx);
                         }),
