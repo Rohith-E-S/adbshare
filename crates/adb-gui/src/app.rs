@@ -144,6 +144,16 @@ impl Layout {
     fn shows_nav(self) -> bool {
         self != Layout::Tiny
     }
+
+    /// Whether the sidebar is on screen at all at this width.
+    ///
+    /// Narrow deliberately sheds it — the pane is not worth 200px of a 600px
+    /// window. It also decides whether the sidebar can be *asked for*: the
+    /// toggle button and F9 both guard on this, so the chrome never offers a
+    /// control this layout will ignore.
+    fn shows_sidebar(self) -> bool {
+        self != Layout::Narrow
+    }
 }
 
 /// The phone folder shortcuts offered in the sidebar.
@@ -301,6 +311,20 @@ impl AdbShareApp {
         }
         current.save();
         self.saved = current;
+    }
+
+    /// Show or hide the sidebar, if this window width can show it at all.
+    ///
+    /// Narrow hides the sidebar outright, so a request made there is dropped
+    /// rather than remembered: flipping `sidebar_visible` with no visible
+    /// effect made both the button and F9 look broken, and the flag would then
+    /// resurface as a surprise sidebar when the window was widened again.
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self.layout.shows_sidebar() {
+            return;
+        }
+        self.sidebar_visible = !self.sidebar_visible;
+        cx.notify();
     }
 
     /// Subscribe to child entities and start the poll loops.
@@ -2454,7 +2478,7 @@ impl AdbShareApp {
             }
             "retry-failed" => self.retry_failed(cx),
             "toggle-sidebar" => {
-                self.sidebar_visible = !self.sidebar_visible;
+                self.toggle_sidebar(cx);
             }
             _ => {}
         }
@@ -2715,8 +2739,12 @@ impl AdbShareApp {
         #[allow(unused_mut)]
         let mut browser = browser;
         if self.layout.shows_nav() {
-            capsules.push(
-                ui::capsule([
+            // The sidebar toggle is only offered while the sidebar can be shown.
+            // Narrow hides it outright, so the button would do nothing there;
+            // hiding it in step keeps `show_sidebar` below honest.
+            let mut buttons: Vec<AnyElement> = Vec::new();
+            if self.layout.shows_sidebar() {
+                buttons.push(
                     ui::icon_button(
                         t,
                         "toggle-sidebar",
@@ -2724,20 +2752,21 @@ impl AdbShareApp {
                         theme::CAPSULE_BTN,
                         ui::icon_tint(names::SIDEBAR_SHOW, t),
                         cx.listener(|this, _e, _w, cx| {
-                            this.sidebar_visible = !this.sidebar_visible;
-                            cx.notify();
+                            this.toggle_sidebar(cx);
                         }),
                     )
                     .into_any_element(),
-                    ui::capsule_separator(t).into_any_element(),
-                    self.nav_button(t, "back", names::GO_PREVIOUS, &browser, cx),
-                    self.nav_button(t, "forward", names::GO_NEXT, &browser, cx),
-                    self.nav_button(t, "up", names::GO_UP, &browser, cx),
-                    ui::capsule_separator(t).into_any_element(),
-                    self.nav_button(t, "refresh", names::REFRESH, &browser, cx),
-                ])
-                .into_any_element(),
-            );
+                );
+                buttons.push(ui::capsule_separator(t).into_any_element());
+            }
+            buttons.extend([
+                self.nav_button(t, "back", names::GO_PREVIOUS, &browser, cx),
+                self.nav_button(t, "forward", names::GO_NEXT, &browser, cx),
+                self.nav_button(t, "up", names::GO_UP, &browser, cx),
+                ui::capsule_separator(t).into_any_element(),
+                self.nav_button(t, "refresh", names::REFRESH, &browser, cx),
+            ]);
+            capsules.push(ui::capsule(buttons).into_any_element());
         }
 
         // The path bar, which doubles as the search box and the Ctrl+L path
@@ -3904,7 +3933,7 @@ impl Render for AdbShareApp {
             self.last_title = Some(target);
         }
 
-        let show_sidebar = self.layout != Layout::Narrow && self.sidebar_visible;
+        let show_sidebar = self.layout.shows_sidebar() && self.sidebar_visible;
         // The browser is told where its item area is, so rubber-band selection
         // hit-tests against real geometry.
         let sidebar_width = if show_sidebar {
@@ -4011,8 +4040,7 @@ impl Render for AdbShareApp {
                 this.on_menu_select("connect-wifi", cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _w, cx| {
-                this.sidebar_visible = !this.sidebar_visible;
-                cx.notify();
+                this.toggle_sidebar(cx);
             }))
             .child(self.topbar(&t, cx))
             .child(self.search_row(&t, cx))
