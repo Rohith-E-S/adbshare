@@ -1063,6 +1063,12 @@ where
 ///
 /// A test asserts no two rows claim the same keys, because a duplicate row is
 /// how "Alt+Up" ended up listed twice.
+///
+/// Kept honest against the binding tables by construction rather than by
+/// memory: the rows here name the keys `crate::views::browser::BINDINGS` and
+/// `crate::BINDINGS` actually register, so a new binding that is not added
+/// here is a shortcut the user cannot discover — which is how "Open in
+/// terminal" came to promise Alt+T while Alt+T switched the view.
 const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "Navigation",
@@ -1106,6 +1112,15 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Zoom out / in", "Ctrl+minus / Ctrl+plus"),
             ("Search this folder", "Ctrl+F"),
             ("Show hidden files", "Overflow menu"),
+        ],
+    ),
+    (
+        // Bound in `app::BINDINGS`, and previously missing from this list
+        // entirely, which left two working shortcuts undocumentable.
+        "Connection",
+        &[
+            ("Connect via Wi-Fi", "Shift+F10"),
+            ("Connection diagnostics", "Ctrl+,"),
         ],
     ),
 ];
