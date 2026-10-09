@@ -2474,6 +2474,22 @@ impl Browser {
             human_size(entry.size)
         };
 
+        // The same ladder the grid tile uses (`self.grid_tile`): selection is
+        // `selected`, hover over a selection is one step past it, and the
+        // keyboard's focus lands on the lighter `hover` step so a focused row
+        // stays distinguishable from a selected one. The list had been using
+        // `hover` for selection and `pressed` for hovering it, which made the
+        // same selected file look different in the two layouts — barely
+        // highlighted in the list, clearly highlighted in the grid.
+        let resting_bg = if selected {
+            Some(t.selected)
+        } else if focused {
+            Some(t.hover)
+        } else {
+            None
+        };
+        let hover_bg = if selected { t.selected_strong } else { t.hover };
+
         let row = div()
             .id(("row", index))
             .flex()
@@ -2485,9 +2501,8 @@ impl Browser {
             .px(px(8.0))
             .rounded(px(6.0))
             .cursor_pointer()
-            .when(selected, |d| d.bg(t.hover))
-            .when(focused && !selected, |d| d.bg(t.hover))
-            .hover(|d| d.bg(if selected { t.pressed } else { t.hover }))
+            .when_some(resting_bg, |d, bg| d.bg(bg))
+            .hover(move |d| d.bg(hover_bg))
             .child(if let Some(thumb) = self.thumb_for(&entry, 18.0) {
                 thumb
             } else if entry.looks_like_dir() {
