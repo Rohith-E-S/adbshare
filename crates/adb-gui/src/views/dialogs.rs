@@ -442,7 +442,8 @@ where
                     vec![
                         Button::normal("cancel", DialogResult::Dismiss),
                         Button::normal("copy", DialogResult::CopyApk(local.clone())),
-                        Button::normal("install", DialogResult::InstallApk(local.clone())),
+                        // The question this dialog asks, so it takes the fill.
+                        Button::primary("install", DialogResult::InstallApk(local.clone())),
                     ],
                     on_result.clone(),
                 )
@@ -519,6 +520,8 @@ enum Button {
         id: &'static str,
         label: SharedString,
         result: DialogResult,
+        /// The filled variant, for the action the dialog is asking about.
+        primary: bool,
     },
     Danger {
         id: &'static str,
@@ -538,12 +541,29 @@ enum Button {
 }
 
 impl Button {
-    /// A secondary or accepting button.
+    /// A secondary button, or an accepting one with `primary` set.
     fn normal(id: &'static str, result: DialogResult) -> Self {
         Button::Normal {
             id,
             label: label_for(id),
             result,
+            primary: false,
+        }
+    }
+
+    /// The filled variant, for the action this dialog is asking about.
+    ///
+    /// Every dialog that has an accepting action states it this way and puts
+    /// it rightmost: "Create", "Delete", "Next", "Pair". The three that did
+    /// not — the APK prompt's Install, the paired prompt's Connect, the image
+    /// preview's Open externally — offered no filled button at all, so the one
+    /// choice the dialog exists for looked like any of its alternatives.
+    fn primary(id: &'static str, result: DialogResult) -> Self {
+        Button::Normal {
+            id,
+            label: label_for(id),
+            result,
+            primary: true,
         }
     }
 
@@ -554,6 +574,17 @@ impl Button {
             id: "extra",
             label: label.into(),
             result,
+            primary: false,
+        }
+    }
+
+    /// The filled variant, for a runtime label.
+    fn primary_owned(label: String, result: DialogResult) -> Self {
+        Button::Normal {
+            id: "extra",
+            label: label.into(),
+            result,
+            primary: true,
         }
     }
 
@@ -653,13 +684,16 @@ where
             // The index keeps ids unique when a dialog offers two buttons built
             // from the same id.
             match button {
-                Button::Normal { id, label, result } => {
-                    ui::button(t, ui::el_id(format!("{id}-{index}")), label, false, {
-                        let on_result = on_result.clone();
-                        move |_, w, cx| on_result(result.clone(), w, cx)
-                    })
-                    .into_any_element()
-                }
+                Button::Normal {
+                    id,
+                    label,
+                    result,
+                    primary,
+                } => ui::button(t, ui::el_id(format!("{id}-{index}")), label, primary, {
+                    let on_result = on_result.clone();
+                    move |_, w, cx| on_result(result.clone(), w, cx)
+                })
+                .into_any_element(),
                 Button::Danger { id, label, result } => {
                     ui::danger_button(t, ui::el_id(format!("{id}-{index}")), label, {
                         let on_result = on_result.clone();
@@ -926,7 +960,9 @@ where
              connect by IP address."
                 .to_string(),
             Some(address_field),
-            vec![Button::normal("cancel", DialogResult::Dismiss)],
+            // Placeholder: the row below is rebuilt per step, because only it
+            // knows which text field the forward button has to read.
+            Vec::new(),
         ),
         WifiStep::Pairing { address } => (
             names::WIRELESS,
@@ -950,7 +986,8 @@ where
             None,
             vec![
                 Button::normal("not now", DialogResult::Dismiss),
-                Button::normal("connect", DialogResult::ConnectWireless(address.clone())),
+                // The step the user drove this flow to reach.
+                Button::primary("connect", DialogResult::ConnectWireless(address.clone())),
             ],
         ),
         WifiStep::Failed { message } => (
@@ -1044,8 +1081,14 @@ where
             buttons(
                 t,
                 vec![
-                    Button::normal_owned("Copy report".into(), DialogResult::CopyDiagnostics(text)),
                     Button::normal("close", DialogResult::Dismiss),
+                    // Not `normal_owned`: the rule is that the accepting action
+                    // is the filled, rightmost button, and copying the report is
+                    // what this dialog is for.
+                    Button::primary_owned(
+                        "Copy report".into(),
+                        DialogResult::CopyDiagnostics(text),
+                    ),
                 ],
                 on_result,
             )
@@ -1230,11 +1273,11 @@ where
             buttons(
                 t,
                 vec![
-                    Button::normal(
+                    Button::normal("close", DialogResult::Dismiss),
+                    Button::primary(
                         "open externally",
                         DialogResult::OpenExternal(local.to_path_buf()),
                     ),
-                    Button::normal("close", DialogResult::Dismiss),
                 ],
                 on_result,
             )

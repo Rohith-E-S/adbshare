@@ -65,8 +65,7 @@ const POPOVER_W: f32 = 340.0;
 /// plucked out of the layout, which is how the transfers menu ended up 44px
 /// in with nothing to explain the 44.
 const POPOVER_RIGHT: f32 = 8.0;
-const POPOVER_RIGHT_UNDER_BUTTON: f32 =
-    POPOVER_RIGHT + theme::CAPSULE_H + POPOVER_RIGHT;
+const POPOVER_RIGHT_UNDER_BUTTON: f32 = POPOVER_RIGHT + theme::CAPSULE_H + POPOVER_RIGHT;
 
 actions!(
     app,
@@ -3551,7 +3550,9 @@ impl AdbShareApp {
             ("Downloads", names::folders::DOWNLOAD, LocalPlace::Downloads),
             ("Trash", names::TRASH, LocalPlace::Trash),
         ] {
-            let active = kind.resolve().is_some_and(|p| browsing_local && p == local_path);
+            let active = kind
+                .resolve()
+                .is_some_and(|p| browsing_local && p == local_path);
             rows.push(
                 place_row(
                     t,
