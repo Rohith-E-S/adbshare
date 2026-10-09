@@ -2947,9 +2947,14 @@ impl AdbShareApp {
                             "Search this folder (Ctrl+F)",
                             {
                                 let browser = browser.clone();
-                                let next = !search_on;
                                 move |_, _w, cx| {
-                                    browser.update(cx, |b, cx| b.set_search_active(next, cx));
+                                    // `flip_search`, not `set_search_active`:
+                                    // the key and the overflow row both hand
+                                    // the caret to the field they just opened,
+                                    // and this button used to leave it in the
+                                    // pane, so the strip appeared and typing
+                                    // went nowhere until you clicked into it.
+                                    browser.update(cx, |b, cx| b.flip_search(cx));
                                 }
                             },
                         )
