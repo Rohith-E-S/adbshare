@@ -15,8 +15,8 @@ else
 fi
 echo "==> Using cargo: $CARGO ($("$CARGO" --version))"
 
-echo "==> Building (cargo build --release --workspace)"
-"$CARGO" build --release --workspace
+echo "==> Building (cargo build --release --bin adb-daemon --bin adb-gui)"
+"$CARGO" build --release --bin adb-daemon --bin adb-gui
 
 echo "==> Stopping existing instances"
 pkill -x adb-daemon 2>/dev/null || true

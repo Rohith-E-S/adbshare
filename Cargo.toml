@@ -43,12 +43,9 @@ fuser = "0.18"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-# Was 1, which compiles a whole crate as a single LLVM unit — on a 16-core
-# machine that leaves fifteen idle for the entire codegen phase, and it is the
-# dominant cost in an incremental rebuild of a leaf crate. 16 is cargo's own
-# default and thin LTO still merges across crates afterwards, so the runtime
-# difference is a fraction of a percent.
+# Disabled LTO: thin LTO re-analyzes every dependency on leaf rebuilds (36s vs 14s)
+# for <1% runtime/size difference.
+lto = false
 codegen-units = 16
 strip = "symbols"
 panic = "abort"
