@@ -381,9 +381,30 @@ where
 /// Paint the given content above everything already laid out in the tree.
 ///
 /// GPUI has no z-index; paint order comes from tree order, and `deferred`
-/// postpones an element's paint until after its ancestors'.
+/// postpones an element's paint until after its ancestors'. The same ordering
+/// decides hit-testing, so a higher priority also means the pointer reaches it
+/// first.
 pub fn on_top(content: impl IntoElement) -> impl IntoElement {
-    deferred(div().absolute().inset_0().child(content)).priority(100)
+    deferred_at(content, OVERLAY_PRIORITY)
+}
+
+/// The priority every overlay — popover, menu, dialog, toast — paints at.
+const OVERLAY_PRIORITY: usize = 100;
+
+/// Paint above the ordinary tree but below the overlays.
+///
+/// This is where a dismiss-anywhere backdrop belongs. It has to cover the
+/// chrome the user clicked away from, and stay *under* the popover that is
+/// still open — and since GPUI resolves the pointer in the same order it
+/// paints, drawing it as an ordinary tree element would put it on top of the
+/// overlay and swallow every click meant for its rows: the menu would open,
+/// and then no row in it would do anything.
+pub fn beneath_overlays(content: impl IntoElement) -> impl IntoElement {
+    deferred_at(content, OVERLAY_PRIORITY - 1)
+}
+
+fn deferred_at(content: impl IntoElement, priority: usize) -> impl IntoElement {
+    deferred(div().absolute().inset_0().child(content)).priority(priority)
 }
 
 /// A menu row for the kebab menu and context menus.

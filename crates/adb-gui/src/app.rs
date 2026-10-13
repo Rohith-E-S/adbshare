@@ -236,6 +236,12 @@ pub struct AdbShareApp {
     /// implying no phone is plugged in.
     daemon_error: Option<String>,
     focus: FocusHandle,
+    /// The window's height as of the last render.
+    ///
+    /// The menus open from here need to know how much room is left under them,
+    /// and only `render` is given a `&Window` to ask. Refreshed every frame,
+    /// which is also what keeps it true through a resize.
+    viewport_h: f32,
     /// Which text-size step is in use, as an index into [`theme::TEXT_SCALES`].
     ///
     /// Mirrored into the palette global by [`Self::set_text_step`]; that is the
@@ -303,6 +309,7 @@ impl AdbShareApp {
             daemon_failures: 0,
             daemon_error: None,
             focus: cx.focus_handle(),
+            viewport_h: theme::WINDOW_H,
             text_step: saved.text_step(),
             saved: saved.clone(),
             subscriptions: Vec::new(),
@@ -3382,9 +3389,15 @@ impl AdbShareApp {
         );
         let items = self.overflow_items(cx, show_hidden, sort);
         let me = cx.entity();
-        let card = menu::render(t, &items, 260.0, move |id, _window, app| {
-            me.update(app, |this, cx| this.on_menu_select(id, cx));
-        });
+        let card = menu::render(
+            t,
+            &items,
+            260.0,
+            menu_max_height(theme::TOPBAR_H, self.viewport_h),
+            move |id, _window, app| {
+                me.update(app, |this, cx| this.on_menu_select(id, cx));
+            },
+        );
 
         ui::on_top(
             div()
@@ -3404,9 +3417,15 @@ impl AdbShareApp {
         let browser = self.browser.read(cx);
         let items = self.context_items(browser);
         let me = cx.entity();
-        let card = menu::render(t, &items, 230.0, move |id, _window, app| {
-            me.update(app, |this, cx| this.on_menu_select(id, cx));
-        });
+        let card = menu::render(
+            t,
+            &items,
+            230.0,
+            menu_max_height(f32::from(state.position.y), self.viewport_h),
+            move |id, _window, app| {
+                me.update(app, |this, cx| this.on_menu_select(id, cx));
+            },
+        );
 
         ui::on_top(
             gpui::anchored()
@@ -3656,6 +3675,27 @@ impl AdbShareApp {
             .into_any_element()
     }
 }
+
+/// The most height a menu can take, so it fits the window it hangs from.
+///
+/// Both menus open downwards — the overflow list from the top bar, the
+/// context menu from the pointer — so the room they have is the viewport
+/// height less where they start, and less a margin so the last row is not
+/// flush against the bottom edge. Without this a long menu simply ran off
+/// the screen: the overflow list used to fit until the text-size rows pushed
+/// it past the window, and on a default-sized window its last two rows —
+/// Keyboard shortcuts, About — were cut in half.
+fn menu_max_height(anchor_y: f32, viewport_h: f32) -> f32 {
+    (viewport_h - anchor_y - MENU_MARGIN).max(MENU_MIN_H)
+}
+
+/// How much room to leave under a menu, so its last row is not flush against
+/// the bottom edge of the window.
+const MENU_MARGIN: f32 = 24.0;
+
+/// The smallest a menu is allowed to be, however close to the bottom edge it
+/// was opened: a few rows are better than none.
+const MENU_MIN_H: f32 = 120.0;
 
 /// A local place from the sidebar.
 #[derive(Debug, Clone, Copy)]
@@ -4124,6 +4164,9 @@ impl Render for AdbShareApp {
         let content_x = sidebar_width + if show_sidebar { 4.0 } else { 0.0 };
         let content_y = theme::TOPBAR_H;
         let viewport = window.viewport_size();
+        // The menus measure the room left beneath them against this, and they
+        // are built later in the same render.
+        self.viewport_h = f32::from(viewport.height);
         let content_w: f32 = f32::from(viewport.width) - sidebar_width;
         // The browser gets the box it was given, not the item area inside it:
         // the context strip, search row and grid padding are the browser's own
@@ -4187,7 +4230,8 @@ impl Render for AdbShareApp {
                 });
             }
         };
-        let backdrop = overlays.then(|| ui::popover_backdrop("overlay", dismiss_overlays));
+        let backdrop = overlays
+            .then(|| ui::beneath_overlays(ui::popover_backdrop("overlay", dismiss_overlays)));
 
         let capture = if self.resizing_sidebar {
             Some(self.resize_capture(window, cx))

@@ -345,6 +345,7 @@ pub fn text_scale_id(step: usize) -> &'static str {
 }
 
 /// The step a scale names, for restoring a row's tick.
+#[cfg(test)]
 pub fn text_scale_step(scale: f32) -> usize {
     // Within a hair of a step is that step; anything else is the default,
     // which is also what a hand-edited preference gets.

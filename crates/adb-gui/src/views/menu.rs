@@ -122,7 +122,16 @@ impl MenuItem {
 ///
 /// `on_select` is called with the chosen item's id. Callers close the menu
 /// themselves, which keeps dismissal in one place.
-pub fn render<F>(t: &Palette, items: &[MenuItem], min_width: f32, on_select: F) -> AnyElement
+///
+/// `max_h` caps the card so a menu longer than the window scrolls instead of
+/// running off the bottom of the screen.
+pub fn render<F>(
+    t: &Palette,
+    items: &[MenuItem],
+    min_width: f32,
+    max_h: f32,
+    on_select: F,
+) -> AnyElement
 where
     // `Clone` rather than `Copy` so each row can own its own handle to the same
     // closure; the alternative is boxing, which callers would have to unwind.
@@ -215,8 +224,17 @@ where
         });
     }
 
+    // A menu can outgrow the window it hangs from — this one is ~32 rows, and
+    // a 680px-tall default window plus the text-size rows put it past the
+    // bottom — so it scrolls inside its own card rather than running off the
+    // screen. `scrollbar_width(0)`: the app hides its scrollbars elsewhere and
+    // the wheel works without one.
     ui::surface(t, rows)
         .min_w(px(min_width))
+        .max_h(px(max_h))
+        .id("menu-scroll")
+        .overflow_y_scroll()
+        .scrollbar_width(px(0.0))
         .py(px(6.0))
         .into_any_element()
 }
