@@ -1,0 +1,39 @@
+The debloat list in this directory is `uad_lists.json.gz`, a gzipped copy of
+`resources/assets/uad_lists.json` from the Universal Android Debloater Next
+Generation project:
+
+    https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation
+
+Upstream states that the project is licensed under the GNU General Public
+License, version 3:
+
+    https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation/blob/main/LICENSE
+
+adbshare is distributed under the GNU General Public License, version 3 or
+later, so this data can be redistributed as part of it.
+
+What the file is
+----------------
+
+A map of Android package name to a short description of the app, which
+curated list it belongs to (aosp, carrier, google, misc, oem), which other
+packages it depends on, and how safe it is to remove:
+
+    Recommended  safe to remove
+    Advanced    breaks obscure or minor parts of functionality
+    Expert      breaks widespread functionality, but should not boot-loop
+    Unsafe      can break vital parts of the operating system
+
+The `removal` level is upstream's own risk assessment and is reproduced
+verbatim, along with the descriptions. Both are the upstream authors' work
+and are covered by the licence above.
+
+How it is refreshed
+-------------------
+
+The file is a snapshot. To take a newer one:
+
+    make debloat-list
+
+which downloads the current upstream file and compresses it in place. Nothing
+in adbshare edits it: it is read as it is found.

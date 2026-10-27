@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod debloat;
 pub mod dialogs;
 pub mod filechooser;
 pub mod menu;

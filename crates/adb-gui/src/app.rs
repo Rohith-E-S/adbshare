@@ -8,6 +8,7 @@
 //! (selected device, jobs, dialogs, menus), and turns events into D-Bus or local
 //! filesystem work.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,16 +21,22 @@ use gpui::{
 
 use crate::icons::{self, names};
 use crate::protocol::{
-    ClipboardFiles, DeviceEntry, DirEntry, JobInfo, SortKey, format_capacity, tree_result_message,
+    ClipboardFiles, DeviceEntry, DirEntry, JobInfo, PackageActionDto, PackageRequestDto,
+    PackageResultDto, SortKey, format_capacity, tree_result_message,
 };
+use crate::state::apk;
 use crate::state::clipboard;
 use crate::state::daemon;
+use crate::state::debloat as debloat_list;
+use crate::state::history;
 use crate::state::localfs;
 use crate::state::prefs::{Preferences, SIDEBAR_RANGE};
 use crate::theme::{self, Themed};
 use crate::views::browser::{Browser, BrowserEvent, ViewMode};
+use crate::views::debloat::{Debloat, DebloatEvent};
 use crate::views::dialogs::{
-    self, Dialog, DialogResult, MessageTone, WifiStep, default_save_dir, validate_name,
+    self, BatchItem, DebloatFailure, DebloatPackage, Dialog, DialogResult, ItemState, MessageTone,
+    WifiStep, default_save_dir, validate_name,
 };
 use crate::views::filechooser::{self, Pick};
 use crate::views::menu::{self, MenuItem};
@@ -45,6 +52,9 @@ const DEVICE_POLL: Duration = Duration::from_secs(3);
 /// How often the transfer queue is refreshed. Much faster than the device poll
 /// because progress has to look live.
 const JOB_POLL: Duration = Duration::from_millis(600);
+/// The Android user package changes are made for. The owner is user 0, and a
+/// work profile is a different user with its own apps.
+const DEBLOAT_USER: u16 = 0;
 const SIDEBAR_MIN: f32 = SIDEBAR_RANGE.0;
 const SIDEBAR_MAX: f32 = SIDEBAR_RANGE.1;
 /// Window widths at which the chrome sheds parts, matching the old breakpoints.
@@ -77,6 +87,8 @@ actions!(
         ToggleSidebar,
         ToggleShowHidden,
         SelectAllEntries,
+        PickInstallApk,
+        TogglePane,
     ]
 );
 
@@ -85,7 +97,12 @@ actions!(
 /// Data rather than a bare call so the shortcuts dialog can be checked against
 /// what is actually bound; see `browser::BINDINGS`.
 pub const BINDINGS: &[crate::views::browser::Binding] = &[
+    // F9, and Ctrl+B as well: on omarchy F9 is bound to push-to-talk
+    // dictation, so the compositor eats it and the app never sees it.
     ("f9", || KeyBinding::new("f9", ToggleSidebar, None)),
+    ("secondary-b", || {
+        KeyBinding::new("secondary-b", ToggleSidebar, None)
+    }),
     // Escape closes whatever is on top, falling back to clearing the selection.
     ("escape", || {
         KeyBinding::new("escape", DismissOverlays, None)
@@ -95,6 +112,14 @@ pub const BINDINGS: &[crate::views::browser::Binding] = &[
     }),
     ("shift-f10", || {
         KeyBinding::new("shift-f10", ConnectWifi, None)
+    }),
+    // Install an APK: same gesture as Ctrl+U, pointed at installs.
+    ("secondary-i", || {
+        KeyBinding::new("secondary-i", PickInstallApk, None)
+    }),
+    // Swap the main pane between the file browser and the debloat view.
+    ("secondary-shift-d", || {
+        KeyBinding::new("secondary-shift-d", TogglePane, None)
     }),
 ];
 
@@ -251,9 +276,136 @@ pub struct AdbShareApp {
     /// change.
     saved: Preferences,
     subscriptions: Vec<Subscription>,
+
+    // ── Installs ───────────────────────────────────────────────────────────
+    /// The background install the Installing dialog is watching, with the
+    /// metadata history needs once it finishes.
+    install_watch: Option<InstallWatch>,
+
+    // ── Debloat ────────────────────────────────────────────────────────────
+    /// The debloat view: the phone's packages, and the curated list's advice
+    /// on them.
+    debloat: Entity<Debloat>,
+    /// What the main pane is showing.
+    pane: Pane,
+    /// What the debloat list says about each phone, for the sidebar badge.
+    ///
+    /// Read once per phone, not polled: the numbers are a hint about what is
+    /// there, and the pane is where the truth lives.
+    debloat_counts: HashMap<String, debloat_list::Counts>,
+}
+
+/// What the main pane is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    /// The file browser.
+    Browser,
+    /// The debloat view.
+    Debloat,
+}
+
+/// What one in-flight install needs remembered between the start call and
+/// the poll that sees it finish.
+#[derive(Debug, Clone)]
+struct InstallWatch {
+    id: u64,
+    device: String,
+    /// Where the APK came from: a host path or a device path.
+    source: String,
+    /// Best-effort package name, when the manifest was read before install.
+    package: Option<String>,
+    version: Option<String>,
+}
+
+/// The action a ledger entry names, if it names one we know.
+fn action_from_name(name: &str) -> Option<PackageActionDto> {
+    match name {
+        "disable" => Some(PackageActionDto::Disable),
+        "enable" => Some(PackageActionDto::Enable),
+        "uninstall" => Some(PackageActionDto::Uninstall),
+        "restore" => Some(PackageActionDto::Restore),
+        _ => None,
+    }
 }
 
 impl AdbShareApp {
+    /// Register the app-level shortcuts as global action handlers.
+    ///
+    /// An action travels *up* the focus path, and the file browser is a
+    /// separate entity below this one, so a handler on this root only ever
+    /// saw the shortcut while this root held the keyboard — which is almost
+    /// never, because the render hands the keyboard to the browser. Every
+    /// app-level shortcut (F9, Ctrl+I, Ctrl+Shift+D, Escape) was therefore
+    /// dead in the file pane, and alive only in the moment before anything
+    /// was clicked. A global handler sees the action whichever entity has
+    /// the focus.
+    pub fn install_global_actions(view: &Entity<Self>, cx: &mut App) {
+        let base = view.clone();
+
+        let view = base.clone();
+        cx.on_action(move |_: &DismissOverlays, cx: &mut App| {
+            view.update(cx, |this, cx| this.dismiss_overlays(cx));
+        });
+
+        let view = base.clone();
+        cx.on_action(move |_: &ShowAbout, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.dialog = crate::views::dialogs::Dialog::About;
+                cx.notify();
+            });
+        });
+
+        let view = base.clone();
+        cx.on_action(move |_: &ShowDiagnostics, cx: &mut App| {
+            view.update(cx, |this, cx| this.open_diagnostics(cx));
+        });
+
+        let view = base.clone();
+        cx.on_action(move |_: &ConnectWifi, cx: &mut App| {
+            view.update(cx, |this, cx| this.on_menu_select("connect-wifi", cx));
+        });
+
+        let view = base.clone();
+        cx.on_action(move |_: &ToggleSidebar, cx: &mut App| {
+            view.update(cx, |this, cx| this.toggle_sidebar(cx));
+        });
+
+        let view = base.clone();
+        cx.on_action(move |_: &PickInstallApk, cx: &mut App| {
+            view.update(cx, |this, cx| this.pick_for_install(cx));
+        });
+
+        let view = base.clone();
+        cx.on_action(move |_: &TogglePane, cx: &mut App| {
+            view.update(cx, |this, cx| this.toggle_pane(cx));
+        });
+    }
+
+    /// Escape unwinds one layer at a time, outermost first, and only clears
+    /// the selection once there is nothing left to close. The GTK build's
+    /// dialogs were Escape-dismissable by default; this is the equivalent,
+    /// decided in one place so no overlay has to remember to bind the key
+    /// itself.
+    fn dismiss_overlays(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.dialog, Dialog::None) {
+            self.dialog = Dialog::None;
+        } else if self.context_menu.take().is_some() {
+        } else if self.overflow_open {
+            self.overflow_open = false;
+        } else if self.transfers_open {
+            self.transfers_open = false;
+        } else if self.browser.read(cx).path_entry_active() {
+            self.browser.update(cx, |b, cx| b.close_path_entry(cx));
+        } else if self.browser.read(cx).search_active() {
+            self.browser
+                .update(cx, |b, cx| b.set_search_active(false, cx));
+        } else {
+            let browser = self.browser.clone();
+            browser.update(cx, |b, cx| b.clear_selection(cx));
+        }
+        cx.notify();
+    }
+
     /// Build the root view. Passed straight to `Application::open_window`.
     pub fn build(_window: &mut Window, cx: &mut App) -> Entity<Self> {
         let saved = Preferences::load();
@@ -269,6 +421,11 @@ impl AdbShareApp {
         // first frame rather than waiting for something to change it.
         theme::set_font_scale(cx, theme::text_scale(saved.text_step()));
         Self::wire_up(&view, cx);
+        // The app-level shortcuts are global rather than handlers on the app's
+        // root element: the file browser is a separate entity below it, and
+        // an action only travels up the focus path, so a handler on the root
+        // never saw them once the browser had the keyboard.
+        Self::install_global_actions(&view, cx);
         view
     }
 
@@ -313,6 +470,10 @@ impl AdbShareApp {
             text_step: saved.text_step(),
             saved: saved.clone(),
             subscriptions: Vec::new(),
+            install_watch: None,
+            debloat: cx.new(Debloat::new),
+            pane: Pane::Browser,
+            debloat_counts: HashMap::new(),
         }
     }
 
@@ -382,6 +543,29 @@ impl AdbShareApp {
         let browser = view.read(cx).browser.clone();
         let sub = cx.subscribe(&browser, move |_browser, event: &BrowserEvent, cx| {
             me.update(cx, |this, cx| this.on_browser_event(event, cx));
+        });
+        view.update(cx, |this, _cx| this.subscriptions.push(sub));
+
+        // The debloat view asks the app to carry out a change, so the
+        // confirmation card, the work on the daemon and the ledger all stay
+        // in one place.
+        let me = view.clone();
+        let debloat = view.read(cx).debloat.clone();
+        let sub = cx.subscribe(&debloat, move |_view, event: &DebloatEvent, cx| {
+            me.update(cx, |this, cx| this.on_debloat_event(event, cx));
+        });
+        view.update(cx, |this, _cx| this.subscriptions.push(sub));
+
+        // The debloat view's own search box.
+        let me = view.clone();
+        let search = view.read(cx).debloat.read(cx).search_field().clone();
+        let sub = cx.subscribe(&search, move |_field, event: &TextFieldEvent, cx| {
+            if let TextFieldEvent::Changed(query) = event {
+                let query = query.to_string();
+                me.update(cx, |this, cx| {
+                    this.debloat.update(cx, |d, cx| d.set_query(query, cx));
+                });
+            }
         });
         view.update(cx, |this, _cx| this.subscriptions.push(sub));
 
@@ -483,6 +667,18 @@ impl AdbShareApp {
                 cx.background_executor().timer(JOB_POLL).await;
                 let result = daemon::list_jobs().await;
                 jobs.update(cx, |this, cx| this.on_jobs_result(result, cx))
+                    .ok();
+            }
+        })
+        .detach();
+
+        let installs = view.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(JOB_POLL).await;
+                let result = daemon::install_status_all().await;
+                installs
+                    .update(cx, |this, cx| this.on_installs_result(result, cx))
                     .ok();
             }
         })
@@ -599,6 +795,11 @@ impl AdbShareApp {
         // name.
         if devices == self.devices {
             return;
+        }
+        // Ask each phone how much is on it, so the sidebar can say so. Asked
+        // once per phone, and the daemon caches the reading.
+        for device in &devices {
+            self.refresh_debloat_count(&device.serial, cx);
         }
         let previous = self.devices.clone();
         // Announce arrivals and departures now that the friendly names are known.
@@ -1332,6 +1533,36 @@ impl AdbShareApp {
 
     // ── Transfers ──────────────────────────────────────────────────────────
 
+    /// Ctrl+I: pick APKs to install. Routing happens once the files are
+    /// chosen, exactly as if they had been dropped on the window.
+    fn pick_for_install(&mut self, cx: &mut Context<Self>) {
+        if self.target_device().is_none() {
+            self.dialog = Dialog::Message {
+                title: "No phone selected".into(),
+                body: "Pick a device in the sidebar first, then install to it.".into(),
+                tone: MessageTone::Info,
+                extra: None,
+            };
+            cx.notify();
+            return;
+        }
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let Some(paths) = filechooser::pick(Pick::Files, "Install APK")
+                .await
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            me.update(cx, |this, cx| {
+                this.route_apks(paths, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn pick_for_upload(&mut self, cx: &mut Context<Self>) {
         let Some(device) = self.target_device() else {
             self.dialog = Dialog::Message {
@@ -1552,6 +1783,11 @@ impl AdbShareApp {
         if paths.is_empty() {
             return;
         }
+        // APKs are installs, not transfers; the rest carry on as files.
+        let paths = self.route_apks(paths, cx);
+        if paths.is_empty() {
+            return;
+        }
         let destination = self.browser.read(cx).path().to_path_buf();
         if let Some(device) = self.target_device() {
             for path in paths {
@@ -1594,6 +1830,7 @@ impl AdbShareApp {
         }
         let parent = self.browser.read(cx).path().to_path_buf();
         let destination = parent.join(&folder.name);
+        let paths = self.route_apks(paths, cx);
         if let Some(device) = self.target_device() {
             for path in paths {
                 let remote = destination.join(file_name_of(&path));
@@ -2058,16 +2295,429 @@ impl AdbShareApp {
 
     // ── APKs ───────────────────────────────────────────────────────────────
 
-    fn install_apk(&mut self, entry: DirEntry, cx: &mut Context<Self>) {
-        // An APK already on the device is installed from there; one on the
-        // computer has to be picked first.
-        if self.browser.read(cx).is_local() {
-            let local = self.browser.read(cx).full_path(&entry);
-            self.dialog = Dialog::SideloadApk {
-                name: entry.name.clone(),
-                local,
+    // ── Debloat ────────────────────────────────────────────────────────────
+
+    /// Swap the main pane between the file browser and the debloat view.
+    fn toggle_pane(&mut self, cx: &mut Context<Self>) {
+        if self.pane == Pane::Debloat {
+            self.pane = Pane::Browser;
+            cx.notify();
+            return;
+        }
+        self.open_debloat(cx);
+    }
+
+    /// Open the debloat view on the selected phone.
+    fn open_debloat(&mut self, cx: &mut Context<Self>) {
+        let Some(device) = self.target_device() else {
+            self.dialog = Dialog::Message {
+                title: "No phone selected".into(),
+                body: "Pick a device in the sidebar first, then debloat it.".into(),
+                tone: MessageTone::Info,
+                extra: None,
             };
             cx.notify();
+            return;
+        };
+        self.open_debloat_for(&device, cx);
+    }
+
+    /// Open the debloat view on one particular phone.
+    ///
+    /// The phone is named rather than taken from the selection, so the row in
+    /// the sidebar can open the right one whichever phone it belongs to.
+    fn open_debloat_for(&mut self, device: &str, cx: &mut Context<Self>) {
+        self.pane = Pane::Debloat;
+        let label = self
+            .devices
+            .iter()
+            .find(|d| d.serial == device)
+            .map(|d| d.display_name().to_string())
+            .unwrap_or_else(|| device.to_string());
+        self.debloat.update(cx, |d, cx| {
+            d.set_device_label(label, cx);
+            d.set_device(Some(device.to_string()), cx);
+        });
+        cx.notify();
+    }
+
+    /// Read a phone's package inventory, so the sidebar can say how much is
+    /// on it.
+    ///
+    /// Asked once per phone, not polled: the numbers are a hint about what is
+    /// there, and the pane is where the truth lives. The daemon caches the
+    /// reading, so opening the debloat view straight afterwards costs
+    /// nothing.
+    fn refresh_debloat_count(&mut self, device: &str, cx: &mut Context<Self>) {
+        if self.debloat_counts.contains_key(device) {
+            return;
+        }
+        let device = device.to_string();
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let result = daemon::list_packages(&device, DEBLOAT_USER).await;
+            me.update(cx, |this, cx| {
+                if let Ok(packages) = result {
+                    this.debloat_counts
+                        .insert(device.clone(), debloat_list::Counts::of(&packages));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the debloat view asked for.
+    fn on_debloat_event(&mut self, event: &DebloatEvent, cx: &mut Context<Self>) {
+        match event {
+            DebloatEvent::Apply { action, packages } => {
+                self.confirm_debloat(*action, packages.clone(), false, cx);
+            }
+            DebloatEvent::Undo => self.confirm_undo(cx),
+        }
+    }
+
+    /// Show what an action would do, before it does it.
+    fn confirm_debloat(
+        &mut self,
+        action: PackageActionDto,
+        packages: Vec<String>,
+        undo: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(device) = self.target_device() else {
+            self.toasts
+                .push("Pick a phone in the sidebar first", ToastTone::Info);
+            return;
+        };
+        if packages.is_empty() {
+            return;
+        }
+        let (shown, breaks) = {
+            let view = self.debloat.read(cx);
+            let shown = view
+                .rows_for(&packages)
+                .iter()
+                .map(|row| DebloatPackage {
+                    id: row.id.clone(),
+                    description: row.description.clone(),
+                    risk: row.removal,
+                    system: row.system,
+                    needed_by: row.needed_by.clone(),
+                })
+                .collect();
+            (shown, view.broken_by_removing(&packages))
+        };
+        self.dialog = Dialog::DebloatConfirm {
+            device,
+            action,
+            actions: crate::views::debloat::requests(action, &packages),
+            packages: shown,
+            breaks,
+            undo,
+        };
+        cx.notify();
+    }
+
+    /// Show what putting back the ledger's changes would do.
+    fn confirm_undo(&mut self, cx: &mut Context<Self>) {
+        let Some(device) = self.target_device() else {
+            self.toasts
+                .push("Pick a phone in the sidebar first", ToastTone::Info);
+            return;
+        };
+        let records = history::undoable(&device, DEBLOAT_USER);
+        if records.is_empty() {
+            self.toasts
+                .push("Nothing on this phone to put back", ToastTone::Info);
+            return;
+        }
+        // One request per package, using the most recent change for each, and
+        // the opposite of what that change did.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut actions: Vec<PackageRequestDto> = Vec::new();
+        let mut packages: Vec<String> = Vec::new();
+        for record in &records {
+            if !seen.insert(record.package.clone()) {
+                continue;
+            }
+            let Some(action) = action_from_name(&record.action) else {
+                continue;
+            };
+            packages.push(record.package.clone());
+            actions.push(PackageRequestDto {
+                package: record.package.clone(),
+                action: action.inverse(),
+            });
+        }
+        if actions.is_empty() {
+            self.toasts
+                .push("Nothing on this phone to put back", ToastTone::Info);
+            return;
+        }
+        let (shown, breaks) = {
+            let view = self.debloat.read(cx);
+            let shown = view
+                .rows_for(&packages)
+                .iter()
+                .map(|row| DebloatPackage {
+                    id: row.id.clone(),
+                    description: row.description.clone(),
+                    risk: row.removal,
+                    system: row.system,
+                    needed_by: row.needed_by.clone(),
+                })
+                .collect();
+            (shown, view.broken_by_removing(&packages))
+        };
+        self.dialog = Dialog::DebloatConfirm {
+            device,
+            action: PackageActionDto::Enable,
+            actions,
+            packages: shown,
+            breaks,
+            undo: true,
+        };
+        cx.notify();
+    }
+
+    /// Carry out a batch of package changes.
+    fn run_debloat(&mut self, actions: Vec<PackageRequestDto>, cx: &mut Context<Self>) {
+        let Some(device) = self.target_device() else {
+            return;
+        };
+        if actions.is_empty() {
+            return;
+        }
+        let count = actions.len();
+        self.dialog = Dialog::DebloatWorking { count };
+        cx.notify();
+
+        let packages: Vec<String> = actions.iter().map(|a| a.package.clone()).collect();
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let result = daemon::apply_package_actions(&device, DEBLOAT_USER, &actions).await;
+            me.update(cx, |this, cx| match result {
+                Ok(results) => this.on_debloat_results(&device, &packages, &actions, results, cx),
+                Err(err) => {
+                    this.dialog = Dialog::Message {
+                        title: "Could not change the packages".into(),
+                        body: err,
+                        tone: MessageTone::Error,
+                        extra: None,
+                    };
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What a batch of package changes actually did.
+    fn on_debloat_results(
+        &mut self,
+        device: &str,
+        packages: &[String],
+        actions: &[PackageRequestDto],
+        results: Vec<PackageResultDto>,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.debloat.read(cx).states_for(packages);
+        let mut done: Vec<String> = Vec::new();
+        let mut failed: Vec<DebloatFailure> = Vec::new();
+        let mut states: Vec<(String, String)> = Vec::new();
+
+        for (index, result) in results.iter().enumerate() {
+            let action = actions
+                .get(index)
+                .map(|a| a.action)
+                .unwrap_or(PackageActionDto::Disable);
+            let was = before
+                .iter()
+                .find(|(id, _)| *id == result.package)
+                .map(|(_, state)| state.clone())
+                .unwrap_or_default();
+            if result.ok {
+                done.push(result.package.clone());
+                if let Some(state) = &result.state {
+                    states.push((result.package.clone(), state.clone()));
+                }
+            } else {
+                failed.push(DebloatFailure {
+                    id: result.package.clone(),
+                    code: result.code.clone(),
+                    message: result.message.clone(),
+                });
+            }
+            // Every change goes in the ledger, so it can be put back.
+            history::record_change(history::DebloatRecord {
+                when: chrono::Utc::now().to_rfc3339(),
+                device: device.to_string(),
+                user: DEBLOAT_USER,
+                package: result.package.clone(),
+                action: action.name().to_string(),
+                before: was,
+                after: result.state.clone().unwrap_or_default(),
+                ok: result.ok,
+                error: result.message.clone(),
+            });
+        }
+
+        let verb = actions.first().map(|a| a.action.past()).unwrap_or_default();
+        let status = if failed.is_empty() {
+            format!("{verb} {} package(s)", done.len())
+        } else {
+            format!("{verb} {} package(s), {} failed", done.len(), failed.len())
+        };
+        self.debloat.update(cx, |d, cx| {
+            d.note_states(&states, cx);
+            d.set_status(Some(status), cx);
+        });
+        // The phone now has a different number of apps on it, so the sidebar's
+        // figure is stale.
+        if let Some(device) = self.target_device() {
+            self.debloat_counts.remove(&device);
+            self.refresh_debloat_count(&device, cx);
+        }
+        self.dialog = Dialog::DebloatResult {
+            action: actions
+                .first()
+                .map(|a| a.action)
+                .unwrap_or(PackageActionDto::Disable),
+            done,
+            failed,
+        };
+        cx.notify();
+    }
+
+    /// Route dropped or picked paths: APKs go to the install dialogs, the
+    /// rest back to the caller for the ordinary transfer path. Returns the
+    /// non-APK remainder (empty when everything was routed).
+    fn route_apks(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) -> Vec<PathBuf> {
+        let (apks, rest): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| apk::is_apk(p));
+        if apks.is_empty() {
+            return rest;
+        }
+        let Some(device) = self.target_device() else {
+            // No phone: leave APKs with the ordinary copy path.
+            return apks.into_iter().chain(rest).collect();
+        };
+        match apks.len() {
+            1 => {
+                let only = apks.into_iter().next().unwrap();
+                self.open_sideload(only, device, cx);
+            }
+            _ => {
+                self.dialog = Dialog::SideloadBatch {
+                    items: apks
+                        .iter()
+                        .map(|p| BatchItem {
+                            name: file_name_of(p),
+                            local: p.clone(),
+                            state: ItemState::Queued,
+                        })
+                        .collect(),
+                    device,
+                };
+            }
+        }
+        cx.notify();
+        rest
+    }
+
+    /// Open the rich pre-install card and start the manifest read in the
+    /// background; the card fills in when it lands.
+    fn open_sideload(&mut self, local: PathBuf, device: String, cx: &mut Context<Self>) {
+        let device_abi = self
+            .devices
+            .iter()
+            .find(|d| d.serial == device)
+            .and_then(|d| d.abi.clone());
+        self.dialog = Dialog::SideloadApk {
+            info: None,
+            parse_error: None,
+            installed: None,
+            device: device.clone(),
+            device_abi,
+            can_copy: true,
+            local: local.clone(),
+        };
+        cx.notify();
+
+        let me = cx.entity();
+        self.off_thread(
+            cx,
+            move || apk::apk_info(&local),
+            move |result, cx| {
+                me.update(cx, |this, cx| {
+                    // Only fill the card if the user has not moved on to a
+                    // different dialog meanwhile.
+                    if !matches!(&this.dialog, Dialog::SideloadApk { .. }) {
+                        return;
+                    }
+                    match result {
+                        Ok(info) => {
+                            let wanted = info.package.clone();
+                            if let Dialog::SideloadApk { info: slot, .. } = &mut this.dialog {
+                                *slot = Some(info.clone());
+                            }
+                            if let Some(watch) = &mut this.install_watch
+                                && watch.package.is_none()
+                            {
+                                watch.package = Some(wanted.clone());
+                                watch.version = info.version_name.clone();
+                            }
+                            // Now ask the device what it has for this package.
+                            let device = this.target_device().unwrap_or_default();
+                            let me = cx.entity();
+                            cx.spawn(async move |_this, cx| {
+                                let installed: Result<crate::protocol::PackageInfoDto, String> =
+                                    if wanted.is_empty() {
+                                        Err("no package name".into())
+                                    } else {
+                                        daemon::package_info(&device, &wanted).await
+                                    };
+                                me.update(cx, |this, cx| {
+                                    if let Dialog::SideloadApk {
+                                        installed: slot, ..
+                                    } = &mut this.dialog
+                                    {
+                                        *slot = installed.ok();
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .detach();
+                        }
+                        Err(err) => {
+                            if let Dialog::SideloadApk { parse_error, .. } = &mut this.dialog {
+                                *parse_error = Some(err.to_string());
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        );
+    }
+
+    fn install_apk(&mut self, entry: DirEntry, cx: &mut Context<Self>) {
+        // An APK already on the device installs from there, with a plain
+        // confirm — the manifest read would cost a pull, and the file name is
+        // usually enough to go on. One on the computer gets the rich card.
+        if self.browser.read(cx).is_local() {
+            let local = self.browser.read(cx).full_path(&entry);
+            let Some(device) = self.target_device() else {
+                self.toasts
+                    .push("Pick a phone in the sidebar to install on", ToastTone::Info);
+                cx.notify();
+                return;
+            };
+            self.open_sideload(local, device, cx);
             return;
         }
         let Some(device) = self.target_device() else {
@@ -2079,43 +2729,190 @@ impl AdbShareApp {
             .full_path(&entry)
             .to_string_lossy()
             .to_string();
-        self.run_install(device, path, cx);
+        // `device` only proves one is connected; the handler re-resolves it.
+        let _ = &device;
+        self.dialog = Dialog::ConfirmDeviceInstall {
+            name: entry.name.clone(),
+            device_path: path.clone(),
+        };
+        cx.notify();
     }
 
-    fn run_install(&mut self, device: String, path: String, cx: &mut Context<Self>) {
+    /// Begin a background install and open the progress dialog.
+    fn run_install(
+        &mut self,
+        device: String,
+        path: String,
+        package: Option<String>,
+        version: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let label = file_name_of(Path::new(&path));
         let me = cx.entity();
-        let label = PathBuf::from(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.clone());
         cx.spawn(async move |_this, cx| {
-            let result = daemon::install_apk(&device, &path).await;
+            let result = daemon::start_install(&device, &path).await;
             me.update(cx, |this, cx| {
-                // Installing can take a while and its result matters, so it gets
-                // a dialog rather than a toast the user may have missed.
-                this.dialog = match result {
-                    Ok(ok) if ok.trim().is_empty() || ok == "ok" => Dialog::Message {
-                        title: "Installed".into(),
-                        body: format!("{label} is on the phone."),
-                        tone: MessageTone::Success,
-                        extra: None,
-                    },
-                    Ok(ok) => Dialog::Message {
-                        title: "Installed".into(),
-                        body: format!("{label}: {ok}"),
-                        tone: MessageTone::Success,
-                        extra: None,
-                    },
-                    Err(err) => Dialog::Message {
-                        title: "Could not install".into(),
-                        body: format!("{label}: {err}"),
-                        tone: MessageTone::Error,
-                        extra: None,
-                    },
-                };
+                match result {
+                    Ok(id) => {
+                        // Installing can take a while and its result matters,
+                        // so it gets a dialog rather than a toast the user may
+                        // have missed. The poll loop drives the progress bar.
+                        this.install_watch = Some(InstallWatch {
+                            id,
+                            device: device.clone(),
+                            source: path.clone(),
+                            package: package.clone(),
+                            version: version.clone(),
+                        });
+                        this.dialog = Dialog::Installing {
+                            label,
+                            status: None,
+                        };
+                    }
+                    Err(err) => {
+                        this.dialog = Dialog::InstallFailed {
+                            label: label.clone(),
+                            code: None,
+                            message: Some(err),
+                            raw: None,
+                            device: device.clone(),
+                            package: None,
+                            path: path.clone(),
+                            from_device: !Path::new(&path).exists(),
+                        };
+                    }
+                }
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Poll result for installs. Only the watched one matters; the dialog is
+    /// updated in place and turned into a success or recovery card at the end.
+    fn on_installs_result(
+        &mut self,
+        result: Result<Vec<crate::protocol::InstallStatusDto>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(watch) = self.install_watch.clone() else {
+            return;
+        };
+        let Ok(statuses) = result else {
+            return;
+        };
+        let Some(status) = statuses.iter().find(|s| s.id == watch.id).cloned() else {
+            return;
+        };
+        if !status.finished {
+            if let Dialog::Installing { status: slot, .. } = &mut self.dialog {
+                *slot = Some(status);
+                cx.notify();
+            }
+            return;
+        }
+
+        // Terminal state: history first, then the dialog.
+        self.install_watch = None;
+        history::record(history::InstallRecord {
+            when: chrono::Utc::now().to_rfc3339(),
+            package: watch.package.clone().unwrap_or_else(|| "unknown".into()),
+            version: watch.version.clone(),
+            source: watch.source.clone(),
+            device: watch.device.clone(),
+            success: status.is_done(),
+            error: if status.is_done() {
+                None
+            } else {
+                status.message.clone()
+            },
+        });
+        self.dialog = if status.is_done() {
+            Dialog::Message {
+                title: "Installed".into(),
+                body: format!("{} is on the phone.", status.label),
+                tone: MessageTone::Success,
+                extra: None,
+            }
+        } else {
+            Dialog::InstallFailed {
+                label: status.label.clone(),
+                code: status.error_code.clone(),
+                message: status.message.clone(),
+                raw: status.raw.clone(),
+                device: watch.device.clone(),
+                package: watch.package.clone(),
+                path: watch.source.clone(),
+                from_device: status.from_device,
+            }
+        };
+        cx.notify();
+    }
+
+    /// Batch: run every queued item's install in sequence, updating the batch
+    /// card's rows as each goes.
+    fn run_batch(&mut self, device: String, items: Vec<BatchItem>, cx: &mut Context<Self>) {
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            for item in items {
+                match daemon::start_install(&device, &item.local.to_string_lossy()).await {
+                    Ok(id) => {
+                        // Poll this one to completion before the next starts;
+                        // the daemon runs one install at a time anyway.
+                        loop {
+                            cx.background_executor().timer(JOB_POLL).await;
+                            let statuses = daemon::install_status_all().await.unwrap_or_default();
+                            let status = statuses.iter().find(|s| s.id == id).cloned();
+                            let finished = status.as_ref().map(|s| s.finished).unwrap_or(true);
+                            let st = status.clone();
+                            me.update(cx, |this, cx| {
+                                if let Dialog::SideloadBatch { items: rows, .. } = &mut this.dialog
+                                    && let Some(row) =
+                                        rows.iter_mut().find(|r| r.local == item.local)
+                                {
+                                    row.state = match st {
+                                        None => ItemState::Failed {
+                                            code: None,
+                                            message: Some(
+                                                "the install disappeared from the queue".into(),
+                                            ),
+                                        },
+                                        Some(s) if s.is_done() => ItemState::Succeeded,
+                                        Some(s) if s.finished => ItemState::Failed {
+                                            code: s.error_code.clone(),
+                                            message: s.message.clone(),
+                                        },
+                                        Some(s) => ItemState::Running {
+                                            percent: s.percent,
+                                            state: s.state.clone(),
+                                        },
+                                    };
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                            if finished {
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        me.update(cx, |this, cx| {
+                            if let Dialog::SideloadBatch { items: rows, .. } = &mut this.dialog
+                                && let Some(row) = rows.iter_mut().find(|r| r.local == item.local)
+                            {
+                                row.state = ItemState::Failed {
+                                    code: None,
+                                    message: Some(err.clone()),
+                                };
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                }
+            }
         })
         .detach();
     }
@@ -2243,17 +3040,115 @@ impl AdbShareApp {
                 }
             }
             DialogResult::InstallApk(path) => {
+                // The card read the manifest, so it knows the package name.
+                // It is taken before the dialog is cleared: the manifest
+                // read almost always finishes before the user clicks, and
+                // waiting for it here would race the click.
+                let (package, version) = match &self.dialog {
+                    Dialog::SideloadApk {
+                        info: Some(info), ..
+                    } => (Some(info.package.clone()), info.version_name.clone()),
+                    _ => (None, None),
+                };
                 self.dialog = Dialog::None;
                 if let Some(device) = self.target_device() {
-                    self.run_install(device, path.to_string_lossy().to_string(), cx);
+                    self.run_install(
+                        device,
+                        path.to_string_lossy().to_string(),
+                        package,
+                        version,
+                        cx,
+                    );
                 }
             }
             DialogResult::CopyApk(path) => {
                 self.dialog = Dialog::None;
                 self.copy_apk_to_device(path.clone(), cx);
             }
+            DialogResult::InstallFromDevice(device_path) => {
+                self.dialog = Dialog::None;
+                if let Some(device) = self.target_device() {
+                    self.run_install(device, device_path.clone(), None, None, cx);
+                }
+            }
+            DialogResult::UninstallAndRetry {
+                device,
+                package,
+                path,
+                from_device,
+            } => {
+                self.dialog = Dialog::None;
+                self.uninstall_and_retry(
+                    device.clone(),
+                    package.clone(),
+                    path.clone(),
+                    *from_device,
+                    cx,
+                );
+            }
+            DialogResult::InstallAll => {
+                // The batch dialog owns the item list; read it back from
+                // there so the buttons can never act on stale state.
+                let items = match &self.dialog {
+                    Dialog::SideloadBatch { items, .. } => items.clone(),
+                    _ => Vec::new(),
+                };
+                self.dialog = Dialog::None;
+                if let Some(device) = self.target_device() {
+                    self.run_batch(device, items, cx);
+                }
+            }
+            DialogResult::CopyAll => {
+                let items = match &self.dialog {
+                    Dialog::SideloadBatch { items, .. } => items.clone(),
+                    _ => Vec::new(),
+                };
+                self.dialog = Dialog::None;
+                if self.target_device().is_some() {
+                    for item in items {
+                        self.copy_apk_to_device(item.local, cx);
+                    }
+                }
+            }
+            DialogResult::DebloatApply { actions } => {
+                self.dialog = Dialog::None;
+                self.run_debloat(actions.clone(), cx);
+            }
         }
         cx.notify();
+    }
+
+    /// Recovery for a signature-mismatch failure: remove what is installed,
+    /// then run the same install again. Deleting an app destroys its data, so
+    /// this is only ever behind a button that says so.
+    fn uninstall_and_retry(
+        &mut self,
+        device: String,
+        package: String,
+        path: String,
+        _from_device: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let result = daemon::uninstall_package(&device, &package).await;
+            me.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.run_install(device, path, None, None, cx);
+                }
+                Err(err) => {
+                    this.dialog = Dialog::Message {
+                        title: "Could not uninstall".into(),
+                        body: format!("{package}: {err}"),
+                        tone: MessageTone::Error,
+                        extra: None,
+                    };
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn run_pair(&mut self, address: String, code: String, cx: &mut Context<Self>) {
@@ -2469,8 +3364,39 @@ impl AdbShareApp {
                 }
             }
             "install-apk" => {
-                if let Some(entry) = self.browser.read(cx).focused_entry() {
-                    self.install_apk(entry, cx);
+                // Every selected APK installs, not just the focused one;
+                // several at once go through the batch dialog.
+                let apks: Vec<DirEntry> = self
+                    .browser
+                    .read(cx)
+                    .selected()
+                    .iter()
+                    .filter(|e| e.ext() == "apk")
+                    .cloned()
+                    .collect();
+                match apks.len() {
+                    0 => {}
+                    1 => self.install_apk(apks[0].clone(), cx),
+                    _ => {
+                        if let Some(device) = self.target_device() {
+                            let locals: Vec<PathBuf> = apks
+                                .iter()
+                                .map(|e| self.browser.read(cx).full_path(e))
+                                .collect();
+                            self.dialog = Dialog::SideloadBatch {
+                                items: locals
+                                    .iter()
+                                    .map(|p| BatchItem {
+                                        name: file_name_of(p),
+                                        local: p.clone(),
+                                        state: ItemState::Queued,
+                                    })
+                                    .collect(),
+                                device,
+                            };
+                            cx.notify();
+                        }
+                    }
                 }
             }
             "open-terminal" => {
@@ -2537,6 +3463,7 @@ impl AdbShareApp {
                 }
             }
             "diagnostics" => self.open_diagnostics(cx),
+            "debloat" => self.open_debloat(cx),
             "shortcuts" => self.dialog = Dialog::Shortcuts,
             "about" => self.dialog = Dialog::About,
             "connect-wifi" => {
@@ -2617,6 +3544,16 @@ impl AdbShareApp {
                 Some("Ctrl+Shift+C"),
             ),
             MenuItem::Separator,
+            MenuItem::with_icon(
+                "debloat",
+                names::PACKAGE,
+                if self.pane == Pane::Debloat {
+                    "Browse files"
+                } else {
+                    "Debloat phone…"
+                },
+                Some("Ctrl+Shift+D"),
+            ),
             MenuItem::with_icon("open-external", names::FILE_MANAGER, "Open in Files", None),
             MenuItem::with_icon("open-terminal", names::TERMINAL, "Open in terminal", None),
             MenuItem::with_icon(
@@ -2758,10 +3695,15 @@ impl AdbShareApp {
             Some("Ctrl+U"),
         ));
         if has_apk {
+            let apk_count = selected.iter().filter(|e| e.ext() == "apk").count();
             items.push(MenuItem::with_icon(
                 "install-apk",
                 names::SOFTWARE_INSTALL,
-                "Install APK on phone",
+                if apk_count > 1 {
+                    format!("Install {apk_count} APKs on phone")
+                } else {
+                    "Install APK on phone".to_string()
+                },
                 None,
             ));
         }
@@ -2919,8 +3861,11 @@ impl AdbShareApp {
         }
 
         // The path bar, which doubles as the search box and the Ctrl+L path
-        // editor.
-        capsules.push(self.omnibar(t, cx));
+        // editor. It is about files, so it steps aside for the debloat view,
+        // which has its own search box.
+        if self.pane == Pane::Browser {
+            capsules.push(self.omnibar(t, cx));
+        }
 
         if self.layout.shows_ops() {
             let _browser = self.browser.clone();
@@ -3031,6 +3976,31 @@ impl AdbShareApp {
                                     browser.update(cx, |b, cx| b.flip_search(cx));
                                 }
                             },
+                        )
+                        .into_any_element(),
+                        ui::capsule_separator(t).into_any_element(),
+                        // The debloat view is a *view*, not an action, so it
+                        // gets a word rather than another glyph in a row of
+                        // them: a row of glyphs can only be read by hovering
+                        // each one, which is no way to find a feature you
+                        // have never heard of. It is also the only way back
+                        // out of the debloat pane, so it lives in the
+                        // toolbar rather than only in a menu.
+                        ui::capsule_button(
+                            t,
+                            "debloat",
+                            if self.pane == Pane::Debloat {
+                                names::FILE_MANAGER
+                            } else {
+                                names::PACKAGE
+                            },
+                            if self.pane == Pane::Debloat {
+                                "Files"
+                            } else {
+                                "Debloat"
+                            },
+                            self.pane == Pane::Debloat,
+                            cx.listener(|this, _e, _w, cx| this.toggle_pane(cx)),
                         )
                         .into_any_element(),
                     ],
@@ -3560,8 +4530,15 @@ impl AdbShareApp {
                         t,
                         device,
                         active,
+                        self.debloat_counts.get(&serial).copied(),
+                        {
+                            let serial = serial.clone();
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.select_device(&serial, cx);
+                            })
+                        },
                         cx.listener(move |this, _e, _w, cx| {
-                            this.select_device(&serial, cx);
+                            this.open_debloat_for(&serial, cx);
                         }),
                     )
                     .into_any_element(),
@@ -3760,7 +4737,9 @@ fn device_card(
     t: &theme::Palette,
     device: DeviceEntry,
     active: bool,
+    count: Option<debloat_list::Counts>,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    on_debloat: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     let mut head: Vec<AnyElement> = vec![
         icons::icon(
@@ -3854,6 +4833,54 @@ fn device_card(
                     .child(format_capacity((used, total))),
             );
     }
+
+    // The debloat row.
+    //
+    // Debloating is a phone-level thing, so it belongs on the phone's own
+    // card rather than in a menu nobody opens. The number is the hook, and
+    // it is the number of apps that can go *safely*, because "there are 381
+    // apps" is a fact and "214 safe to remove" is a reason to click.
+    let debloat_row = div()
+        .id(ui::el_id(format!("debloat:{}", device.serial.clone())))
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .mt(px(2.0))
+        .pt(px(6.0))
+        .border_t_1()
+        .border_color(t.border_soft)
+        .cursor_pointer()
+        .text_size(t.text(12.0))
+        .text_color(t.text_secondary)
+        .hover(|s| s.text_color(t.text_header))
+        .child(icons::icon(
+            names::PACKAGE,
+            14.0,
+            ui::icon_tint(names::PACKAGE, t),
+        ))
+        .child("Debloat")
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(t.text(10.5))
+                .text_color(t.text_muted)
+                .text_right()
+                .child(match count {
+                    Some(count) if count.recommended > 0 => {
+                        format!("{} safe to remove", count.recommended)
+                    }
+                    Some(count) if count.listed > 0 => format!("{} apps", count.listed),
+                    Some(_) => "nothing to remove".to_string(),
+                    None => String::new(),
+                }),
+        )
+        .on_click(on_debloat)
+        .tooltip(ui::hover_hint(
+            "See what is preinstalled on this phone, and remove it",
+        ));
+
+    card = card.child(debloat_row);
 
     card.on_click(on_click)
 }
@@ -4146,7 +5173,8 @@ impl Render for AdbShareApp {
         // "window not found" once per navigation.
         let target = {
             let browser = self.browser.read(cx);
-            window_title(self.dialog.heading(), browser.has_device(), browser.path())
+            let heading = self.dialog.heading();
+            window_title(&heading, browser.has_device(), browser.path())
         };
         if self.last_title.as_deref() != Some(target.as_str()) {
             window.set_window_title(&target);
@@ -4182,6 +5210,14 @@ impl Render for AdbShareApp {
         // starts after it.
         let divider = show_sidebar.then(|| self.sidebar_divider(&t, cx));
 
+        // The main pane is either the file browser or the debloat view. The
+        // browser is kept alive either way, so switching back is instant and
+        // its geometry does not go stale.
+        let pane: AnyElement = match self.pane {
+            Pane::Browser => self.browser.clone().into_any_element(),
+            Pane::Debloat => self.debloat.clone().into_any_element(),
+        };
+
         let body = div()
             .flex()
             .flex_1()
@@ -4190,7 +5226,7 @@ impl Render for AdbShareApp {
             .bg(t.canvas)
             .when(show_sidebar, |d| d.child(self.sidebar(&t, cx)))
             .when_some(divider, |d, divider| d.child(divider))
-            .child(self.browser.clone());
+            .child(pane);
 
         // `cx.listener` borrows the context, which the render tree below also
         // needs, so the emitters are rebuilt from a weak entity instead.
@@ -4246,43 +5282,6 @@ impl Render for AdbShareApp {
             .bg(t.canvas)
             .text_color(t.text_primary)
             .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &DismissOverlays, _w, cx| {
-                // Escape unwinds one layer at a time, outermost first, and only
-                // clears the selection once there is nothing left to close. The
-                // GTK build's dialogs were Escape-dismissable by default; this
-                // is the equivalent, decided in one place so no overlay has to
-                // remember to bind the key itself.
-                if !matches!(this.dialog, Dialog::None) {
-                    this.dialog = Dialog::None;
-                } else if this.context_menu.take().is_some() {
-                } else if this.overflow_open {
-                    this.overflow_open = false;
-                } else if this.transfers_open {
-                    this.transfers_open = false;
-                } else if this.browser.read(cx).path_entry_active() {
-                    this.browser.update(cx, |b, cx| b.close_path_entry(cx));
-                } else if this.browser.read(cx).search_active() {
-                    this.browser
-                        .update(cx, |b, cx| b.set_search_active(false, cx));
-                } else {
-                    let browser = this.browser.clone();
-                    browser.update(cx, |b, cx| b.clear_selection(cx));
-                }
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ShowAbout, _w, cx| {
-                this.dialog = crate::views::dialogs::Dialog::About;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &ShowDiagnostics, _w, cx| {
-                this.open_diagnostics(cx);
-            }))
-            .on_action(cx.listener(|this, _: &ConnectWifi, _w, cx| {
-                this.on_menu_select("connect-wifi", cx);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _w, cx| {
-                this.toggle_sidebar(cx);
-            }))
             .child(self.topbar(&t, cx))
             .child(self.search_row(&t, cx))
             .child(body)
@@ -4303,6 +5302,10 @@ impl Render for AdbShareApp {
 impl AdbShareApp {
     /// The search strip, shown only while search is active.
     fn search_row(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        // The debloat view has its own search box, in its own header.
+        if self.pane == Pane::Debloat {
+            return div().into_any_element();
+        }
         if !self.browser.read(cx).search_active() {
             return div().into_any_element();
         }

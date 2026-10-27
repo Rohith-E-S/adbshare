@@ -13,7 +13,10 @@ use std::time::Duration;
 use gpui::prelude::*;
 use zbus::names::WellKnownName;
 
-use crate::protocol::{DeviceInfoDto, DirEntry, DirEntryDto, JobDto, JobInfo, TransferPolicy};
+use crate::protocol::{
+    DeviceInfoDto, DirEntry, DirEntryDto, InstallStatusDto, JobDto, JobInfo, PackageDto,
+    PackageInfoDto, PackageRequestDto, PackageResultDto, TransferPolicy,
+};
 
 /// Bus name, object path and interface the daemon serves.
 const SERVICE: &str = "org.adbshare.Manager";
@@ -86,7 +89,17 @@ pub trait Manager {
     async fn delete(&self, device: &str, path: &str) -> zbus::Result<()>;
     async fn connect_wireless(&self, address: &str) -> zbus::Result<String>;
     async fn mountpoint_for(&self, device: &str) -> zbus::Result<String>;
-    async fn install_apk(&self, device: &str, path: &str) -> zbus::Result<String>;
+    async fn start_install(&self, device: &str, path: &str) -> zbus::Result<u64>;
+    async fn install_status_all(&self) -> zbus::Result<String>;
+    async fn package_info(&self, device: &str, package: &str) -> zbus::Result<String>;
+    async fn uninstall_package(&self, device: &str, package: &str) -> zbus::Result<()>;
+    async fn list_packages(&self, device: &str, user: u16) -> zbus::Result<String>;
+    async fn apply_package_actions(
+        &self,
+        device: &str,
+        user: u16,
+        actions: &str,
+    ) -> zbus::Result<String>;
 }
 
 /// Handle to the pinned tokio runtime.
@@ -541,11 +554,79 @@ pub async fn delete(device: &str, path: &str) -> Result<(), String> {
 }
 
 /// Install an APK from a local path onto a device.
-pub async fn install_apk(device: &str, path: &str) -> Result<String, String> {
+/// Kick off a background APK install; returns the id to poll with
+/// [`install_status_all`].
+pub async fn start_install(device: &str, path: &str) -> Result<u64, String> {
     let (device, path) = (device.to_string(), path.to_string());
     dispatch(move || async move {
         let proxy = get_manager().await?;
-        Ok(proxy.install_apk(&device, &path).await?)
+        Ok(proxy.start_install(&device, &path).await?)
+    })
+    .await
+}
+
+/// Every tracked install status, newest first.
+pub async fn install_status_all() -> Result<Vec<InstallStatusDto>, String> {
+    dispatch(|| async move {
+        let proxy = get_manager().await?;
+        let json = proxy.install_status_all().await?;
+        serde_json::from_str::<Vec<InstallStatusDto>>(&json)
+            .map_err(|e| anyhow::anyhow!("install_status_all decode: {e}"))
+    })
+    .await
+}
+
+/// What the device has installed for this package, cached on the daemon.
+pub async fn package_info(device: &str, package: &str) -> Result<PackageInfoDto, String> {
+    let (device, package) = (device.to_string(), package.to_string());
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        let json = proxy.package_info(&device, &package).await?;
+        serde_json::from_str::<PackageInfoDto>(&json)
+            .map_err(|e| anyhow::anyhow!("package_info decode: {e}"))
+    })
+    .await
+}
+
+/// Remove an installed package from a device.
+pub async fn uninstall_package(device: &str, package: &str) -> Result<(), String> {
+    let (device, package) = (device.to_string(), package.to_string());
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.uninstall_package(&device, &package).await?)
+    })
+    .await
+}
+
+/// Every package on the device, with the state it reports.
+pub async fn list_packages(device: &str, user: u16) -> Result<Vec<PackageDto>, String> {
+    let (device, user) = (device.to_string(), user);
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        let json = proxy.list_packages(&device, user).await?;
+        serde_json::from_str::<Vec<PackageDto>>(&json)
+            .map_err(|e| anyhow::anyhow!("list_packages decode: {e}"))
+    })
+    .await
+}
+
+/// Change the state of a batch of packages.
+///
+/// The daemon runs the calls a few at a time and returns one result per
+/// request, in the order the requests were given.
+pub async fn apply_package_actions(
+    device: &str,
+    user: u16,
+    requests: &[PackageRequestDto],
+) -> Result<Vec<PackageResultDto>, String> {
+    let (device, user) = (device.to_string(), user);
+    let payload =
+        serde_json::to_string(requests).map_err(|e| format!("encode package actions: {e}"))?;
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        let json = proxy.apply_package_actions(&device, user, &payload).await?;
+        serde_json::from_str::<Vec<PackageResultDto>>(&json)
+            .map_err(|e| anyhow::anyhow!("apply_package_actions decode: {e}"))
     })
     .await
 }

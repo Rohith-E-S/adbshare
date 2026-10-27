@@ -158,6 +158,41 @@ pub fn capsule_separator(t: &Palette) -> Div {
         .bg(t.capsule_border)
 }
 
+/// A capsule button with a word on it, not just a glyph.
+///
+/// A row of glyphs can only be read by hovering each one, which is no way to
+/// find a feature you have never heard of. The debloat view is one the user
+/// is meant to discover, so it gets a word.
+pub fn capsule_button(
+    t: &Palette,
+    id: impl Into<ElementId>,
+    icon: &'static str,
+    label: impl Into<gpui::SharedString>,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .h(px(theme::CAPSULE_BTN))
+        .px(px(8.0))
+        .rounded(px(theme::RADIUS_CAPSULE_BTN))
+        .cursor_pointer()
+        .text_size(t.text(12.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(if active {
+            t.text_header
+        } else {
+            t.text_secondary
+        })
+        .hover(|s| s.bg(t.hover).text_color(t.text_header))
+        .child(icons::icon(icon, 14.0, icon_tint(icon, t)))
+        .child(label.into())
+        .on_click(on_click)
+}
+
 /// The destructive variant of a dialog button.
 pub fn danger_button(
     t: &Palette,
@@ -431,13 +466,13 @@ pub fn menu_row(
         .gap(px(10.0))
         .w_full()
         .px(px(12.0))
-        .py(px(7.0))
+        .py(px(5.5))
         .cursor_pointer()
-        .text_size(t.text(14.0))
+        .text_size(t.text(12.0))
         .text_color(if danger { t.danger } else { fg })
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
         .when_some(icon, |d, icon| {
-            d.child(icons::icon_or_art(icon, 15.0, icon_tint(icon, t)))
+            d.child(icons::icon_or_art(icon, 14.0, icon_tint(icon, t)))
         })
         .child(label.to_string())
         .on_click(on_click)
@@ -467,14 +502,14 @@ pub fn menu_check(
         .gap(px(10.0))
         .w_full()
         .px(px(12.0))
-        .py(px(7.0))
+        .py(px(5.5))
         .cursor_pointer()
-        .text_size(t.text(14.0))
+        .text_size(t.text(12.0))
         .text_color(t.text_secondary)
         .hover(|s| s.bg(t.hover).text_color(t.text_header))
         .child(icons::icon_or_art(
             icon,
-            15.0,
+            14.0,
             if checked {
                 icon_tint(icon, t)
             } else {

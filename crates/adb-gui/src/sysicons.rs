@@ -378,17 +378,27 @@ fn theme_chain() -> &'static [PathBuf] {
     })
 }
 
-/// Raster sizes to try, nearest first.
+/// Standard raster sizes found in freedesktop icon themes.
+const STANDARD_SIZES: &[u32] = &[16, 22, 24, 32, 48, 64, 96, 128, 256, 512];
+
+/// Raster sizes to try, closest to `want` without upscaling first.
 ///
-/// Themes do not carry every size for every icon, and a theme that only ships
-/// 48x48 is still a better answer than the generic page. So this walks down to
-/// 16 and then back up, rather than demanding an exact match — and it stops at
-/// 16 because below that every `text-x-*` glyph is an unreadable smudge.
+/// Themes do not carry every size for every icon. To ensure the GPU downsamples
+/// rather than upsampling (which causes blurry, pixelated icons), we try rasters
+/// >= want in ascending order first, then fall back to smaller rasters descending to 16.
 fn size_ladder(want: u32) -> Vec<u32> {
-    let want = want.clamp(16, 256);
-    let down = (1..=want / 16).rev().map(|n| n * 16);
-    let up = (want / 16 + 1..=256 / 16).map(|n| n * 16);
-    down.chain(up).collect()
+    let mut ladder = Vec::with_capacity(STANDARD_SIZES.len());
+    for &s in STANDARD_SIZES {
+        if s >= want {
+            ladder.push(s);
+        }
+    }
+    for &s in STANDARD_SIZES.iter().rev() {
+        if s < want {
+            ladder.push(s);
+        }
+    }
+    ladder
 }
 
 /// The first raster of `name` any installed theme provides.
@@ -425,18 +435,20 @@ fn find_in(theme_dirs: &[PathBuf], name: &str, want: u32) -> Option<PathBuf> {
                 continue;
             }
             for size in size_ladder(want) {
-                let size_dir = theme_dir.join(format!("{size}x{size}"));
-                let Ok(entries) = std::fs::read_dir(&size_dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    // The size directory itself may hold the file outright.
-                    if entry.file_name() == file.as_str() {
-                        return Some(entry.path());
-                    }
-                    let sub = entry.path();
-                    if sub.is_dir() && sub.join(&file).is_file() {
-                        return Some(sub.join(&file));
+                for dir_name in [format!("{size}x{size}"), format!("{size}x{size}@2x")] {
+                    let size_dir = theme_dir.join(dir_name);
+                    let Ok(entries) = std::fs::read_dir(&size_dir) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        // The size directory itself may hold the file outright.
+                        if entry.file_name() == file.as_str() {
+                            return Some(entry.path());
+                        }
+                        let sub = entry.path();
+                        if sub.is_dir() && sub.join(&file).is_file() {
+                            return Some(sub.join(&file));
+                        }
                     }
                 }
             }
@@ -479,7 +491,8 @@ fn icon_bytes(name: &'static str, want: u32) -> Option<Arc<Vec<u8>>> {
 /// match so the GPU downsamples instead of the CPU upsampling.
 pub fn element(ext: &str, mode: u32, size: f32, path: &std::path::Path) -> Option<AnyElement> {
     let name = name_for_path(ext, mode, path)?;
-    let want = size.round().max(16.0) as u32;
+    // Request at 2x logical size so HiDPI screens downsample crisp rasters rather than upscaling.
+    let want = (size * 2.0).round().max(32.0) as u32;
     let bytes = icon_bytes(name, want)?;
     // The bytes came from a `.png`, so the format is not a guess.
     let image = Arc::new(Image::from_bytes(ImageFormat::Png, (*bytes).clone()));
@@ -624,17 +637,13 @@ mod tests {
     fn the_size_ladder_prefers_the_nearest_raster() {
         let ladder = size_ladder(128);
         assert_eq!(ladder[0], 128);
-        // Descends to 16, then climbs: the near rasters first, then whatever is
-        // larger, in that order.
-        let floor = ladder.iter().position(|s| *s == 16).expect("reaches 16");
-        assert!(
-            ladder[..=floor].windows(2).all(|w| w[0] > w[1]),
-            "must descend to 16"
-        );
-        assert!(
-            ladder[floor + 1..].windows(2).all(|w| w[0] < w[1]),
-            "must climb after 16"
-        );
+        // Rasters >= 128 come first (ascending for downsampling), then smaller rasters descending.
+        let smaller = ladder
+            .iter()
+            .position(|s| *s < 128)
+            .expect("has smaller rasters");
+        assert!(ladder[..smaller].iter().all(|s| *s >= 128));
+        assert!(ladder[smaller..].iter().all(|s| *s < 128));
         // 128 is missing from some themes and 64 is where it lands.
         assert!(ladder.contains(&64));
         // Never below 16: every text-x-* glyph turns to mush.

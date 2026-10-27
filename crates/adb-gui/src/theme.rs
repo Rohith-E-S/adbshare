@@ -355,6 +355,40 @@ pub fn text_scale_step(scale: f32) -> usize {
         .unwrap_or(TEXT_DEFAULT_STEP)
 }
 
+// ── Geometry tokens ──────────────────────────────────────────────────────────
+// The GTK stylesheet expressed these as literal `min-height` / `padding` /
+// `border-radius` values per rule; hoisting them keeps the builders below
+// consistent with each other.
+
+/// The window the app opens at, and the basis for the benchmarks' geometry.
+pub const WINDOW_W: f32 = 1000.0;
+pub const WINDOW_H: f32 = 680.0;
+/// The smallest useful window.
+pub const WINDOW_MIN_W: f32 = 360.0;
+pub const WINDOW_MIN_H: f32 = 400.0;
+/// Height of the top bar.
+pub const TOPBAR_H: f32 = 45.0;
+/// Height of the breadcrumb / path capsule.
+pub const CAPSULE_H: f32 = 34.0;
+/// Edge length of a square icon button inside a capsule.
+pub const CAPSULE_BTN: f32 = 30.0;
+/// Corner radius of a capsule container.
+pub const RADIUS_CAPSULE: f32 = 10.0;
+/// Corner radius of a button inside a capsule.
+pub const RADIUS_CAPSULE_BTN: f32 = 7.0;
+/// Corner radius of a sidebar row.
+pub const RADIUS_ROW: f32 = 8.0;
+/// Corner radius of a device card.
+pub const RADIUS_CARD: f32 = 12.0;
+/// Corner radius of an omnibar / context bar.
+pub const RADIUS_BAR: f32 = 10.0;
+/// Height of the bottom status strip.
+pub const STATUSBAR_H: f32 = 30.0;
+/// Full-pill radius, used for badges and LEDs.
+pub const RADIUS_PILL: f32 = 9999.0;
+/// Monospace stack used for paths, counts and status lines.
+pub const MONO: &str = "JetBrains Mono, DejaVu Sans Mono, monospace";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,37 +450,3 @@ mod tests {
         assert_eq!(f32::from(t.text(10.0)), 13.0);
     }
 }
-
-// ── Geometry tokens ──────────────────────────────────────────────────────────
-// The GTK stylesheet expressed these as literal `min-height` / `padding` /
-// `border-radius` values per rule; hoisting them keeps the builders below
-// consistent with each other.
-
-/// The window the app opens at, and the basis for the benchmarks' geometry.
-pub const WINDOW_W: f32 = 1000.0;
-pub const WINDOW_H: f32 = 680.0;
-/// The smallest useful window.
-pub const WINDOW_MIN_W: f32 = 360.0;
-pub const WINDOW_MIN_H: f32 = 400.0;
-/// Height of the top bar.
-pub const TOPBAR_H: f32 = 45.0;
-/// Height of the breadcrumb / path capsule.
-pub const CAPSULE_H: f32 = 34.0;
-/// Edge length of a square icon button inside a capsule.
-pub const CAPSULE_BTN: f32 = 30.0;
-/// Corner radius of a capsule container.
-pub const RADIUS_CAPSULE: f32 = 10.0;
-/// Corner radius of a button inside a capsule.
-pub const RADIUS_CAPSULE_BTN: f32 = 7.0;
-/// Corner radius of a sidebar row.
-pub const RADIUS_ROW: f32 = 8.0;
-/// Corner radius of a device card.
-pub const RADIUS_CARD: f32 = 12.0;
-/// Corner radius of an omnibar / context bar.
-pub const RADIUS_BAR: f32 = 10.0;
-/// Height of the bottom status strip.
-pub const STATUSBAR_H: f32 = 30.0;
-/// Full-pill radius, used for badges and LEDs.
-pub const RADIUS_PILL: f32 = 9999.0;
-/// Monospace stack used for paths, counts and status lines.
-pub const MONO: &str = "JetBrains Mono, DejaVu Sans Mono, monospace";

@@ -31,3 +31,12 @@ unicode-segmentation = "1.12"
 image = "0.25"
 md-5 = "0.10"
 crc32fast = "1.5"
+# Reading AndroidManifest.xml out of an APK needs deflate; flate2 is already in
+# Cargo.lock as a transitive dependency of gpui, so naming it directly costs no
+# new download. The ZIP container is walked by hand (see state/apk.rs): APKs are
+# tens of megabytes and only one small file is needed, which a full zip crate
+# solution would pull in a lot of machinery for.
+flate2 = "1"
+
+[features]
+axmldebug = []

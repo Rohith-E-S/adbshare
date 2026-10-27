@@ -26,6 +26,23 @@ adb-proxy-device:
 build:
 	$(CARGO) build --release --workspace
 
+# Refresh the bundled debloat list from upstream. The list is a snapshot of
+# the Universal Android Debloater Next Generation project's package list
+# (GPL-3.0; see crates/adb-gui/assets/debloat/NOTICE). It is bundled rather
+# than fetched at runtime so that adbshare never has to reach the network.
+LIST_URL := https://raw.githubusercontent.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation/main/resources/assets/uad_lists.json
+LIST_DIR := crates/adb-gui/assets/debloat
+LIST_TMP := $(LIST_DIR)/uad_lists.json
+
+.PHONY: debloat-list
+debloat-list:
+	@echo "==> Fetching the debloat list"
+	@curl -fsSL "$(LIST_URL)" -o "$(LIST_TMP)"
+	@echo "==> Compressing it"
+	@gzip -9 -n -c "$(LIST_TMP)" > "$(LIST_DIR)/uad_lists.json.gz"
+	@rm "$(LIST_TMP)"
+	@ls -la "$(LIST_DIR)"
+
 .PHONY: clean
 clean:
 	$(CARGO) clean

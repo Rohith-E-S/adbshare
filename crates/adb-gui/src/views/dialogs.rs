@@ -16,7 +16,12 @@ use gpui::prelude::*;
 use gpui::{AnyElement, Entity, SharedString, Styled, Window, div, px, relative};
 
 use crate::icons::{self, names};
-use crate::protocol::{DiagnosticReportDto, DirEntry, format_diagnostics, human_size};
+use crate::protocol::{
+    DiagnosticReportDto, DirEntry, InstallStatusDto, PackageActionDto, PackageInfoDto,
+    PackageRequestDto, StateTone, format_diagnostics, human_size,
+};
+use crate::state::apk::ApkInfo;
+use crate::state::debloat::Removal;
 use crate::theme::{self, Palette};
 use crate::views::textinput::TextField;
 use crate::views::ui;
@@ -105,9 +110,82 @@ pub enum Dialog {
         report: DiagnosticReportDto,
     },
     /// A picked or dropped `.apk`: install it, or just copy it across.
+    ///
+    /// The manifest is read while the dialog is open, in the background; the
+    /// fields the card shows arrive through `info` once it lands.
     SideloadApk {
-        name: String,
         local: PathBuf,
+        /// Parsed manifest. None until the background read finishes, or when
+        /// it failed — see `parse_error`.
+        info: Option<ApkInfo>,
+        /// Why the manifest could not be read, when it could not.
+        parse_error: Option<String>,
+        /// What the device has installed for this package, if anything.
+        installed: Option<PackageInfoDto>,
+        /// Device the install would go to.
+        device: String,
+        /// The device's primary ABI, for the native-libs warning.
+        device_abi: Option<String>,
+        /// Whether "Copy across" applies (host-local files only).
+        can_copy: bool,
+    },
+    /// An install in flight, with live progress from the daemon. The daemon's
+    /// install id lives in the app's `install_watch`; the dialog only renders.
+    Installing {
+        label: String,
+        status: Option<InstallStatusDto>,
+    },
+    /// An APK already on the device, opened from its browser. Installing from
+    /// there is one click, so a plain confirm replaces the rich card.
+    ConfirmDeviceInstall {
+        name: String,
+        device_path: String,
+    },
+    /// Several APKs dropped or picked at once.
+    SideloadBatch {
+        /// The dialog owns this list; the app reads it back through
+        /// `self.dialog` when "Install all" or "Copy all" is pressed.
+        items: Vec<BatchItem>,
+        device: String,
+    },
+    /// An install failed, with classified advice and recovery actions.
+    InstallFailed {
+        label: String,
+        code: Option<String>,
+        message: Option<String>,
+        raw: Option<String>,
+        device: String,
+        /// Package name, when known — the uninstall-and-retry action needs it.
+        package: Option<String>,
+        path: String,
+        from_device: bool,
+    },
+    /// What is about to happen to a batch of packages.
+    DebloatConfirm {
+        device: String,
+        /// The headline, e.g. "Disable".
+        action: PackageActionDto,
+        /// What will actually run, one entry per package.
+        actions: Vec<PackageRequestDto>,
+        /// The packages the action applies to.
+        packages: Vec<DebloatPackage>,
+        /// Apps that would be left broken by this, and are not in the
+        /// selection.
+        breaks: Vec<String>,
+        /// True when this is putting back what a previous session changed.
+        undo: bool,
+    },
+    /// A batch of package changes in flight.
+    DebloatWorking {
+        count: usize,
+    },
+    /// What a batch of package changes actually did.
+    DebloatResult {
+        action: PackageActionDto,
+        /// The packages that changed.
+        done: Vec<String>,
+        /// The packages that did not, with the reason.
+        failed: Vec<DebloatFailure>,
     },
     Message {
         title: String,
@@ -126,34 +204,110 @@ pub enum Dialog {
     About,
 }
 
+/// One row of the batch install dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchItem {
+    pub name: String,
+    pub local: PathBuf,
+    pub state: ItemState,
+}
+
+/// One package in a batch of changes, as the confirmation card shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebloatPackage {
+    pub id: String,
+    /// The curated list's description of the app.
+    pub description: Option<String>,
+    /// The curated list's risk tier, when it has one.
+    pub risk: Option<Removal>,
+    /// True when the app is on the system's read-only partition.
+    pub system: bool,
+    /// Other packages that need this one.
+    pub needed_by: Vec<String>,
+}
+
+/// A package that could not be changed, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebloatFailure {
+    pub id: String,
+    /// A classified reason, e.g. `system_uninstall_blocked`.
+    pub code: Option<String>,
+    /// A sentence a person can act on.
+    pub message: Option<String>,
+}
+
+/// Where one batch row stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemState {
+    Queued,
+    Running {
+        percent: u8,
+        state: String,
+    },
+    Succeeded,
+    Failed {
+        code: Option<String>,
+        message: Option<String>,
+    },
+}
+
+impl ItemState {
+    /// `(pill text, semantic tone)`.
+    pub fn pill(&self) -> (&'static str, StateTone) {
+        use StateTone as T;
+        match self {
+            ItemState::Queued => ("Queued", T::Neutral),
+            ItemState::Running { .. } => ("Running", T::Active),
+            ItemState::Succeeded => ("Installed", T::Success),
+            ItemState::Failed { .. } => ("Failed", T::Danger),
+        }
+    }
+}
+
+// StateTone comes from protocol.rs, shared with the job pills in ui.rs.
+
 impl Dialog {
     /// Whether Escape and a backdrop click should dismiss this dialog.
     ///
     /// A pairing already in flight must not be dismissed by a stray click, or
-    /// the user loses track of an operation that is still running.
+    /// the user loses track of an operation that is still running. A batch
+    /// with anything still running stays put for the same reason.
     pub fn is_dismissible(&self) -> bool {
         match self {
             Dialog::None => false,
             Dialog::ConnectWifi { step, .. } => step_is_dismissible(step),
+            Dialog::SideloadBatch { items, .. } => !items
+                .iter()
+                .any(|i| matches!(i.state, ItemState::Running { .. })),
+            // A batch of package changes is in flight: the phone is being
+            // changed, and a stray click should not hide that.
+            Dialog::DebloatWorking { .. } => false,
             _ => true,
         }
     }
 
     /// The dialog title, also used as the accessible name and by tests.
-    pub fn heading(&self) -> &str {
+    pub fn heading(&self) -> String {
         match self {
-            Dialog::None => "",
-            Dialog::NewFolder { .. } => "New folder",
-            Dialog::Rename { .. } => "Rename",
-            Dialog::ConfirmDelete { .. } => "Delete",
-            Dialog::Properties { .. } => "Properties",
-            Dialog::ConnectWifi { step, .. } => step_heading(step),
-            Dialog::Diagnostics { .. } => "Connection diagnostics",
-            Dialog::SideloadApk { .. } => "Install this APK?",
-            Dialog::Message { title, .. } => title,
-            Dialog::ImagePreview { name, .. } => name,
-            Dialog::Shortcuts => "Keyboard shortcuts",
-            Dialog::About => "About ADBShare",
+            Dialog::None => String::new(),
+            Dialog::NewFolder { .. } => "New folder".into(),
+            Dialog::Rename { .. } => "Rename".into(),
+            Dialog::ConfirmDelete { .. } => "Delete".into(),
+            Dialog::Properties { .. } => "Properties".into(),
+            Dialog::ConnectWifi { step, .. } => step_heading(step).into(),
+            Dialog::Diagnostics { .. } => "Connection diagnostics".into(),
+            Dialog::SideloadApk { .. } => "Install this APK?".into(),
+            Dialog::Installing { .. } => "Installing".into(),
+            Dialog::ConfirmDeviceInstall { .. } => "Install this APK?".into(),
+            Dialog::SideloadBatch { .. } => "Install APKs".into(),
+            Dialog::InstallFailed { .. } => "Could not install".into(),
+            Dialog::DebloatConfirm { .. } => "Change these packages?".into(),
+            Dialog::DebloatWorking { .. } => "Working".into(),
+            Dialog::DebloatResult { .. } => "Packages changed".into(),
+            Dialog::Message { title, .. } => title.clone(),
+            Dialog::ImagePreview { name, .. } => name.clone(),
+            Dialog::Shortcuts => "Keyboard shortcuts".into(),
+            Dialog::About => "About ADBShare".into(),
         }
     }
 }
@@ -202,6 +356,24 @@ pub enum DialogResult {
     InstallApk(PathBuf),
     /// Copy the APK across without installing.
     CopyApk(PathBuf),
+    /// Install an APK that is already on the device.
+    InstallFromDevice(String),
+    /// Recovery: remove the installed package, then install again.
+    UninstallAndRetry {
+        device: String,
+        package: String,
+        path: String,
+        from_device: bool,
+    },
+    /// Batch: install every queued item, one after another.
+    InstallAll,
+    /// Batch: copy every queued item across without installing.
+    CopyAll,
+    /// Carry out a change to a batch of packages.
+    DebloatApply {
+        /// What to do to each package.
+        actions: Vec<PackageRequestDto>,
+    },
 }
 
 // ── Validation ───────────────────────────────────────────────────────────────
@@ -419,7 +591,31 @@ where
 
         Dialog::Diagnostics { report } => diagnostics(t, report, on_result.clone()),
 
-        Dialog::SideloadApk { name, local } => card(
+        Dialog::SideloadApk {
+            local,
+            info,
+            parse_error,
+            installed,
+            device,
+            device_abi,
+            can_copy,
+        } => sideload_apk(
+            t,
+            local,
+            info.as_ref(),
+            parse_error.as_deref(),
+            installed.as_ref(),
+            device,
+            device_abi.as_deref(),
+            *can_copy,
+            on_result.clone(),
+        ),
+
+        Dialog::Installing { label, status, .. } => {
+            installing(t, label, status.as_ref(), on_result.clone())
+        }
+
+        Dialog::ConfirmDeviceInstall { name, device_path } => card(
             t,
             CARD_W,
             vec![
@@ -432,24 +628,76 @@ where
                 .into_any_element(),
                 body_text(
                     t,
-                    &format!(
-                        "Install {name} on the connected phone, or copy it across without installing?"
-                    ),
+                    &format!("Install {name} from the phone's storage on this device?"),
                 )
                 .into_any_element(),
+                detail_table(t, vec![("Location", device_path.clone())], 90.0),
                 buttons(
                     t,
                     vec![
                         Button::normal("cancel", DialogResult::Dismiss),
-                        Button::normal("copy", DialogResult::CopyApk(local.clone())),
-                        // The question this dialog asks, so it takes the fill.
-                        Button::primary("install", DialogResult::InstallApk(local.clone())),
+                        Button::primary(
+                            "install",
+                            DialogResult::InstallFromDevice(device_path.clone()),
+                        ),
                     ],
                     on_result.clone(),
                 )
                 .into_any_element(),
             ],
         ),
+
+        Dialog::SideloadBatch { items, device } => {
+            sideload_batch(t, items, device, on_result.clone())
+        }
+
+        Dialog::InstallFailed {
+            label,
+            code,
+            message,
+            raw,
+            device,
+            package,
+            path,
+            from_device,
+        } => install_failed(
+            t,
+            label,
+            code.as_deref(),
+            message.as_deref(),
+            raw.as_deref(),
+            device,
+            package.as_deref(),
+            path,
+            *from_device,
+            on_result.clone(),
+        ),
+
+        Dialog::DebloatConfirm {
+            device,
+            action,
+            actions,
+            packages,
+            breaks,
+            undo,
+        } => debloat_confirm(
+            t,
+            device,
+            *action,
+            actions,
+            packages,
+            breaks,
+            *undo,
+            on_result.clone(),
+        ),
+
+        Dialog::DebloatWorking { count } => debloat_working(t, *count, on_result.clone()),
+
+        Dialog::DebloatResult {
+            action,
+            done,
+            failed,
+        } => debloat_result(t, *action, done, failed, on_result.clone()),
 
         Dialog::Message {
             title,
@@ -474,9 +722,7 @@ where
 
         Dialog::Shortcuts => shortcuts(t, on_result.clone()),
 
-        Dialog::ImagePreview { name, local } => {
-            image_preview(t, name, local, on_result.clone())
-        }
+        Dialog::ImagePreview { name, local } => image_preview(t, name, local, on_result.clone()),
 
         Dialog::About => about(t, on_result.clone()),
     };
@@ -510,6 +756,745 @@ where
 }
 
 // ── Card scaffolds ───────────────────────────────────────────────────────────
+
+/// The pre-install card for a host-local APK: what it is, what the phone has
+/// now, what installing would do.
+#[allow(clippy::too_many_arguments)]
+fn sideload_apk<F>(
+    t: &Palette,
+    local: &Path,
+    info: Option<&ApkInfo>,
+    parse_error: Option<&str>,
+    installed: Option<&PackageInfoDto>,
+    device: &str,
+    device_abi: Option<&str>,
+    can_copy: bool,
+    on_result: F,
+) -> AnyElement
+where
+    F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
+{
+    let name = local
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // ── what the card knows so far ──────────────────────────────────────
+    let mut rows: Vec<AnyElement> = Vec::new();
+    match (info, parse_error) {
+        (Some(info), _) => {
+            if let Some(label) = &info.label {
+                rows.push(
+                    div()
+                        .px(px(18.0))
+                        .pb(px(4.0))
+                        .text_size(t.text(15.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(t.text_header)
+                        .child(label.clone())
+                        .into_any_element(),
+                );
+            }
+            let mut table: Vec<(&str, String)> = vec![
+                ("Package", info.package.clone()),
+                (
+                    "Version",
+                    match (&info.version_name, info.version_code) {
+                        (Some(v), Some(c)) => format!("{v} ({c})"),
+                        (Some(v), None) => v.clone(),
+                        (None, Some(c)) => c.to_string(),
+                        (None, None) => "—".into(),
+                    },
+                ),
+                ("Size", human_size(info.size.unwrap_or(0))),
+            ];
+            if let Some(min) = info.min_sdk {
+                table.push(("Min Android", pretty_api(min)));
+            }
+            if !info.permissions.is_empty() {
+                let short: Vec<String> = info
+                    .permissions
+                    .iter()
+                    .map(|p| p.rsplit('.').next().unwrap_or(p).to_string())
+                    .collect();
+                table.push(("Permissions", short.join(", ")));
+            }
+            // ABI warning: native libs that cannot run on this phone.
+            if !info.native_abis.is_empty()
+                && let Some(abi) = device_abi
+                && !info.native_abis.iter().any(|a| a == abi)
+            {
+                table.push((
+                    "Architecture",
+                    format!(
+                        "{abi} device — this APK ships {:?} and may not install",
+                        info.native_abis
+                    ),
+                ));
+            }
+            rows.push(detail_table(t, table, 110.0));
+        }
+        (None, Some(err)) => {
+            rows.push(
+                body_text(t, &format!("{name} could not be read as an APK: {err}"))
+                    .into_any_element(),
+            );
+        }
+        (None, None) => {
+            rows.push(body_text(t, "Reading the package…").into_any_element());
+        }
+    }
+
+    // ── the upgrade / downgrade / replace banner ─────────────────────────
+    if let (Some(info), Some(installed)) = (info, installed)
+        && installed.installed
+    {
+        let verdict = match (info.version_code, installed.version_code) {
+            (Some(new), Some(old)) if new > old => ("Upgrade", StateTone::Active),
+            (Some(new), Some(old)) if new < old => (
+                "Downgrade — the device will refuse unless the old version is removed first",
+                StateTone::Warning,
+            ),
+            (Some(_), Some(_)) => ("Replace", StateTone::Neutral),
+            _ => ("Already installed", StateTone::Neutral),
+        };
+        let (fg, bg) = ui::tone_colors(t, verdict.1);
+        let installed_text = match &installed.version_name {
+            Some(v) => format!(" v{v}"),
+            _ => String::new(),
+        };
+        rows.push(
+            div()
+                .px(px(18.0))
+                .pb(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(ui::pill(t, verdict.0, fg, bg))
+                .child(
+                    div()
+                        .text_size(t.text(12.0))
+                        .text_color(t.text_muted)
+                        .child(format!(
+                            "{}{installed_text} is on {device}",
+                            installed.package
+                        )),
+                )
+                .into_any_element(),
+        );
+    }
+
+    // ── actions ─────────────────────────────────────────────────────────
+    let mut row = vec![Button::normal("cancel", DialogResult::Dismiss)];
+    if can_copy {
+        row.push(Button::normal(
+            "copy",
+            DialogResult::CopyApk(local.to_path_buf()),
+        ));
+    }
+    row.push(Button::primary(
+        "install",
+        DialogResult::InstallApk(local.to_path_buf()),
+    ));
+    rows.push(buttons(t, row, on_result).into_any_element());
+
+    card(t, CARD_W, rows)
+}
+
+/// 21 → "Android 5.0"; beyond the map, "API 34".
+fn pretty_api(sdk: u32) -> String {
+    let api = match sdk {
+        21 => "5.0",
+        22 => "5.1",
+        23 => "6.0",
+        24 => "7.0",
+        25 => "7.1",
+        26 => "8.0",
+        27 => "8.1",
+        28 => "9",
+        29 => "10",
+        30 => "11",
+        31 => "12",
+        32 => "12L",
+        33 => "13",
+        34 => "14",
+        35 => "15",
+        36 => "16",
+        _ => "",
+    };
+    if api.is_empty() {
+        format!("API {sdk}")
+    } else {
+        format!("{api} (API {sdk})")
+    }
+}
+
+/// Live install progress, polled from the daemon's install status.
+fn installing<F>(
+    t: &Palette,
+    label: &str,
+    status: Option<&InstallStatusDto>,
+    on_result: F,
+) -> AnyElement
+where
+    F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
+{
+    let (state, percent, bytes_done, bytes_total) = status
+        .map(|s| (s.state.clone(), s.percent, s.bytes_done, s.bytes_total))
+        .unwrap_or(("Pending".into(), 0, 0, 0));
+    let stage = match state.as_str() {
+        "Done" | "Failed" => state.clone(),
+        _ => state.clone(),
+    };
+    let detail = if bytes_total > 0 {
+        format!(
+            "{} / {} — {}%",
+            human_size(bytes_done),
+            human_size(bytes_total),
+            percent
+        )
+    } else {
+        format!("{percent}%")
+    };
+
+    card(
+        t,
+        CARD_W,
+        vec![
+            header(
+                t,
+                names::SOFTWARE_INSTALL,
+                ui::icon_tint(names::SOFTWARE_INSTALL, t),
+                "Installing",
+            )
+            .into_any_element(),
+            detail_table(
+                t,
+                vec![("Package", label.to_string()), ("Stage", stage.clone())],
+                110.0,
+            ),
+            div()
+                .px(px(18.0))
+                .pb(px(6.0))
+                .child(ui::progress_bar(t, percent as f32 / 100.0, 6.0))
+                .into_any_element(),
+            div()
+                .px(px(18.0))
+                .pb(px(16.0))
+                .text_size(t.text(12.0))
+                .text_color(t.text_muted)
+                .child(detail)
+                .into_any_element(),
+            buttons(
+                t,
+                vec![Button::normal("close", DialogResult::Dismiss)],
+                on_result,
+            )
+            .into_any_element(),
+        ],
+    )
+}
+
+/// The batch card: one row per APK, with per-item state pills.
+fn sideload_batch<F>(t: &Palette, items: &[BatchItem], device: &str, on_result: F) -> AnyElement
+where
+    F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
+{
+    let queued = items
+        .iter()
+        .filter(|i| matches!(i.state, ItemState::Queued))
+        .count();
+    let running = items
+        .iter()
+        .any(|i| matches!(i.state, ItemState::Running { .. }));
+
+    let mut rows: Vec<AnyElement> = vec![
+        header(
+            t,
+            names::SOFTWARE_INSTALL,
+            ui::icon_tint(names::SOFTWARE_INSTALL, t),
+            "Install APKs",
+        )
+        .into_any_element(),
+        body_text(
+            t,
+            &format!("{} dropped — install {queued} on {device}?", items.len()),
+        )
+        .into_any_element(),
+    ];
+
+    // One row per item: name, size, state pill. Bigger batches scroll.
+    rows.push(
+        div()
+            .id("batch-list")
+            .px(px(18.0))
+            .pb(px(12.0))
+            .max_h(px(260.0))
+            .overflow_y_scroll()
+            .children(items.iter().map(|item| {
+                let (pill_text, tone) = item.state.pill();
+                let (fg, bg) = ui::tone_colors(t, tone);
+                let sub = match &item.state {
+                    ItemState::Failed { message, .. } => message.clone().unwrap_or_default(),
+                    _ => String::new(),
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .py(px(3.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(t.text(13.0))
+                            .text_color(t.text_primary)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(item.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(t.text(11.0))
+                            .text_color(t.text_muted)
+                            .child(human_size(
+                                std::fs::metadata(&item.local).map(|m| m.len()).unwrap_or(0),
+                            )),
+                    )
+                    .child(ui::pill(t, pill_text, fg, bg))
+                    .when(!sub.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(t.text(11.0))
+                                .text_color(t.text_muted)
+                                .child(sub),
+                        )
+                    })
+            }))
+            .into_any_element(),
+    );
+
+    let mut row = vec![Button::normal("cancel", DialogResult::Dismiss)];
+    if !running {
+        if queued > 0 {
+            row.push(Button::normal("copy-all", DialogResult::CopyAll));
+            row.push(Button::primary("install-all", DialogResult::InstallAll));
+        } else {
+            // Everything finished or failed; closing is the only action.
+        }
+    }
+    rows.push(buttons(t, row, on_result).into_any_element());
+
+    card(t, WIDE_W, rows)
+}
+
+/// The recovery card: classified advice plus the actions that can fix it.
+#[allow(clippy::too_many_arguments)]
+fn install_failed<F>(
+    t: &Palette,
+    label: &str,
+    code: Option<&str>,
+    message: Option<&str>,
+    raw: Option<&str>,
+    device: &str,
+    package: Option<&str>,
+    path: &str,
+    from_device: bool,
+    on_result: F,
+) -> AnyElement
+where
+    F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
+{
+    let mut rows: Vec<AnyElement> = vec![
+        header(t, names::DIALOG_ERROR, t.danger, "Could not install").into_any_element(),
+        body_text(t, &format!("{label} on {device}")).into_any_element(),
+    ];
+    if let Some(code) = code {
+        rows.push(
+            div()
+                .px(px(18.0))
+                .pb(px(8.0))
+                .text_size(t.text(11.0))
+                .text_color(t.text_muted)
+                .child(format!("Error kind: {code}"))
+                .into_any_element(),
+        );
+    }
+    if let Some(message) = message
+        && !message.is_empty()
+    {
+        rows.push(body_text(t, message).into_any_element());
+    }
+    if let Some(raw) = raw {
+        rows.push(
+            div()
+                .px(px(18.0))
+                .pb(px(12.0))
+                .text_size(t.text(11.0))
+                .text_color(t.text_muted)
+                .whitespace_normal()
+                .child(raw.to_string())
+                .into_any_element(),
+        );
+    }
+
+    let mut row = vec![Button::normal("close", DialogResult::Dismiss)];
+    // Recovery actions, most specific first.
+    if let Some(package) = package {
+        row.push(Button::normal_owned(
+            "Uninstall and retry".into(),
+            DialogResult::UninstallAndRetry {
+                device: device.to_string(),
+                package: package.to_string(),
+                path: path.to_string(),
+                from_device,
+            },
+        ));
+    }
+    if !from_device {
+        row.push(Button::normal_owned(
+            "Copy instead".into(),
+            DialogResult::CopyApk(PathBuf::from(path)),
+        ));
+    }
+    rows.push(buttons(t, row, on_result).into_any_element());
+
+    card(t, WIDE_W, rows)
+}
+
+// ── Debloat ──────────────────────────────────────────────────────────────────
+
+/// The card that says what is about to happen to a batch of packages.
+///
+/// This is the last stop before the phone changes, so it says what will
+/// change, what the worst of it is, and what cannot be taken back. It does
+/// not pretend that all of it can.
+#[allow(clippy::too_many_arguments)]
+fn debloat_confirm<F>(
+    t: &Palette,
+    device: &str,
+    action: PackageActionDto,
+    actions: &[PackageRequestDto],
+    packages: &[DebloatPackage],
+    breaks: &[String],
+    undo: bool,
+    on_result: F,
+) -> AnyElement
+where
+    F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
+{
+    let count = packages.len();
+    let verb = action.label().to_lowercase();
+
+    let mut rows: Vec<AnyElement> = vec![
+        header(
+            t,
+            names::PACKAGE,
+            ui::icon_tint(names::PACKAGE, t),
+            if undo {
+                "Put these back"
+            } else {
+                "Change these packages?"
+            },
+        )
+        .into_any_element(),
+        body_text(
+            t,
+            &if undo {
+                format!("{count} package(s) will be put back on {device}.")
+            } else {
+                format!("{count} package(s) will be {verb}d on {device}.")
+            },
+        )
+        .into_any_element(),
+    ];
+
+    // The risks, worst first. The tier words are the curated list's own
+    // assessment, and they are the reason the card exists.
+    let unsafe_count = packages
+        .iter()
+        .filter(|p| p.risk == Some(Removal::Unsafe))
+        .count();
+    let expert_count = packages
+        .iter()
+        .filter(|p| p.risk == Some(Removal::Expert))
+        .count();
+    if unsafe_count > 0 {
+        rows.push(
+            div()
+                .mx(px(18.0))
+                .mb(px(8.0))
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .bg(t.danger_soft)
+                .border_1()
+                .border_color(t.danger_border)
+                .text_size(t.text(11.5))
+                .text_color(t.danger)
+                .child(format!(
+                    "{unsafe_count} of these can break parts of the phone. A factory reset \
+                     may be needed to fix it. {}",
+                    Removal::Unsafe.explanation()
+                ))
+                .into_any_element(),
+        );
+    }
+    if expert_count > 0 {
+        rows.push(
+            div()
+                .mx(px(18.0))
+                .mb(px(8.0))
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .bg(t.warning_soft)
+                .text_size(t.text(11.5))
+                .text_color(t.warning)
+                .child(format!(
+                    "{expert_count} of these break functionality you probably use, though \
+                     the phone should still boot. {}",
+                    Removal::Expert.explanation()
+                ))
+                .into_any_element(),
+        );
+    }
+    // Apps that need one of these and are not in the selection: they would
+    // be left broken.
+    if !breaks.is_empty() {
+        rows.push(
+            div()
+                .mx(px(18.0))
+                .mb(px(8.0))
+                .text_size(t.text(11.5))
+                .text_color(t.text_muted)
+                .child(format!(
+                    "{} other app(s) need one of these and will stop working: {}.",
+                    breaks.len(),
+                    breaks.join(", ")
+                ))
+                .into_any_element(),
+        );
+    }
+    // The one thing that cannot be done at all on a recent Android.
+    if action == PackageActionDto::Uninstall {
+        rows.push(
+            div()
+                .mx(px(18.0))
+                .mb(px(8.0))
+                .text_size(t.text(11.5))
+                .text_color(t.text_muted)
+                .child(
+                    "Android 17 and later do not let ADB remove a system app. Removing it \
+                     needs root.",
+                )
+                .into_any_element(),
+        );
+    }
+    if action == PackageActionDto::Disable {
+        rows.push(
+            div()
+                .mx(px(18.0))
+                .mb(px(8.0))
+                .text_size(t.text(11.5))
+                .text_color(t.text_muted)
+                .child(
+                    "Android 15 and later do not let ADB switch a system app off. If the \
+                     phone refuses, removing it for this user is the way round it.",
+                )
+                .into_any_element(),
+        );
+    }
+
+    // The packages themselves, with the risk pill beside each.
+    rows.push(
+        div()
+            .id("debloat-list")
+            .px(px(18.0))
+            .pb(px(12.0))
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .children(packages.iter().map(|package| {
+                let (fg, bg) = match package.risk {
+                    Some(Removal::Recommended) => ui::tone_colors(t, StateTone::Success),
+                    Some(Removal::Advanced) => ui::tone_colors(t, StateTone::Active),
+                    Some(Removal::Expert) => ui::tone_colors(t, StateTone::Warning),
+                    Some(Removal::Unsafe) => ui::tone_colors(t, StateTone::Danger),
+                    None => ui::tone_colors(t, StateTone::Neutral),
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .py(px(2.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(t.text(12.0))
+                                    .text_color(t.text_primary)
+                                    .font_family(theme::MONO)
+                                    .truncate()
+                                    .child(package.id.clone()),
+                            )
+                            .when_some(package.description.clone(), |d, description| {
+                                d.child(
+                                    div()
+                                        .text_size(t.text(10.5))
+                                        .text_color(t.text_muted)
+                                        .truncate()
+                                        .child(description),
+                                )
+                            }),
+                    )
+                    .when_some(package.risk, |d, risk| {
+                        d.child(ui::pill(t, risk.label(), fg, bg))
+                    })
+            }))
+            .into_any_element(),
+    );
+
+    let mut row = vec![Button::normal("cancel", DialogResult::Dismiss)];
+    let result = DialogResult::DebloatApply {
+        actions: actions.to_vec(),
+    };
+    // A selection that can break the phone gets a button that says so.
+    let label = format!("{} {count}", action.label());
+    if packages
+        .iter()
+        .any(|p| p.risk.is_some_and(|risk| risk.needs_confirmation()))
+    {
+        row.push(Button::danger_owned(label, result));
+    } else {
+        row.push(Button::primary_owned(label, result));
+    }
+    rows.push(buttons(t, row, on_result).into_any_element());
+
+    card(t, WIDE_W, rows)
+}
+
+/// The card shown while a batch of changes is in flight.
+fn debloat_working<F>(t: &Palette, count: usize, _on_result: F) -> AnyElement
+where
+    F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
+{
+    card(
+        t,
+        CARD_W,
+        vec![
+            header(
+                t,
+                names::PACKAGE,
+                ui::icon_tint(names::PACKAGE, t),
+                "Working",
+            )
+            .into_any_element(),
+            body_text(t, &format!("Changing {count} package(s)…")).into_any_element(),
+            div()
+                .px(px(18.0))
+                .pb(px(16.0))
+                .child(ui::progress_bar(t, 0.5, 6.0))
+                .into_any_element(),
+        ],
+    )
+}
+
+/// The card that says what a batch of changes actually did.
+fn debloat_result<F>(
+    t: &Palette,
+    action: PackageActionDto,
+    done: &[String],
+    failed: &[DebloatFailure],
+    on_result: F,
+) -> AnyElement
+where
+    F: Fn(DialogResult, &mut Window, &mut gpui::App) + Clone + 'static,
+{
+    let verb = action.past();
+    let mut rows: Vec<AnyElement> = vec![
+        header(
+            t,
+            if failed.is_empty() {
+                names::CHECKBOX_CHECKED
+            } else {
+                names::DIALOG_WARNING
+            },
+            if failed.is_empty() {
+                t.success
+            } else {
+                t.warning
+            },
+            if failed.is_empty() {
+                "Done"
+            } else {
+                "Partly done"
+            },
+        )
+        .into_any_element(),
+        body_text(
+            t,
+            &if failed.is_empty() {
+                format!("{verb} {} package(s).", done.len())
+            } else {
+                format!(
+                    "{verb} {} package(s); {} could not be changed.",
+                    done.len(),
+                    failed.len()
+                )
+            },
+        )
+        .into_any_element(),
+    ];
+
+    if !failed.is_empty() {
+        rows.push(
+            div()
+                .id("debloat-failures")
+                .px(px(18.0))
+                .pb(px(10.0))
+                .max_h(px(200.0))
+                .overflow_y_scroll()
+                .children(failed.iter().map(|failure| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .py(px(3.0))
+                        .gap(px(1.0))
+                        .child(
+                            div()
+                                .text_size(t.text(12.0))
+                                .text_color(t.text_primary)
+                                .font_family(theme::MONO)
+                                .child(failure.id.clone()),
+                        )
+                        .when_some(failure.message.clone(), |d, message| {
+                            d.child(
+                                div()
+                                    .text_size(t.text(11.0))
+                                    .text_color(t.text_muted)
+                                    .child(message),
+                            )
+                        })
+                }))
+                .into_any_element(),
+        );
+    }
+
+    rows.push(
+        buttons(
+            t,
+            vec![Button::normal("close", DialogResult::Dismiss)],
+            on_result,
+        )
+        .into_any_element(),
+    );
+
+    card(t, WIDE_W, rows)
+}
 
 /// A dialog button.
 ///
@@ -589,6 +1574,14 @@ impl Button {
     }
 
     /// A destructive button.
+    fn danger_owned(label: String, result: DialogResult) -> Self {
+        Self::Danger {
+            id: "extra",
+            label: label.into(),
+            result,
+        }
+    }
+
     fn danger(id: &'static str, result: DialogResult) -> Self {
         Button::Danger {
             id,
@@ -1143,6 +2136,8 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Delete permanently", "Shift+Delete"),
             ("Copy / Paste", "Ctrl+C / Ctrl+V"),
             ("Send to phone", "Ctrl+U"),
+            ("Install APK", "Ctrl+I"),
+            ("Debloat phone", "Ctrl+Shift+D"),
             ("Save to computer", "Ctrl+Shift+C"),
             ("Open in terminal", "Context menu"),
         ],
@@ -1150,7 +2145,7 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "View",
         &[
-            ("Toggle sidebar", "F9"),
+            ("Toggle sidebar", "F9 / Ctrl+B"),
             ("Switch grid / list", "Alt+T"),
             ("Zoom out / in", "Ctrl+minus / Ctrl+plus"),
             ("Search this folder", "Ctrl+F"),

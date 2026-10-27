@@ -1180,8 +1180,8 @@ impl Browser {
     /// zoom level, which can exceed the list's 18px by a wide margin.
     fn thumb_size(&self) -> ThumbSize {
         match self.view_mode {
-            ViewMode::Grid if self.zoom >= 128.0 => ThumbSize::Large,
-            _ => ThumbSize::Normal,
+            ViewMode::Grid => ThumbSize::Large,
+            ViewMode::List => ThumbSize::Normal,
         }
     }
 

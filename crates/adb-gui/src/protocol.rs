@@ -92,6 +92,8 @@ pub struct DeviceEntry {
     /// `(used, total)` bytes on `/sdcard`, when the device reported them.
     pub storage: Option<(u64, u64)>,
     pub battery_pct: Option<u8>,
+    /// Primary CPU architecture, e.g. `arm64-v8a`, for the install card.
+    pub abi: Option<String>,
 }
 
 impl DeviceEntry {
@@ -115,6 +117,7 @@ impl DeviceEntry {
             transport: "usb",
             storage: None,
             battery_pct: None,
+            abi: None,
         }
     }
 }
@@ -256,6 +259,9 @@ pub struct DeviceInfoDto {
     pub storage_used: Option<u64>,
     #[serde(default)]
     pub storage_total: Option<u64>,
+    /// Primary CPU architecture, e.g. `arm64-v8a`. None on older daemons.
+    #[serde(default)]
+    pub abi: Option<String>,
 }
 
 impl DeviceInfoDto {
@@ -273,8 +279,167 @@ impl DeviceInfoDto {
                 _ => None,
             },
             battery_pct: self.battery_pct,
+            abi: self.abi,
         }
     }
+}
+
+/// Live progress of one APK install, straight from the daemon.
+///
+/// Some fields mirror the daemon's record for completeness of the protocol
+/// even where the GUI does not read them back; serde keeps the shape honest.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
+pub struct InstallStatusDto {
+    pub id: u64,
+    #[serde(default)]
+    pub device: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub from_device: bool,
+    /// `Pending` | `Copying` | `Installing` | `Done` | `Failed`.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub percent: u8,
+    #[serde(default)]
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub bytes_total: u64,
+    /// Classified problem, e.g. `downgrade`, or None while running.
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The untranslated `pm install` output, kept for the details fold.
+    #[serde(default)]
+    pub raw: Option<String>,
+    #[serde(default)]
+    pub finished: bool,
+}
+
+impl InstallStatusDto {
+    pub fn is_done(&self) -> bool {
+        self.state == "Done"
+    }
+}
+
+/// What the daemon knows about a package installed on a device.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PackageInfoDto {
+    #[serde(default)]
+    pub package: String,
+    /// True when the package is installed (any version).
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub version_name: Option<String>,
+    #[serde(default)]
+    pub version_code: Option<u64>,
+}
+
+/// One package on a device, with the state the device reports.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct PackageDto {
+    pub id: String,
+    /// `enabled` | `disabled` | `uninstalled`.
+    pub state: String,
+    /// True when the package lives on the system's read-only partition.
+    #[serde(default)]
+    pub system: bool,
+    /// Where the APK is, when it is installed at all.
+    #[serde(default)]
+    pub apk_path: Option<String>,
+}
+
+/// The four things that can be done to a package.
+///
+/// The names match the daemon's own; serde keeps the two in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageActionDto {
+    /// Take the app out of the launcher and stop it running. Reversible.
+    #[default]
+    Disable,
+    /// Put a disabled app back. Reversible.
+    Enable,
+    /// Unlink the app for this user, keeping its data. Reversible.
+    Uninstall,
+    /// Re-link an app that was uninstalled for this user.
+    Restore,
+}
+
+impl PackageActionDto {
+    /// The name shown on the button that carries this action out.
+    pub fn label(self) -> &'static str {
+        match self {
+            PackageActionDto::Disable => "Disable",
+            PackageActionDto::Enable => "Enable",
+            PackageActionDto::Uninstall => "Uninstall",
+            PackageActionDto::Restore => "Restore",
+        }
+    }
+
+    /// The name written into the ledger.
+    pub fn name(self) -> &'static str {
+        match self {
+            PackageActionDto::Disable => "disable",
+            PackageActionDto::Enable => "enable",
+            PackageActionDto::Uninstall => "uninstall",
+            PackageActionDto::Restore => "restore",
+        }
+    }
+
+    /// The action in the past tense, for a sentence about what happened.
+    pub fn past(self) -> &'static str {
+        match self {
+            PackageActionDto::Disable => "Disabled",
+            PackageActionDto::Enable => "Enabled",
+            PackageActionDto::Uninstall => "Uninstalled",
+            PackageActionDto::Restore => "Restored",
+        }
+    }
+
+    /// The action that puts a package back the way it was.
+    ///
+    /// Every action here can be taken back, which is what the ledger's undo
+    /// is made of. A package that was unlinked is linked again; a package
+    /// that was disabled is enabled.
+    pub fn inverse(self) -> PackageActionDto {
+        match self {
+            PackageActionDto::Disable => PackageActionDto::Enable,
+            PackageActionDto::Enable => PackageActionDto::Disable,
+            PackageActionDto::Uninstall => PackageActionDto::Restore,
+            PackageActionDto::Restore => PackageActionDto::Disable,
+        }
+    }
+}
+
+/// One request in a batch of package changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PackageRequestDto {
+    pub package: String,
+    pub action: PackageActionDto,
+}
+
+/// What happened to one package in a batch.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PackageResultDto {
+    #[serde(default)]
+    pub package: String,
+    #[serde(default)]
+    pub ok: bool,
+    /// The state the package should now be in, when the action worked.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// A classified reason, e.g. `system_uninstall_blocked`.
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

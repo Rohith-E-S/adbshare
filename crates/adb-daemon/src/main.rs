@@ -28,6 +28,8 @@ use zbus::{ConnectionBuilder, interface};
 
 use transfer_engine::{Direction, Job, JobOptions, JobQueue, Worker};
 
+mod packages;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "adb-daemon",
@@ -64,6 +66,36 @@ struct DeviceSlot {
     host_port: u16,
 }
 
+/// One running (or just-finished) package-install operation.
+///
+/// Installs deliberately sit beside the transfer queue rather than inside it:
+/// an install is `adb push` + `pm install`, not a proxy op, and the GUI wants
+/// per-stage status — which the queue's byte counters cannot express. The GUI
+/// reads these through `install_status_all` on its regular job poll.
+#[derive(Debug, Clone, Serialize)]
+struct InstallStatus {
+    id: u64,
+    device: String,
+    /// File name shown to the user while the source is out of sight.
+    label: String,
+    source: String,
+    /// True when the APK already lived on the phone, so there is no transfer.
+    from_device: bool,
+    /// `false` before the first progress reading arrives.
+    stage: u32,
+    percent: u8,
+    bytes_done: u64,
+    bytes_total: u64,
+    /// `Pending` | `Copying` | `Installing` | `Done` | `Failed`.
+    state: String,
+    /// Code (`downgrade`, `signature_mismatch`, …) so the GUI can offer the
+    /// matching recovery instead of a raw string to stare at.
+    error_code: Option<String>,
+    message: Option<String>,
+    raw: Option<String>,
+    finished: bool,
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// serial -> slot
@@ -72,6 +104,16 @@ struct State {
     mount_base: PathBuf,
     proxy_conns: usize,
     no_fuse: bool,
+    /// Install operations the GUI can watch. Kept here rather than the queue
+    /// for the reasons on `InstallStatus`.
+    installs: HashMap<u64, InstallStatus>,
+    /// True while a pipeline is actually executing, so a second request can be
+    /// told "one install at a time" rather than overlap two `pm install` runs.
+    install_running: bool,
+    /// The id the next install gets. `pm` cannot run two session installs at
+    /// once without running into stale-session errors, so installs run one at
+    /// a time and the id doubles as an ordering guarantee.
+    next_install_id: u64,
     /// Host RSA identity, loaded once at startup. The daemon drives every
     /// device through the `adb` binary, which does its own ADB auth from
     /// `~/.android/adbkey`, so this is not needed for the `adb` path — but it
@@ -321,7 +363,9 @@ async fn main() -> anyhow::Result<()> {
             ManagerInterface {
                 state: state.clone(),
                 queue: queue.clone(),
-                device_info: Arc::new(DeviceInfoCache::new(DEVICE_INFO_TTL)),
+                device_info: Arc::new(TimedCache::new(DEVICE_INFO_TTL)),
+                package_info: Arc::new(TimedCache::new(PACKAGE_INFO_TTL)),
+                packages: Arc::new(TimedCache::new(packages::INVENTORY_TTL)),
             },
         )?
         .build()
@@ -362,8 +406,34 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// `adb shell` subprocesses per minute into one, which is still far more often
 /// than a battery percentage or a storage total meaningfully changes.
 const DEVICE_INFO_TTL: Duration = Duration::from_secs(15);
+/// How long a `package_info` reading may be reused before `dumpsys` is asked
+/// again — a package version changes only on install, so this is deliberately
+/// longer than the device sweep.
+const PACKAGE_INFO_TTL: Duration = Duration::from_secs(30);
+/// How long `pm install` may take to verify and commit a package. Large game
+/// bundles take minutes; the transfer stage has its own budget.
+const INSTALL_PM_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long `adb push` may take for one APK.
+const INSTALL_PUSH_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long copying a device-local APK into the staging area may take.
+const INSTALL_CP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long `pm uninstall` may take.
+const UNINSTALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Where an APK is parked on the device before `pm install` runs.
+const INSTALL_STAGE: &str = "/data/local/tmp/adbshare_install_stage.apk";
+/// How often the transfer stage re-reads the staged file's size, which is what
+/// turns `adb push` into live byte progress.
+const INSTALL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How many finished installs are kept on the map, so a long session does not
+/// grow it without bound while the GUI's list stays within reach.
+const INSTALL_HISTORY_CAP: usize = 25;
+
 /// Timeout for quick adb commands (shell one-liners, forward, getprop).
 const ADB_CMD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many packages one batch may change. A list of two thousand is a sign
+/// something went wrong, not a request.
+const MAX_PACKAGE_ACTIONS: usize = 1000;
 
 /// Run `adb <args>` with a hard timeout so a hung device or adb server can't
 /// stall the single watcher task. Returns the command's exit status.
@@ -889,11 +959,11 @@ fn is_wireless_serial(serial: &str) -> bool {
     }
 }
 
-/// Run `adb -s <serial> shell <cmd>` with a hard timeout so an unresponsive
-/// device can't stall the D-Bus call.
-async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
+/// Run `adb -s <serial> shell <cmd>` with a caller-chosen timeout so an
+/// unresponsive device can't stall the D-Bus call.
+async fn adb_shell_with(serial: &str, cmd: &str, timeout: Duration) -> anyhow::Result<String> {
     let out = tokio::time::timeout(
-        Duration::from_secs(5),
+        timeout,
         adb_command()
             .args(["-s", serial, "shell", cmd])
             .kill_on_drop(true)
@@ -908,6 +978,418 @@ async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run `adb -s <serial> shell <cmd>` with the default short timeout.
+async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
+    adb_shell_with(serial, cmd, Duration::from_secs(5)).await
+}
+
+// ── Package installs ─────────────────────────────────────────────────────────
+
+/// True when a path names a file on the phone rather than on this computer.
+///
+/// An absolute path that does not exist here cannot be a local file, and the
+/// phone's storage is the only other place adbshare can reach, so it is
+/// treated as a device path. A relative path is always local.
+fn is_device_local_path(path: &str) -> bool {
+    if path.starts_with("/sdcard/")
+        || path.starts_with("/storage/")
+        || path.starts_with("/data/")
+        || path.starts_with("/mnt/")
+    {
+        return true;
+    }
+    path.starts_with('/') && !std::path::Path::new(path).exists()
+}
+
+/// True for a string that could only be a package name, which is what keeps a
+/// shell injection out of every command that one is interpolated into.
+fn is_package_name(package: &str) -> bool {
+    if package.is_empty() || package.len() > 224 {
+        return false;
+    }
+    // The real rule: dot-separated segments, each starting with a letter and
+    // continuing with letters, digits or underscores. Anything else is not a
+    // package name, and refusing it is what keeps a shell injection out of
+    // every command one is interpolated into.
+    package.split('.').all(|segment| {
+        let mut chars = segment.chars();
+        match chars.next() {
+            Some(first) if first.is_ascii_alphabetic() => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Drop the oldest finished installs so the map stays within
+/// [`INSTALL_HISTORY_CAP`]. Callers hold the state lock.
+fn prune_installs(installs: &mut HashMap<u64, InstallStatus>) {
+    let mut done: Vec<u64> = installs
+        .iter()
+        .filter(|(_, s)| s.finished)
+        .map(|(id, _)| *id)
+        .collect();
+    if done.len() <= INSTALL_HISTORY_CAP {
+        return;
+    }
+    done.sort_unstable();
+    let surplus = done.len() - INSTALL_HISTORY_CAP;
+    for id in done.into_iter().take(surplus) {
+        installs.remove(&id);
+    }
+}
+
+/// The one JSON shape `package_info` serves, read back from `dumpsys`.
+#[derive(Debug, Clone, Serialize)]
+struct PackageInfo {
+    package: String,
+    installed: bool,
+    version_name: Option<String>,
+    version_code: Option<u64>,
+}
+
+/// Ask the device what it has installed for this package.
+///
+/// `dumpsys package <pkg>` prints a versionName = line for anything installed
+/// and nothing of the kind when it is not, so the shape of the answer carries
+/// the answer — no separate existence probe is needed.
+async fn read_package_info(device: &str, package: &str) -> anyhow::Result<String> {
+    let dump = adb_shell_with(
+        device,
+        &format!("dumpsys package '{package}'"),
+        Duration::from_secs(10),
+    )
+    .await?;
+    // The first occurrences are the installed package's own; later ones belong
+    // to shared-user or split entries.
+    let mut version_name = None;
+    let mut version_code = None;
+    for line in dump.lines() {
+        let line = line.trim();
+        if version_name.is_none()
+            && let Some(rest) = line
+                .strip_prefix("versionName=")
+                .and_then(|v| v.split_whitespace().next())
+                .filter(|v| !v.is_empty())
+        {
+            version_name = Some(rest.to_string());
+        }
+        if version_code.is_none()
+            && let Some(rest) = line
+                .strip_prefix("versionCode=")
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.trim().parse().ok())
+        {
+            version_code = Some(rest);
+        }
+    }
+    let installed = version_name.is_some() || version_code.is_some();
+    serde_json::to_string(&PackageInfo {
+        package: package.to_string(),
+        installed,
+        version_name,
+        version_code,
+    })
+    .map_err(|e| anyhow::anyhow!("serialize package info: {e}"))
+}
+
+/// What a `pm install` failure means, in code and in person.
+///
+/// The raw output is never thrown away; the ledger keeps it next to the
+/// translation, so the recovery dialog can quote it.
+fn classify_install_failure(trimmed: &str) -> (Option<String>, String) {
+    if trimmed.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
+        return (
+            Some("downgrade".into()),
+            "A newer version of this application is already installed on the device.".into(),
+        );
+    }
+    if trimmed.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") {
+        return (
+            Some("signature_mismatch".into()),
+            "Signatures do not match the installed version. The old app has to be uninstalled
+             before installing this one; its data will be lost."
+                .into(),
+        );
+    }
+    if trimmed.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE") {
+        return (
+            Some("insufficient_storage".into()),
+            "The device does not have enough storage space for this package.".into(),
+        );
+    }
+    if trimmed.contains("INSTALL_FAILED_CONFLICTING_PROVIDER") {
+        return (
+            Some("conflicting_provider".into()),
+            "Another app already registers the same content provider.".into(),
+        );
+    }
+    if trimmed.contains("INSTALL_FAILED_NO_MATCHING_ABIS") {
+        return (
+            Some("no_matching_abis".into()),
+            "This package does not support the device's CPU architecture.".into(),
+        );
+    }
+    if trimmed.contains("INSTALL_PARSE_FAILED") {
+        return (
+            Some("parse_failed".into()),
+            "The file appears damaged or is not a valid APK.".into(),
+        );
+    }
+    let offline = [
+        "device not found",
+        "no devices",
+        "device offline",
+        "closed",
+        "more than one",
+    ]
+    .iter()
+    .any(|needle| trimmed.to_ascii_lowercase().contains(needle));
+    if offline {
+        return (
+            Some("device_offline".into()),
+            "The phone disconnected (or is not authorised for debugging).".into(),
+        );
+    }
+    (Some("unknown".into()), trimmed.to_string())
+}
+
+/// Update one install's mutable bookkeeping. The status lock is held only for
+/// the field writes, so pipelined adb calls never run inside it.
+fn update_install(state: &Arc<Mutex<State>>, id: u64, mutate: impl FnOnce(&mut InstallStatus)) {
+    let mut s = state.lock();
+    if let Some(status) = s.installs.get_mut(&id) {
+        mutate(status);
+    }
+}
+
+/// Finish an install with a failure and release the pipeline slot.
+fn install_failed(
+    state: &Arc<Mutex<State>>,
+    id: u64,
+    code: Option<String>,
+    message: String,
+    raw: Option<String>,
+) {
+    add_install_signed(state, Some(id), code, Some(message), raw, false);
+}
+
+/// Finish an install with success and release the pipeline slot.
+fn install_succeeded(state: &Arc<Mutex<State>>, id: u64, raw: String) {
+    add_install_signed(state, Some(id), None, None, Some(raw), true);
+}
+
+/// Mark terminal state once, in one place, always clearing `install_running`.
+fn add_install_signed(
+    state: &Arc<Mutex<State>>,
+    id: Option<u64>,
+    code: Option<String>,
+    message: Option<String>,
+    raw: Option<String>,
+    success: bool,
+) {
+    let mut s = state.lock();
+    s.install_running = false;
+    if let Some(id) = id
+        && let Some(status) = s.installs.get_mut(&id)
+    {
+        status.finished = true;
+        status.state = if success { "Done" } else { "Failed" }.into();
+        status.stage = 5;
+        status.percent = if success { 100 } else { status.percent };
+        status.error_code = code;
+        status.message = message;
+        status.raw = raw;
+    }
+    prune_installs(&mut s.installs);
+}
+
+/// The full sideload install: stage the file (pushing it when it is
+/// host-local, with live byte progress), then `pm install -r`, then clean up.
+/// Every exit releases the single-install slot exactly once, through
+/// [`install_failed`] or [`install_succeeded`].
+async fn run_install_pipeline(state: Arc<Mutex<State>>, id: u64, device: String, path: String) {
+    let outcome = perform_install(&state, id, &device, &path).await;
+    if let Err(err) = &outcome {
+        // The pipeline releases the single-install slot on every other exit.
+        // An error return is the one path that would leave it held, and a
+        // held slot means no install ever runs again until the daemon
+        // restarts.
+        install_failed(
+            &state,
+            id,
+            Some("unknown".into()),
+            format!("the install could not be completed: {err}"),
+            Some(err.to_string()),
+        );
+    }
+    debug!(id, ?outcome, "install pipeline finished");
+}
+
+/// The body of [`run_install_pipeline`].
+async fn perform_install(
+    state: &Arc<Mutex<State>>,
+    id: u64,
+    device: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    let from_device = {
+        let watcher = state.lock();
+        watcher
+            .installs
+            .get(&id)
+            .map(|status| status.from_device)
+            .unwrap_or(false)
+    };
+
+    // ── Stage the file ──────────────────────────────────────────────────
+    update_install(state, id, |status| {
+        status.state = "Copying".into();
+        status.stage = 2;
+    });
+
+    if from_device {
+        // A device-local APK is copied on the device itself: no transfer to
+        // watch, so the card goes straight through the installing stage.
+        let escaped = path.replace('\'', "'\\''");
+        if let Err(e) = adb_shell_with(
+            device,
+            &format!("cp '{escaped}' {INSTALL_STAGE}"),
+            INSTALL_CP_TIMEOUT,
+        )
+        .await
+        {
+            let raw = format!("copying {path} into the staging area: {e}");
+            install_failed(state, id, Some("unknown".into()), raw.clone(), Some(raw));
+            return Ok(());
+        }
+    } else {
+        // Poll the staged file's size on a second task while `adb push` runs;
+        // that is the whole trick to live transfer progress. The poll task is
+        // aborted as soon as the push ends, whichever way it went.
+        let poll = {
+            let state = state.clone();
+            let device = device.to_string();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(INSTALL_POLL_INTERVAL).await;
+                    let Ok(out) = adb_shell(&device, &format!("stat -c %s {INSTALL_STAGE}")).await
+                    else {
+                        continue;
+                    };
+                    let done = out.trim().parse::<u64>().unwrap_or(0);
+                    update_install(&state, id, |status| {
+                        status.bytes_done = done;
+                        if let Some(pct) = (done * 100)
+                            .checked_div(status.bytes_total)
+                            .map(|p| p.min(100) as u8)
+                        {
+                            status.percent = pct;
+                        }
+                    });
+                }
+            })
+        };
+        let push = adb_run_output(
+            &["-s", device, "push", path, INSTALL_STAGE],
+            INSTALL_PUSH_TIMEOUT,
+        )
+        .await;
+        poll.abort();
+        let Ok(out) = push else {
+            let e = "push never returned".to_string();
+            install_failed(state, id, Some("device_offline".into()), e.clone(), Some(e));
+            return Ok(());
+        };
+        if !out.status.success() {
+            let raw = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let trimmed = raw.trim();
+            let (code, mut message) = classify_install_failure(trimmed);
+            if message != trimmed {
+                message = format!("{message}\n\n{trimmed}");
+            }
+            install_failed(state, id, code, message, Some(trimmed.to_string()));
+            return Ok(());
+        }
+        update_install(state, id, |status| {
+            status.bytes_done = status.bytes_total;
+            status.percent = 100;
+        });
+    }
+
+    // ── Verify + commit ─────────────────────────────────────────────────
+    update_install(state, id, |status| {
+        status.state = "Installing".into();
+        status.stage = 4;
+    });
+    let out = tokio::time::timeout(
+        INSTALL_PM_TIMEOUT,
+        adb_command()
+            .args([
+                "-s",
+                device,
+                "shell",
+                &format!("pm install -r {INSTALL_STAGE}"),
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    // Clean up the staged copy either way: a 20 MB leftover in
+    // /data/local/tmp is a small thing, but it is ours.
+    let _ = adb_shell(device, &format!("rm -f {INSTALL_STAGE}")).await;
+    match out {
+        Err(_) => {
+            install_failed(
+                state,
+                id,
+                Some("timeout".into()),
+                "pm install did not answer in time.".into(),
+                None,
+            );
+        }
+        Ok(Err(e)) => {
+            let raw = format!("pm install: {e}");
+            install_failed(
+                state,
+                id,
+                Some("device_offline".into()),
+                raw.clone(),
+                Some(raw),
+            );
+        }
+        Ok(Ok(out)) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let trimmed = text.trim();
+            let is_failure = !out.status.success()
+                || trimmed.contains("Failure [")
+                || trimmed.starts_with("Failure")
+                || trimmed.contains("INSTALL_FAILED");
+            if is_failure {
+                let (code, message) = classify_install_failure(trimmed);
+                install_failed(
+                    state,
+                    id,
+                    code,
+                    format!("{message}\n\n{trimmed}"),
+                    Some(trimmed.to_string()),
+                );
+            } else {
+                install_succeeded(state, id, trimmed.to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse `getprop` output ("[prop]: [value]" lines) into a map.
@@ -932,6 +1414,9 @@ struct DeviceInfoDto {
     battery_pct: Option<u8>,
     storage_used: Option<u64>,
     storage_total: Option<u64>,
+    /// Primary CPU architecture, e.g. `arm64-v8a`, for the install card's
+    /// ABI warning. The GUI matches it against the APK's native libs.
+    abi: Option<String>,
 }
 
 async fn device_info_json(serial: &str) -> anyhow::Result<String> {
@@ -946,6 +1431,14 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
         adb_shell(serial, "dumpsys battery"),
         adb_shell(serial, "df -k /sdcard"),
     );
+
+    let abi = match &props_raw {
+        Ok(raw) => parse_getprop(raw)
+            .get("ro.product.cpu.abi")
+            .filter(|s| !s.is_empty())
+            .cloned(),
+        Err(_) => None,
+    };
 
     let model = match props_raw {
         Ok(raw) => {
@@ -1007,6 +1500,7 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
         battery_pct,
         storage_used,
         storage_total,
+        abi,
     })
     .map_err(|e| anyhow::anyhow!("serialize device info: {e}"))
 }
@@ -1118,7 +1612,7 @@ async fn delete_recursive(client: &ProxyClient, path: &str, depth: u32) -> anyho
 /// Entries are refreshed on expiry and the last good value is served if a
 /// refresh fails, so a phone that has gone quiet does not make the sidebar
 /// flicker.
-struct DeviceInfoCache {
+struct TimedCache {
     ttl: Duration,
     /// `parking_lot` rather than `std::sync::Mutex` on purpose: a panic while the
     /// guard is held poisons a std mutex, and these methods used to swallow that
@@ -1129,7 +1623,7 @@ struct DeviceInfoCache {
     entries: Mutex<std::collections::HashMap<String, (Instant, String)>>,
 }
 
-impl DeviceInfoCache {
+impl TimedCache {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
@@ -1165,12 +1659,36 @@ impl DeviceInfoCache {
             .lock()
             .retain(|serial, _| present.iter().any(|known| known == serial));
     }
+
+    /// Drop one entry, so the next read goes back to the device.
+    fn forget(&self, key: &str) {
+        self.entries.lock().remove(key);
+    }
+
+    /// Forget the readings of devices that have gone away, so the cache cannot
+    /// grow without bound over a long session with phones coming and going.
+    ///
+    /// A key is a device serial, or a device serial and a package joined by a
+    /// null byte; in both cases the device is the part before the separator.
+    fn forget_missing_devices(&self, present: &[String]) {
+        self.entries.lock().retain(|key, _| {
+            let device = key.split('\u{0}').next().unwrap_or(key);
+            present.iter().any(|known| known == device)
+        });
+    }
 }
 
 struct ManagerInterface {
     state: Arc<Mutex<State>>,
     queue: Arc<JobQueue>,
-    device_info: Arc<DeviceInfoCache>,
+    device_info: Arc<TimedCache>,
+    /// Cached `package_info` readings, per device+package, for the same reason
+    /// as `device_info`: a pre-install card asks once per APK, and `dumpsys`
+    /// costs a binder round trip per call.
+    package_info: Arc<TimedCache>,
+    /// Cached package inventories, per device and user. The GUI refreshes the
+    /// list often, and each reading costs four `pm` calls on the phone.
+    packages: Arc<TimedCache>,
 }
 
 #[interface(name = "org.adbshare.Manager")]
@@ -1182,6 +1700,7 @@ impl ManagerInterface {
             s.devices.keys().map(|d| d.to_string()).collect()
         };
         self.device_info.forget_missing(&devices);
+        self.package_info.forget_missing_devices(&devices);
         Ok(devices)
     }
 
@@ -1701,86 +2220,224 @@ impl ManagerInterface {
         Ok(text)
     }
 
-    /// `adb install -r` with a 120s timeout. Supports both host-local APK paths
-    /// and device-local paths (e.g. `/sdcard/...` or `/storage/...`).
-    async fn install_apk(&self, device: &str, path: &str) -> zbus::fdo::Result<String> {
+    /// Begin installing an APK from a local (host) or device path.
+    ///
+    /// Returns the install id the GUI can watch for with `install_status_all`.
+    /// The pipeline runs in the background: push the file to
+    /// `/data/local/tmp/adbshare_install_stage.apk` (with byte progress read
+    /// back by polling `stat` on the device), then `pm install -r`, then
+    /// remove the staged copy. That decomposition is what makes progress
+    /// possible at all: `adb install` does its own push internally and gives
+    /// nothing back until it has fully finished or failed.
+    async fn start_install(&self, device: &str, path: &str) -> zbus::fdo::Result<u64> {
         if device.is_empty() || path.is_empty() {
             return Err(zbus::fdo::Error::InvalidArgs(
                 "device and path are required".into(),
             ));
         }
+        client_for(&self.state, device)?;
 
-        let is_device_path = path.starts_with("/sdcard/")
-            || path.starts_with("/storage/")
-            || path.starts_with("/data/")
-            || !std::path::Path::new(path).exists();
-
-        let cmd = if is_device_path {
-            if path.starts_with("/data/local/tmp/") {
-                let escaped_path = path.replace('\'', "'\\''");
-                adb_command()
-                    .args([
-                        "-s",
-                        device,
-                        "shell",
-                        &format!("pm install -r '{escaped_path}'"),
-                    ])
-                    .kill_on_drop(true)
-                    .output()
-            } else {
-                let escaped_path = path.replace('\'', "'\\''");
-                let script = format!(
-                    "tmp=\"/data/local/tmp/adbshare_$$.apk\" && cp '{escaped_path}' \"$tmp\" && pm install -r \"$tmp\"; res=$?; rm -f \"$tmp\"; exit $res"
-                );
-                adb_command()
-                    .args(["-s", device, "shell", &script])
-                    .kill_on_drop(true)
-                    .output()
-            }
-        } else {
-            adb_command()
-                .args(["-s", device, "install", "-r", path])
-                .kill_on_drop(true)
-                .output()
-        };
-
-        let out = tokio::time::timeout(Duration::from_secs(120), cmd)
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("Installation timed out after 120s".into()))?
-            .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to execute adb: {e}")))?;
-
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-
-        let trimmed = text.trim();
-        let is_failure = !out.status.success()
-            || trimmed.contains("Failure [")
-            || trimmed.starts_with("Failure")
-            || trimmed.contains("INSTALL_FAILED");
-
-        if is_failure {
-            let user_msg = if trimmed.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
-                "Cannot install: a newer version of this application is already installed on the device."
-            } else if trimmed.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") {
-                "Cannot install: signatures do not match the installed version. Please uninstall the existing app first."
-            } else if trimmed.contains("INSTALL_FAILED_INSUFFICIENT_STORAGE") {
-                "Cannot install: device has insufficient storage space."
-            } else if trimmed.contains("INSTALL_FAILED_CONFLICTING_PROVIDER") {
-                "Cannot install: conflicting content provider with an existing application."
-            } else if trimmed.contains("INSTALL_FAILED_NO_MATCHING_ABIS") {
-                "Cannot install: APK is incompatible with this device's CPU architecture."
-            } else if trimmed.contains("INSTALL_PARSE_FAILED") {
-                "Cannot install: corrupted or invalid APK file."
-            } else {
-                trimmed
-            };
-            return Err(zbus::fdo::Error::Failed(format!("{user_msg}\n\n{trimmed}")));
+        let from_device = is_device_local_path(path);
+        let host_exists = std::path::Path::new(path).exists();
+        if !from_device && !host_exists {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "{path} does not exist on this computer"
+            )));
         }
 
-        Ok(trimmed.to_string())
+        let mut state = self.state.lock();
+        if state.install_running {
+            return Err(zbus::fdo::Error::Failed(
+                "another installation is already running; wait for it to finish".into(),
+            ));
+        }
+        let id = state.next_install_id;
+        state.next_install_id += 1;
+        state.install_running = true;
+        let label = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        state.installs.insert(
+            id,
+            InstallStatus {
+                id,
+                device: device.to_string(),
+                label,
+                source: path.to_string(),
+                from_device,
+                stage: 0,
+                percent: 0,
+                bytes_done: 0,
+                bytes_total: if from_device || !host_exists {
+                    0
+                } else {
+                    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+                },
+                state: "Pending".into(),
+                error_code: None,
+                message: None,
+                raw: None,
+                finished: false,
+            },
+        );
+        prune_installs(&mut state.installs);
+        drop(state);
+
+        let state = self.state.clone();
+        let device = device.to_string();
+        let path = path.to_string();
+        tokio::spawn(async move {
+            run_install_pipeline(state, id, device, path).await;
+        });
+        Ok(id)
+    }
+
+    /// Every tracked install status, latest first. The GUI polls this on its
+    /// regular job tick while an install is on screen.
+    async fn install_status_all(&self) -> zbus::fdo::Result<String> {
+        let mut statuses: Vec<InstallStatus> =
+            self.state.lock().installs.values().cloned().collect();
+        statuses.sort_by_key(|s| std::cmp::Reverse(s.id));
+        serde_json::to_string(&statuses)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
+    /// What is installed for this package, read back from `dumpsys command
+    /// package`. Powers the pre-install card's upgrade/downgrade warning.
+    async fn package_info(&self, device: &str, package: &str) -> zbus::fdo::Result<String> {
+        if device.is_empty() || package.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "device and package are required".into(),
+            ));
+        }
+        if !is_package_name(package) {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "{package} does not look like a package name"
+            )));
+        }
+        let key = format!("{device}\u{0}{package}");
+        if let Some(cached) = self.package_info.fresh(&key) {
+            return Ok(cached);
+        }
+        match read_package_info(device, package).await {
+            Ok(json) => {
+                self.package_info.store(&key, json.clone());
+                Ok(json)
+            }
+            Err(e) => {
+                if let Some(cached) = self.package_info.stale(&key) {
+                    tracing::debug!(%device, error = %e, "package_info refresh failed; serving the cached reading");
+                    return Ok(cached);
+                }
+                Err(zbus::fdo::Error::Failed(format!("package_info: {e}")))
+            }
+        }
+    }
+
+    /// Every package on the device, with its state.
+    ///
+    /// The answer is a JSON array of `PackageRow`. It is cached, because the
+    /// GUI refreshes the list often and each reading costs four `pm` calls on
+    /// the phone.
+    async fn list_packages(&self, device: &str, user: u16) -> zbus::fdo::Result<String> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        client_for(&self.state, device)?;
+        let key = format!("{device}\u{0}{user}");
+        if let Some(cached) = self.packages.fresh(&key) {
+            return Ok(cached);
+        }
+        match packages::inventory(device, user).await {
+            Ok(rows) => {
+                let json = serde_json::to_string(&rows)
+                    .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))?;
+                self.packages.store(&key, json.clone());
+                Ok(json)
+            }
+            Err(e) => {
+                // A phone that has gone quiet should not empty the list; the
+                // last good reading is better than nothing.
+                if let Some(cached) = self.packages.stale(&key) {
+                    tracing::debug!(%device, error = %e, "list_packages refresh failed; serving the cached reading");
+                    return Ok(cached);
+                }
+                Err(zbus::fdo::Error::Failed(format!("list_packages: {e}")))
+            }
+        }
+    }
+
+    /// Change the state of a batch of packages.
+    ///
+    /// `actions` is a JSON array of `{ "package": ..., "action": ... }`, where
+    /// the action is one of `disable`, `enable`, `uninstall` or `restore`. The
+    /// answer is a JSON array of `PackageResult`, one per request, in the
+    /// order the requests were given.
+    ///
+    /// The calls run a few at a time, so a list of two hundred packages does
+    /// not take two hundred round trips in a row.
+    async fn apply_package_actions(
+        &self,
+        device: &str,
+        user: u16,
+        actions: &str,
+    ) -> zbus::fdo::Result<String> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        client_for(&self.state, device)?;
+        let requests: Vec<packages::PackageRequest> = serde_json::from_str(actions)
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("actions: {e}")))?;
+        if requests.len() > MAX_PACKAGE_ACTIONS {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "at most {MAX_PACKAGE_ACTIONS} packages can be changed at once"
+            )));
+        }
+        let results = packages::apply_all(device, user, requests).await;
+        // The device now reports something different, so the cached reading
+        // of it is stale.
+        self.packages.forget(&format!("{device}\u{0}{user}"));
+        serde_json::to_string(&results)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
+    /// Remove an installed package from a device. `pm uninstall` works for a
+    /// normal user app; a delete is offered by recovery flows only.
+    async fn uninstall_package(&self, device: &str, package: &str) -> zbus::fdo::Result<()> {
+        if device.is_empty() || package.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "device and package are required".into(),
+            ));
+        }
+        if !is_package_name(package) {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "{package} does not look like a package name"
+            )));
+        }
+        client_for(&self.state, device)?;
+        let out = adb_shell_with(
+            device,
+            &format!("pm uninstall '{package}'"),
+            UNINSTALL_TIMEOUT,
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(format!("uninstall: {e}")))?;
+        // `pm uninstall` prints `Success` on victory and `Failure [...]` with
+        // a reason otherwise; an empty output means the adb call itself
+        // returned nothing, which is nearly always a disconnect.
+        let trimmed = out.trim();
+        if trimmed != "Success" {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "uninstall {package}: {}",
+                if trimmed.is_empty() {
+                    "device did not answer"
+                } else {
+                    trimmed
+                }
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1991,5 +2648,35 @@ mod tests {
         assert!(check_tree_path("relative/path").is_err());
         assert!(check_tree_path("/sdcard/\0evil").is_err());
         assert!(check_tree_path(&format!("/{}", "x".repeat(4096))).is_err());
+    }
+
+    #[test]
+    fn package_names_follow_the_platform_rule() {
+        assert!(is_package_name("com.samsung.android.bixby.service"));
+        assert!(is_package_name("com.example.app_2"));
+        assert!(is_package_name("android"));
+        // A segment may not start with a digit or an underscore, and a
+        // hyphen is not part of the grammar at all.
+        assert!(!is_package_name("com.2fast.app"));
+        assert!(!is_package_name("com.example.-app"));
+        assert!(!is_package_name("com.example.app;rm -rf /"));
+        assert!(!is_package_name("com.example.app$(id)"));
+        assert!(!is_package_name(""));
+        assert!(!is_package_name("com..app"));
+        assert!(!is_package_name(&"a".repeat(225)));
+    }
+
+    #[test]
+    fn a_missing_local_path_is_not_mistaken_for_a_device_path() {
+        // The old rule treated every path that did not exist here as a path
+        // on the phone, which made the "does not exist on this computer"
+        // error unreachable.
+        assert!(!is_device_local_path("does-not-exist.apk"));
+        assert!(!is_device_local_path("relative/does-not-exist.apk"));
+        assert!(is_device_local_path("/sdcard/Download/app.apk"));
+        assert!(is_device_local_path("/storage/emulated/0/app.apk"));
+        assert!(is_device_local_path("/data/local/tmp/app.apk"));
+        // An absolute path that is not on this computer is on the phone.
+        assert!(is_device_local_path("/somewhere/else/app.apk"));
     }
 }

@@ -293,7 +293,13 @@ pub fn cached(path: &Path, size: Size) -> Option<Thumb> {
     let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
     let uri = file_uri(path);
     let file = cache_path(&uri, size);
-    let png = std::fs::read(&file).ok()?;
+    let png = std::fs::read(&file).ok().or_else(|| {
+        let other = match size {
+            Size::Large => Size::Normal,
+            Size::Normal => Size::Large,
+        };
+        std::fs::read(cache_path(&uri, other)).ok()
+    })?;
 
     // The spec requires verifying the stored URI (hash collisions) and the
     // mtime (the file changed). Skipping this check is how a stale thumbnail

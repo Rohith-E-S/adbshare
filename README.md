@@ -16,6 +16,7 @@ Browse your Android phone and move files between it and your Linux computer over
 - Watch transfer progress, speed, and ETA; pause, resume, or cancel queued work.
 - Create folders, rename items, view properties, and delete items.
 - Install APKs from the computer or the phone.
+- Debloat a phone: see what is preinstalled, what it is for, and how safe it is to remove, then disable or uninstall it.
 - Pair a phone and connect to it over Wi-Fi.
 - Open phone files in external applications through FUSE.
 
@@ -189,8 +190,10 @@ The full list is also in the app, under **Keyboard shortcuts** in the overflow m
 | `Ctrl+F` | Search the current folder |
 | `Esc` | Clear the selection |
 | `F5` | Refresh |
-| `F9` | Toggle the sidebar |
+| `F9` / `Ctrl+B` | Toggle the sidebar |
 | `Ctrl+U` | Send a file to the phone |
+| `Ctrl+I` | Install an APK |
+| `Ctrl+Shift+D` | Debloat phone |
 | `Ctrl+Shift+C` | Save selected phone files to the computer |
 | `Ctrl+C` / `Ctrl+V` | Copy / paste files; see the same-phone limitation below |
 | `Ctrl+N` | New folder |
@@ -207,10 +210,34 @@ For Android's Wireless debugging feature, choose **Connect via Wi-Fi…** in adb
 
 ### Install an APK
 
-Use **Install APK…** in the more-options menu, or the APK context action. Dropping an APK onto a phone folder offers an install-versus-copy choice. Installation uses Android's package manager and may replace an existing installation; only install APKs you trust.
+Use **Install APK…** in the more-options menu, press **Ctrl+I**, or use the APK context action — selecting several APKs installs them as a batch, one after another. Dropping APKs anywhere on the phone view offers install-versus-copy too, again for whole handfuls at once. The install card shows what the package is — name, version, size, permissions, required Android version — and warns when the phone already has a newer version installed, when signatures would clash, or when the APK's native libraries do not match the phone's CPU. An APK already in the phone's storage can be installed straight from there. Installation runs in the background with live transfer progress, and a failure comes back with a plain-language reason plus recovery actions (such as uninstalling the conflicting version and retrying). A history of recent installs is kept in `~/.config/adbshare/install_history.json`. Installation uses Android's package manager and may replace an existing installation; only install APKs you trust.
+
+### Debloat a phone
+
+Press **Ctrl+Shift+D**, or use **Debloat phone…** in the more-options menu, to swap the main pane for a list of what is on the phone.
+
+The list is the phone's own packages, joined against a curated list of what each app is and how safe it is to remove. The curated list comes from the [Universal Android Debloater Next Generation](https://github.com/Universal-Debloater-Alliance/universal-android-debloater-next-generation) project (GPL-3.0; see `crates/adb-gui/assets/debloat/NOTICE`) and is bundled with adbshare, so nothing is fetched from the network. It is bundled rather than downloaded because adbshare does not phone home; `make debloat-list` takes a newer snapshot.
+
+Because the list is joined against what is actually installed, the answer to "what is bloat on this phone" needs no guesswork about the brand: a Poco shows Xiaomi's software, a German contract phone shows the carrier's, a Pixel shows Google's. The filters narrow by vendor, by risk, and by whether the app is installed.
+
+Four things can be done to a package, and all four can be taken back:
+
+| Action | What it does | Undone by |
+|---|---|---|
+| **Disable** | The app stops running and leaves the launcher | Enable |
+| **Enable** | A disabled app comes back | Disable |
+| **Uninstall** | The app is unlinked for this user, keeping its data | Restore |
+| **Restore** | An unlinked app is linked back | Uninstall |
+
+Before anything happens, a card says what will change, how many of the chosen apps are risky, and which other apps would be left broken. Every change is written to `~/.config/adbshare/debloat_ledger.json`, so the whole of a session's work can be put back in one go.
+
+Two things to know. **Android 15 and later refuse to let ADB switch a system app off** (`Cannot disable system packages`), and **Android 17 and later refuse to let ADB remove one at all** (`only root can delete system app for a particular user`). On those versions only apps you installed yourself can be disabled, and removing a preinstalled app is done by uninstalling it for this user — which is what the **Uninstall** action does, and which **Restore** undoes. The card says so before you commit, and a refusal comes back as a plain sentence rather than a stack trace.
+
+A system app is never really removed: it stays on the phone's read-only partition and comes back after a factory reset.
 
 ## Current limitations
 
+- **Debloating a system app depends on the phone's Android version.** Android 15 and later refuse to let ADB switch a system app off, and Android 17 and later refuse to let ADB remove one. Uninstalling for the current user still works and is reversible, but a refusal is the phone's decision, not adbshare's. Work profiles and other users are not touched: everything happens for the phone's owner.
 - **Phone deletion is permanent.** Only local files offer “Move to Trash”; there is no phone trash/recovery feature. `Shift+Delete` is the explicit permanent-delete action on both.
 - The grid renders only the rows that fit on screen, so a folder with thousands of files scrolls as smoothly as a small one. The list view is likewise virtualised.
 - Same-phone paste copies files and folders without replacing existing destinations (folders copy synchronously; symlinks are skipped). It requires the updated phone helper. If a copy loses its connection or times out, completion is unknown: the destination may be incomplete or still copying. Cross-phone paste is unsupported.

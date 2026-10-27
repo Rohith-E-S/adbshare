@@ -1,6 +1,6 @@
 The folder PNGs in this directory are from the Yaru icon theme
 (https://github.com/ubuntu/yaru), taken from the `Yaru-purple` variant at
-48x48@2x. They are the same artwork the desktop file manager shows, so a
+256x256@2x (512x512). They are the same artwork the desktop file manager shows, so a
 directory looks the same in adbshare as it does everywhere else.
 
 Upstream states:

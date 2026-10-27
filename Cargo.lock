@@ -57,6 +57,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "dirs 5.0.1",
+ "flate2",
  "futures",
  "gpui",
  "image",
