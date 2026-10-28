@@ -66,8 +66,6 @@ pub struct Palette {
     pub sidebar: Rgba,
     /// `--card`. Dialogs, popovers and the panels inside them.
     pub card: Rgba,
-    /// `--surface-raised`. A resting row or tile.
-    pub surface_raised: Rgba,
 
     // ── Interaction ────────────────────────────────────────────────────────
     // Percentages of white rather than fixed greys, so one value works over
@@ -206,7 +204,6 @@ impl Palette {
             // canvas rather than blending into it.
             sidebar: rgba(0x000000FF),
             card: rgba(0x111111FF),
-            surface_raised: rgba(0x111111FF),
 
             // Interaction, as the theme's own percentages of white. `--accent`
             // is white 4% and `--sidebar-row-active` white 11%, so hover sits
@@ -380,8 +377,6 @@ pub const RADIUS_CAPSULE_BTN: f32 = 7.0;
 pub const RADIUS_ROW: f32 = 8.0;
 /// Corner radius of a device card.
 pub const RADIUS_CARD: f32 = 12.0;
-/// Corner radius of an omnibar / context bar.
-pub const RADIUS_BAR: f32 = 10.0;
 /// Height of the bottom status strip.
 pub const STATUSBAR_H: f32 = 30.0;
 /// Full-pill radius, used for badges and LEDs.

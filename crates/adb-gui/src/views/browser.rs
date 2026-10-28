@@ -1851,60 +1851,6 @@ fn short_serial(serial: &str) -> String {
 
 // ── Rendering ────────────────────────────────────────────────────────────────
 
-/// The context strip above the file area: what is being browsed, and how much of
-/// it is currently visible.
-fn context_bar(browser: &Browser, t: &theme::Palette) -> Div {
-    let icon = if browser.is_local() {
-        names::DRIVE_HARDDISK
-    } else {
-        names::PHONE
-    };
-    let title = if browser.is_local() {
-        "This computer".to_string()
-    } else {
-        browser.device_label()
-    };
-    let shown = browser.visible.len();
-    let total = browser.entries.len();
-    let count = if shown == total {
-        format!("{total} item(s)")
-    } else {
-        format!("{shown} of {total}")
-    };
-
-    div()
-        .flex()
-        .items_center()
-        .gap(px(10.0))
-        .mx(px(10.0))
-        .mt(px(8.0))
-        .px(px(14.0))
-        .py(px(8.0))
-        .rounded(px(theme::RADIUS_BAR))
-        // A raised strip: T3 Code's canvas is near-black, so the context bar sits
-        // on the `--surface-raised` step above it rather than below it.
-        .bg(t.surface_raised)
-        .border_1()
-        .border_color(t.border_soft)
-        .child(icons::icon(icon, 16.0, ui::icon_tint(icon, t)))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .min_w_0()
-                .child(
-                    div()
-                        .text_size(t.text(13.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(t.text_header)
-                        .child(title),
-                )
-                .child(ui::mono(browser.path().display().to_string(), t).mt(px(2.0))),
-        )
-        .child(div().flex_1())
-        .child(ui::mono(count, t))
-}
-
 /// Shown when nothing is selected: what to do, in order.
 fn empty_state(t: &theme::Palette) -> Div {
     div()
@@ -2774,7 +2720,6 @@ impl Render for Browser {
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_first))
             .on_action(cx.listener(Self::focus_last))
-            .child(context_bar(self, &t))
             .child(scroller)
             .child(status_bar(self, &t, &me))
             .into_any_element()
