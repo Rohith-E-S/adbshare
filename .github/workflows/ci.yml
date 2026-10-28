@@ -107,7 +107,13 @@ jobs:
             vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel \
             wayland-devel libX11-devel libXext-devel \
             fontconfig-devel freetype-devel \
-            fuse3-devel libusbx-devel
+            fuse3-devel libusbx-devel \
+            yaru-icon-theme adwaita-icon-theme-legacy
+        # The icon packages are for the test step, not the build: adb-gui's
+        # sysicons test resolves every name in its table against the icon
+        # themes installed on the machine. A bare container has none, so it
+        # fails on a missing application-pdf.png. Yaru supplies the raster
+        # mimetypes and Adwaita legacy the device icons (media-optical).
 
       # Matches `rust-toolchain.toml`. Pinned to an exact release rather than
       # `stable`, so a new lint cannot turn the job red on a tree that passed

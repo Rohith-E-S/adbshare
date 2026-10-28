@@ -38,6 +38,17 @@ ignore = [
   #
   # Revisit when rsa ships constant-time padding or implicit rejection.
   "RUSTSEC-2023-0071",
+  # crypto-bigint 0.5.5 — timing variability in operations meant to be
+  # constant-time (RUSTSEC-2026-0387). Patched in 0.7.6, but nothing in this
+  # workspace compiles it: it is in the lockfile as an optional dependency of
+  # ssh-key's ECDSA curve features (p256/p384/p521 -> elliptic-curve 0.13).
+  # adb-device enables only ssh-key's `rsa` support — ADB authentication is
+  # RSA-2048, and auth.rs rejects any non-RSA OpenSSH key — so those features
+  # are never activated and `cargo tree -e features -i crypto-bigint` resolves
+  # nothing. Cargo.lock records optional dependencies for every feature, which
+  # is why the audit reports it anyway. Revisit if an ECDSA feature is enabled
+  # or ssh-key 0.7 (currently an RC, on elliptic-curve 0.14) is adopted.
+  "RUSTSEC-2026-0387",
 ]
 
 # git2's two unsound advisories (RUSTSEC-2026-0183 / -0184) used to be listed
