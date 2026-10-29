@@ -36,19 +36,29 @@ pub enum ViewMode {
 
 /// How much one Ctrl+= / Ctrl+- press changes the icon size.
 const ZOOM_STEP: f32 = 12.0;
-/// Padding around a grid tile, on top of the icon.
+/// Space around a grid tile, on top of the icon. Also the grid's outer inset.
 const GRID_TILE_PAD: f32 = 14.0;
+/// Horizontal padding inside a grid tile.
+const GRID_TILE_PAD_X: f32 = 8.0;
+/// Vertical padding inside a grid tile.
+const GRID_TILE_PAD_Y: f32 = 10.0;
 
-/// Height of the two lines under a grid tile's icon: the name and, for a file,
-/// its size. Part of the tile's height, so it appears in both the tile and the
-/// row maths and cannot drift between them.
-const GRID_TILE_CAPTION: f32 = 34.0;
+/// Height of the caption block under a grid tile's icon: up to two name lines
+/// and, for a file, its size. Part of the tile's height, so it appears in both
+/// the tile and the row maths and cannot drift between them.
+const GRID_TILE_CAPTION: f32 = 46.0;
 /// Gap between grid tiles.
 const GRID_GAP: f32 = 8.0;
-/// Height of one row in the list view.
+/// List icon size at the default zoom. List rows scale with the same zoom the
+/// grid uses, so Ctrl+= / Ctrl+- are not dead keys in this mode.
+const LIST_ICON: f32 = 18.0;
+/// List icon bounds, matching the zoom range's effect on a 18px default.
+const LIST_ICON_RANGE: (f32, f32) = (14.0, 40.0);
+/// Height of one row in the list view at the default zoom: the icon plus its
+/// vertical breathing room, which stays constant as the icon scales.
 const LIST_ROW_H: f32 = 30.0;
-/// Height of the context strip above the file area: padding plus two text lines.
-pub const CONTEXT_BAR_H: f32 = 38.0;
+/// Height of the sticky column header above the list view.
+const LIST_HEADER_H: f32 = 28.0;
 /// Height of the search strip, shown only while search is active.
 pub const SEARCH_ROW_H: f32 = 40.0;
 
@@ -812,6 +822,18 @@ impl Browser {
         self.zoom + GRID_TILE_PAD * 2.0
     }
 
+    /// The current list icon size. The list has no separate zoom: it reads the
+    /// grid's, scaled down to row-sized icons.
+    pub fn list_icon(&self) -> f32 {
+        list_icon_size(self.zoom)
+    }
+
+    /// The height of one list row at the current zoom. Row height follows the
+    /// icon so the padding above and below it stays constant.
+    pub fn list_row_h(&self) -> f32 {
+        list_row_height(self.list_icon())
+    }
+
     pub fn has_key_focus(&self, window: &Window) -> bool {
         self.focus.is_focused(window)
     }
@@ -1125,7 +1147,7 @@ impl Browser {
                 first..last.max(first)
             }
             ViewMode::List => {
-                let (first, rows) = self.visible_row_range(LIST_ROW_H);
+                let (first, rows) = self.visible_row_range(self.list_row_h());
                 let first = first.min(count);
                 let end = (first + rows).min(count);
                 first..end.max(first)
@@ -1528,18 +1550,14 @@ impl Browser {
 
     /// How far the item area starts below the top of the browser's own box.
     ///
-    /// The context strip and, while it is showing, the search row are the
-    /// browser's first children; the grid then adds its own padding. Anything
-    /// that positions or hit-tests items has to start here, or drag-selection
-    /// lands on the wrong row.
+    /// In the grid that is its own padding; in the list it is the sticky column
+    /// header. Anything that positions or hit-tests items has to start here, or
+    /// drag-selection lands on the wrong row.
     pub fn item_area_top(&self) -> f32 {
-        CONTEXT_BAR_H
-            + if self.search_active {
-                SEARCH_ROW_H
-            } else {
-                0.0
-            }
-            + GRID_TILE_PAD
+        match self.view_mode {
+            ViewMode::Grid => GRID_TILE_PAD,
+            ViewMode::List => LIST_HEADER_H,
+        }
     }
 
     /// How tall the item area is inside the browser's own box.
@@ -1762,6 +1780,16 @@ pub fn step_zoom(current: f32, delta: f32) -> f32 {
     (current + delta).clamp(prefs::ZOOM_RANGE.0, prefs::ZOOM_RANGE.1)
 }
 
+/// Map the grid zoom level onto a list-view icon size.
+pub fn list_icon_size(zoom: f32) -> f32 {
+    (zoom * LIST_ICON / prefs::ZOOM_DEFAULT).clamp(LIST_ICON_RANGE.0, LIST_ICON_RANGE.1)
+}
+
+/// List row height for an icon size, keeping the default row's padding.
+pub fn list_row_height(icon: f32) -> f32 {
+    icon + (LIST_ROW_H - LIST_ICON)
+}
+
 /// Number of grid tiles that fit across `container_w`.
 pub fn grid_columns(container_w: f32, tile_w: f32, gap: f32) -> usize {
     if tile_w <= 0.0 || container_w <= 0.0 {
@@ -1922,6 +1950,36 @@ fn transfer_bar(browser: &Browser, t: &theme::Palette) -> AnyElement {
         .into_any_element()
 }
 
+/// The fixed column header above the list view.
+///
+/// It sits outside the scroller, so it stays put while rows scroll under it.
+/// Widths mirror [`Browser::list_row_with`]: an icon slot, a flexible name
+/// column, and the fixed size and date columns.
+fn list_column_header(t: &theme::Palette, icon: f32) -> AnyElement {
+    let label = |text: &'static str| -> AnyElement {
+        div()
+            .text_size(t.text(11.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(t.text_muted)
+            .child(text)
+            .into_any_element()
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .h(px(LIST_HEADER_H))
+        .mx(px(10.0))
+        .px(px(8.0))
+        .border_b_1()
+        .border_color(t.divider)
+        .child(div().w(px(icon)).flex_shrink_0())
+        .child(div().flex_1().min_w_0().child(label("Name")))
+        .child(div().w(px(72.0)).text_right().child(label("Size")))
+        .child(div().w(px(118.0)).text_right().child(label("Modified")))
+        .into_any_element()
+}
+
 fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) -> AnyElement {
     let running = browser.active_jobs > 0;
     // A listing in flight outranks everything: the count is the previous
@@ -1948,7 +2006,7 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
         .px(px(14.0))
         .bg(t.statusbar)
         .border_t_1()
-        .border_color(t.border_soft)
+        .border_color(t.divider)
         .child(
             div()
                 .flex_1()
@@ -2301,6 +2359,11 @@ impl Browser {
         // One div per piece of text rather than a wrapper plus a label: at
         // ~0.023ms per element, the two wrappers this tile used to spend on the
         // name and the size were about a third of its layout cost for nothing.
+        //
+        // Two name lines rather than one truncated line: a camera or download
+        // name is long, and `12303701_Ad...` tells the reader nothing. The
+        // clamp keeps a pathological name from pushing the tile out of its
+        // fixed height, while line-height keeps the two lines tight.
         let label = div()
             // So a test can measure the laid-out box. Note what this does *not*
             // prove: `debug_bounds` reports the element's box, not the width the
@@ -2315,18 +2378,18 @@ impl Browser {
             // means collapsing to the shortest thing that can be drawn, which is
             // an ellipsis. Every name read as "...".
             //
-            // The tile's own 8px of horizontal padding is taken out here, so the
-            // label is exactly as wide as the tile's content box and `truncate()`
-            // has a definite box to ellipsize inside. The size line below already
-            // worked this way, which is why the sizes were readable while the
-            // names were not.
-            .w(px(tile_w - 8.0))
-            .px(px(2.0))
+            // The tile's own horizontal padding is taken out here, so the label
+            // is exactly as wide as the tile's content box.
+            .w(px(tile_w - GRID_TILE_PAD_X * 2.0))
             .min_w_0()
             // The box is now the full width of the tile, so the text inside it
             // needs centring or names sit against the tile's left edge.
             .text_center()
             .text_size(t.text(11.5))
+            .line_height(relative(1.35))
+            // Wrap instead of ellipsizing on a single short line.
+            .whitespace_normal()
+            .line_clamp(2)
             .font_weight(if entry.looks_like_dir() {
                 gpui::FontWeight::MEDIUM
             } else {
@@ -2337,20 +2400,19 @@ impl Browser {
             } else {
                 t.text_secondary
             })
-            .truncate()
             .child(entry.name.clone());
 
         // A folder has no meaningful size, and an em dash under every folder was
         // just noise. Only files get the second line.
         let sub = (!entry.is_dir).then(|| {
             div()
-                .mt(px(1.0))
-                .w(px(tile_w - 8.0))
+                .mt(px(4.0))
+                .w(px(tile_w - GRID_TILE_PAD_X * 2.0))
                 .min_w_0()
                 .text_center()
                 .font_family(theme::MONO)
                 .text_size(t.text(9.5))
-                .text_color(t.text_muted)
+                .text_color(t.text_dim)
                 .truncate()
                 .child(human_size(entry.size))
         });
@@ -2364,7 +2426,11 @@ impl Browser {
         } else {
             None
         };
-        let hover_bg = if selected { t.selected_strong } else { t.hover };
+        let hover_bg = if selected {
+            t.selected_strong
+        } else {
+            t.row_hover
+        };
 
         let tile = div()
             .id(("tile", index))
@@ -2373,10 +2439,10 @@ impl Browser {
             .items_center()
             .w(px(tile_w))
             .h(px(tile_h))
-            .pt(px(GRID_TILE_PAD))
-            .px(px(4.0))
-            .pb(px(6.0))
-            .rounded(px(10.0))
+            .pt(px(GRID_TILE_PAD_Y))
+            .px(px(GRID_TILE_PAD_X))
+            .pb(px(GRID_TILE_PAD_Y))
+            .rounded(px(8.0))
             .cursor_pointer()
             // A tile is exactly `tile_w` wide by construction, and
             // `grid_geometry` hit-tests against that width. Left shrinkable, a
@@ -2434,6 +2500,7 @@ impl Browser {
         let entry = self.entries.get(index)?.clone();
         let selected = self.selection.contains(&index);
         let focused = self.focused == Some(index);
+        let icon = self.list_icon();
         let size = if entry.is_dir {
             "—".to_string()
         } else {
@@ -2454,7 +2521,11 @@ impl Browser {
         } else {
             None
         };
-        let hover_bg = if selected { t.selected_strong } else { t.hover };
+        let hover_bg = if selected {
+            t.selected_strong
+        } else {
+            t.row_hover
+        };
 
         let row = div()
             .id(("row", index))
@@ -2462,30 +2533,32 @@ impl Browser {
             .items_center()
             .gap(px(10.0))
             .w_full()
-            .h(px(LIST_ROW_H))
+            .h(px(self.list_row_h()))
             .mx(px(10.0))
             .px(px(8.0))
             .rounded(px(6.0))
+            .border_b_1()
+            .border_color(t.row_divider)
             .cursor_pointer()
             .when_some(resting_bg, |d, bg| d.bg(bg))
             .hover(move |d| d.bg(hover_bg))
-            .child(if let Some(thumb) = self.thumb_for(&entry, 18.0) {
+            .child(if let Some(thumb) = self.thumb_for(&entry, icon) {
                 thumb
             } else if entry.looks_like_dir() {
-                icons::artwork(folder_art_for(&entry), 18.0).into_any_element()
+                icons::artwork(folder_art_for(&entry), icon).into_any_element()
             } else if let Some(sys) = crate::sysicons::element(
                 &entry.ext(),
                 entry.mode,
-                16.0,
+                icon * 0.86,
                 &self.current_path.join(&entry.name),
             ) {
                 sys
             } else if let Some(art) = artwork_for(&entry) {
-                icons::artwork(art, 18.0).into_any_element()
+                icons::artwork(art, icon).into_any_element()
             } else {
                 icons::icon(
                     self.glyph_for(&entry),
-                    15.0,
+                    icon * 0.9,
                     if selected {
                         t.text_header
                     } else {
@@ -2562,7 +2635,7 @@ impl Render for Browser {
         };
         self.list_geometry = ListGeometry {
             origin_y: px(item_top),
-            row_h: LIST_ROW_H,
+            row_h: self.list_row_h(),
         };
 
         // After the geometry above, not before it. The request window is derived
@@ -2665,6 +2738,9 @@ impl Render for Browser {
             }
         };
 
+        let header = (self.view_mode == ViewMode::List && count > 0)
+            .then(|| list_column_header(&t, self.list_icon()));
+
         let scroller = div()
             .id("canvas")
             .flex_1()
@@ -2720,8 +2796,44 @@ impl Render for Browser {
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_first))
             .on_action(cx.listener(Self::focus_last))
+            .when_some(header, |d, header| d.child(header))
             .child(scroller)
             .child(status_bar(self, &t, &me))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The caption block has to fit two name lines, the gap and a size line
+    /// inside the tile's fixed height. Too small and a wrapped name is clipped
+    /// or pushed into the row below; the grid geometry would still claim the
+    /// old stride.
+    #[test]
+    fn grid_caption_fits_two_lines_and_a_size() {
+        // The tile is `icon + 2 * GRID_TILE_PAD` wide, and that width already
+        // covers the icon, so what remains below the icon is the outer pad on
+        // both axes plus the caption block.
+        let below_icon = GRID_TILE_PAD * 2.0 + GRID_TILE_CAPTION;
+        let name_line = 11.5 * 1.35;
+        let size_line = 9.5 * 1.2;
+        let needed = GRID_TILE_PAD_Y + 6.0 + 2.0 * name_line + 4.0 + size_line + GRID_TILE_PAD_Y;
+        assert!(
+            below_icon >= needed,
+            "caption needs {needed}px, tile has {below_icon}px"
+        );
+    }
+
+    /// Ctrl+= / Ctrl+- have to change something in the list too. They only
+    /// moved grid tiles before, so the keys looked dead in list mode.
+    #[test]
+    fn list_metrics_follow_the_zoom() {
+        let default = list_icon_size(prefs::ZOOM_DEFAULT);
+        assert_eq!(list_icon_size(prefs::ZOOM_DEFAULT), LIST_ICON);
+        assert_eq!(list_row_height(default), LIST_ROW_H);
+        assert!(list_icon_size(prefs::ZOOM_RANGE.1) > default);
+        assert!(list_icon_size(prefs::ZOOM_RANGE.0) < default);
     }
 }

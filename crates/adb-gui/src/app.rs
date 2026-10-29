@@ -32,7 +32,7 @@ use crate::state::history;
 use crate::state::localfs;
 use crate::state::prefs::{Preferences, SIDEBAR_RANGE};
 use crate::theme::{self, Themed};
-use crate::views::browser::{Browser, BrowserEvent, ViewMode};
+use crate::views::browser::{Browser, BrowserEvent, SEARCH_ROW_H, ViewMode};
 use crate::views::debloat::{Debloat, DebloatEvent};
 use crate::views::dialogs::{
     self, BatchItem, DebloatFailure, DebloatPackage, Dialog, DialogResult, ItemState, MessageTone,
@@ -4804,20 +4804,22 @@ fn device_card(
         .py(px(9.0))
         .rounded(px(theme::RADIUS_CARD))
         .cursor_pointer()
-        // A device card sits on the sidebar, so it takes the lighter surface to
-        // read as raised, and the focused border when it is the current device.
-        //
-        // `card`, not `canvas`: the onboarding card and the daemon-error card
-        // beside it both sit on `--card`, which is the one step above the pure
-        // black pane. This card was using `--background` instead, so the three
-        // cards in one sidebar rose off it by three different amounts — the
-        // phone sat flatter than the message telling you no phone was found.
-        .bg(if active { t.selected } else { t.card })
+        // A device card sits on the elevated sidebar, so it takes the raised
+        // control surface, and the accent identity of the current device when
+        // it is the active one.
+        .bg(if active { t.device_active_bg } else { t.card })
         .border_1()
         .border_color(if active {
-            t.accent_muted
+            t.device_active_border
         } else {
-            t.border_soft
+            t.border
+        })
+        .hover(move |s| {
+            s.bg(if active {
+                t.device_active_bg
+            } else {
+                t.card_hover
+            })
         })
         .child(div().flex().items_center().gap(px(7.0)).children(head));
 
@@ -4829,7 +4831,7 @@ fn device_card(
                 div()
                     .mt(px(1.0))
                     .text_size(t.text(10.5))
-                    .text_color(t.text_muted)
+                    .text_color(t.text_dim)
                     .child(format_capacity((used, total))),
             );
     }
@@ -4895,6 +4897,7 @@ fn place_row(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(ui::el_id(format!("place:{label}")))
+        .relative()
         .flex()
         .items_center()
         .gap(px(10.0))
@@ -4905,19 +4908,43 @@ fn place_row(
         .rounded(px(theme::RADIUS_ROW))
         .cursor_pointer()
         .text_size(t.text(12.5))
+        .font_weight(if active {
+            gpui::FontWeight::MEDIUM
+        } else {
+            gpui::FontWeight::NORMAL
+        })
         .text_color(if active {
             t.text_header
         } else {
             t.text_secondary
         })
-        .border_1()
-        .border_color(if active {
-            t.secondary_bg
+        .bg(if active {
+            t.sidebar_active
         } else {
             rgba(0x00000000)
         })
-        .bg(if active { t.hover } else { rgba(0x00000000) })
-        .hover(|s| s.bg(t.hover).text_color(t.text_header))
+        .hover(move |s| {
+            s.bg(if active {
+                t.sidebar_active
+            } else {
+                t.row_hover
+            })
+            .text_color(t.text_header)
+        })
+        // The accent pill anchors the current folder to the left edge, so the
+        // selection survives even where the fill is subtle.
+        .when(active, |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(6.0))
+                    .bottom(px(6.0))
+                    .w(px(3.0))
+                    .rounded(px(2.0))
+                    .bg(t.accent),
+            )
+        })
         .child(icons::icon_or_art(
             icon,
             16.0,
@@ -5190,18 +5217,22 @@ impl Render for AdbShareApp {
             0.0
         };
         let content_x = sidebar_width + if show_sidebar { 4.0 } else { 0.0 };
-        let content_y = theme::TOPBAR_H;
+        // The search strip is a sibling above the browser, so the browser's
+        // reported box starts below it and loses that height. Reporting the
+        // wrong top while searching put every hit test one strip too high.
+        let search_h = if self.pane == Pane::Browser && self.browser.read(cx).search_active() {
+            SEARCH_ROW_H
+        } else {
+            0.0
+        };
+        let content_y = theme::TOPBAR_H + search_h;
         let viewport = window.viewport_size();
         // The menus measure the room left beneath them against this, and they
         // are built later in the same render.
         self.viewport_h = f32::from(viewport.height);
         let content_w: f32 = f32::from(viewport.width) - sidebar_width;
-        // The browser gets the box it was given, not the item area inside it:
-        // the context strip, search row and grid padding are the browser's own
-        // children, and only it knows how tall they are. Subtracting
-        // CONTEXT_BAR_H here as well made the viewport 38px short, because
-        // `item_area_top` adds that same constant back.
-        let content_h = f32::from(viewport.height) - theme::TOPBAR_H - theme::STATUSBAR_H;
+        let content_h =
+            f32::from(viewport.height) - theme::TOPBAR_H - theme::STATUSBAR_H - search_h;
         self.browser.update(cx, |b, cx| {
             b.set_viewport(content_x, content_y, content_w, content_h, cx)
         });

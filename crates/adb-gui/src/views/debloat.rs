@@ -1029,7 +1029,7 @@ impl Debloat {
             .px(px(14.0))
             .bg(t.statusbar)
             .border_t_1()
-            .border_color(t.border_soft)
+            .border_color(t.divider)
             .child(
                 div()
                     .flex_1()

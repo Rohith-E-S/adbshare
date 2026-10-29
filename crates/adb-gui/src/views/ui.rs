@@ -338,7 +338,7 @@ pub fn section_heading(text: impl Into<gpui::SharedString>, t: &Palette) -> Div 
         .h(px(24.0))
         .px(px(4.0))
         .text_size(t.text(11.0))
-        .font_weight(FontWeight::MEDIUM)
+        .font_weight(FontWeight::SEMIBOLD)
         .text_color(t.text_muted)
         .child(text.into().to_uppercase())
 }
@@ -522,11 +522,9 @@ pub fn menu_check(
 
 /// A right-pointing chevron for breadcrumb separators.
 pub fn breadcrumb_separator(t: &Palette) -> Div {
-    div().px(px(2.0)).child(icons::icon(
-        names::GO_NEXT,
-        11.0,
-        icon_tint(names::GO_NEXT, t),
-    ))
+    div()
+        .px(px(2.0))
+        .child(icons::icon(names::GO_NEXT, 11.0, t.text_muted))
 }
 
 // ── Tooltips ─────────────────────────────────────────────────────────────────
