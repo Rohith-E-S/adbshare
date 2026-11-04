@@ -4,24 +4,27 @@
 //! system lives here as tokens, installed as an [`gpui::Global`] that views read
 //! without threading it through every call.
 //!
-//! # A pure-black OLED theme with an elevated chrome
+//! # A deep slate workbench
 //!
-//! The file canvas stays true black (`#000000`) so an OLED panel switches those
-//! pixels off. Everything framing it — the sidebar, top bar and status bar —
-//! sits one step up at `#09090B`, and controls on that chrome rise again to
-//! `#121216`. Structure therefore reads from fill as well as from hairlines,
-//! and the hairlines themselves are `#222228` rather than the near-invisible
-//! borders the previous palette used.
+//! The file canvas is a deep ink-slate (`#0B0E12`) rather than pure black, so
+//! the whole window reads as one graphite instrument instead of a void with
+//! floating controls. Chrome steps up through `#10141A` and `#161C24`, cards
+//! and popovers sit at `#171D26`, and hairlines at `#232C37` give every pane a
+//! precise edge. Structure reads from fill first, border second.
 //!
-//! Text avoids pure white. At OLED contrast a `#FFFFFF` glyph blooms, so the
-//! strongest ink is `#F4F4F6`, body copy is `#EDEDEF`, metadata `#A1A1AA`, and
-//! section headers `#71717A`. That ladder keeps sizes, dates and storage stats
+//! The accent is a restrained cool cyan-blue (`#5CB6D9`): it marks the active
+//! device, the current location and live transfers, and nowhere else. States
+//! are kept off the accent ramp, so a selected row, a hovered control and a
+//! running job cannot be mistaken for one another.
+//!
+//! Text avoids pure white. The strongest ink is `#F3F6F8`, body copy
+//! `#E6EBF0`, secondary labels `#D3DAE1`, metadata `#97A3B0`, and section
+//! headers `#66717E`. That ladder keeps sizes, dates and storage stats
 //! scannable without letting them compete with file names.
 //!
 //! Surfaces are *opaque* steps, because near-black greys a browser cannot
 //! round-trip would band. Interaction fills are percentages of white instead:
-//! one value stays legible over the black canvas, the `#09090B` chrome and a
-//! `#121216` card alike.
+//! one value stays legible over the canvas, the chrome and a card alike.
 //!
 //! One token is deliberately absent: `scrollbar.thumb.background`. GPUI 0.2.2
 //! has no scrollbar colour API at all, so a palette entry for it would be a
@@ -66,6 +69,11 @@ pub struct Palette {
     pub device_active_bg: Rgba,
     /// Its accent border, at 60% so the edge stays crisp.
     pub device_active_border: Rgba,
+    /// A neutral accent wash for active chrome: the current breadcrumb, an
+    /// open toolbar button, the active device card.
+    pub accent_soft: Rgba,
+    /// The accent as an outline, one step quieter than [`Self::accent`].
+    pub accent_border: Rgba,
 
     // ── Interaction ────────────────────────────────────────────────────────
     // Percentages of white rather than fixed greys, so one value works over
@@ -181,86 +189,87 @@ impl Palette {
             IconHue::Success => self.success,
             IconHue::Warning => self.warning,
             IconHue::Danger => self.danger,
-            IconHue::Violet => rgba(0x8063C4FF),
-            IconHue::Cyan => rgba(0x4288ACFF),
+            IconHue::Violet => rgba(0x8B84C9FF),
+            IconHue::Cyan => rgba(0x5CB6D9FF),
             IconHue::Neutral => self.text_dim,
         }
     }
 
-    /// The app's dark theme: pure-black canvas, elevated chrome, one blue
+    /// The app's dark theme: a deep slate workbench with one cool cyan-blue
     /// accent.
     pub fn t3_dark() -> Self {
         Self {
-            // Surfaces. The canvas is true black; every piece of chrome is one
-            // deliberately visible step above it. Controls sit on `card`, so a
-            // capsule or a device card separates from the bar it lives on.
-            canvas: rgba(0x000000FF),
-            topbar: rgba(0x09090BFF),
-            topbar_raised: rgba(0x121216FF),
-            statusbar: rgba(0x09090BFF),
-            sidebar: rgba(0x09090BFF),
-            card: rgba(0x121216FF),
-            card_hover: rgba(0x1A1A22FF),
-            sidebar_active: rgba(0x1C1C24FF),
-            row_hover: rgba(0x141419FF),
-            divider: rgba(0x1F1F24FF),
-            row_divider: rgba(0x141418FF),
-            // The active device keeps its blue identity: a 6% tint under a 60%
-            // accent border, crisp enough to pick out at a glance.
-            device_active_bg: rgba(0x3B82F60F),
-            device_active_border: rgba(0x3B82F699),
+            // Surfaces. A deep ink-slate canvas; chrome and cards climb a
+            // visible step so the window reads as panes on one instrument.
+            canvas: rgba(0x0B0E12FF),
+            topbar: rgba(0x10141AFF),
+            topbar_raised: rgba(0x161C24FF),
+            statusbar: rgba(0x0E1217FF),
+            sidebar: rgba(0x0E1217FF),
+            card: rgba(0x171D26FF),
+            card_hover: rgba(0x1E2631FF),
+            sidebar_active: rgba(0x1B2530FF),
+            row_hover: rgba(0x151B22FF),
+            divider: rgba(0x232C37FF),
+            row_divider: rgba(0x171E26FF),
+            // The active device keeps its cyan identity: a 10% tint under a
+            // 70% accent border, crisp enough to pick out at a glance.
+            device_active_bg: rgba(0x5CB6D91A),
+            device_active_border: rgba(0x5CB6D9B3),
+            accent_soft: rgba(0x5CB6D91F),
+            accent_border: rgba(0x5CB6D98C),
 
-            // Interaction, as percentages of white. 8% clears the old 4% hover
-            // step while staying under the 11% selection, and it brightens on
-            // a card instead of disappearing into it.
-            hover: rgba(0xFFFFFF14),
-            selected: rgba(0xFFFFFF1C),
-            selected_strong: rgba(0xFFFFFF29),
-            pressed: rgba(0xFFFFFF24),
+            // Interaction, as percentages of white. 5% is a hover step that
+            // clears the slate canvas without bleaching a card; selection and
+            // its hover step stay brighter than any resting control.
+            hover: rgba(0xFFFFFF0D),
+            selected: rgba(0xFFFFFF14),
+            selected_strong: rgba(0xFFFFFF21),
+            pressed: rgba(0xFFFFFF1C),
             // A capsule is a raised control on the top bar.
-            capsule_bg: rgba(0x121216FF),
-            capsule_border: rgba(0x222228FF),
+            capsule_bg: rgba(0x161C24FF),
+            capsule_border: rgba(0x27313CFF),
             // A resting control, and one step denser under the pointer.
-            secondary_bg: rgba(0xFFFFFF14),
-            secondary_bg_hover: rgba(0xFFFFFF26),
+            secondary_bg: rgba(0xFFFFFF12),
+            secondary_bg_hover: rgba(0xFFFFFF22),
             track: rgba(0xFFFFFF14),
             fill_soft: rgba(0xFFFFFFD9),
 
             // Text. Off-white at the top of the ladder rather than #FFFFFF,
-            // which haloes on OLED; metadata and headers walk down through the
-            // zinc greys so filenames stay dominant.
-            text_header: rgba(0xF4F4F6FF),
-            text_primary: rgba(0xEDEDEFFF),
-            text_secondary: rgba(0xEDEDEFFF),
-            text_dim: rgba(0xA1A1AAFF),
-            text_muted: rgba(0x71717AFF),
+            // which blooms on a dark panel; metadata and headers walk down
+            // through the cool greys so filenames stay dominant.
+            text_header: rgba(0xF3F6F8FF),
+            text_primary: rgba(0xE6EBF0FF),
+            text_secondary: rgba(0xD3DAE1FF),
+            text_dim: rgba(0x97A3B0FF),
+            text_muted: rgba(0x66717EFF),
             text_inverse: rgba(0xFFFFFFFF),
-            text_on_light: rgba(0x000000FF),
+            text_on_light: rgba(0x081016FF),
 
-            // Strokes. A visible structural grey: #222228 is the line between
-            // the sidebar and the canvas, and around every card.
-            border: rgba(0x222228FF),
-            border_soft: rgba(0x222228FF),
+            // Strokes. A visible cool grey: #232C37 is the line between the
+            // sidebar and the canvas, and around every popover.
+            border: rgba(0x26303BFF),
+            border_soft: rgba(0x1E262FFF),
 
-            // Semantic. Focus and accent are the same blue, so they cannot
-            // disagree. The status hues stay legible on the black canvas.
-            accent: rgba(0x3B82F6FF),
-            success: rgba(0x00D492FF),
-            warning: rgba(0xFFB900FF),
-            danger: rgba(0xFB414AFF),
+            // Semantic. The accent is one restrained cyan-blue, used only for
+            // identity and live work. Status hues stay legible on the slate.
+            accent: rgba(0x5CB6D9FF),
+            success: rgba(0x41D6A3FF),
+            warning: rgba(0xE9B45AFF),
+            danger: rgba(0xEE6673FF),
             // Every tone surface is its hue at 16%, so a badge of any tone
             // carries the same weight against the same dark background.
-            success_soft: rgba(0x00D49229),
-            warning_soft: rgba(0xFFB90029),
-            danger_soft: rgba(0xFB414A29),
+            success_soft: rgba(0x41D6A329),
+            warning_soft: rgba(0xE9B45A29),
+            danger_soft: rgba(0xEE667329),
             // The panel border is one step denser than its fill, so a warning
             // panel keeps a visible edge.
-            danger_border: rgba(0xFB414A73),
+            danger_border: rgba(0xEE667380),
 
             // A tooltip is an overlay, so it sits above every surface.
-            tooltip: rgba(0x171717F2),
-            tooltip_text: rgba(0xF4F4F6FF),
-            tooltip_border: rgba(0xFFFFFF14),
+            tooltip: rgba(0x1A222CF2),
+            tooltip_text: rgba(0xF3F6F8FF),
+            tooltip_border: rgba(0x2A3642FF),
 
             // No scale until a preference says otherwise; see [`set_font_scale`].
             font_scale: TEXT_SCALES[TEXT_DEFAULT_STEP],
@@ -366,13 +375,13 @@ pub const CAPSULE_H: f32 = 34.0;
 /// Edge length of a square icon button inside a capsule.
 pub const CAPSULE_BTN: f32 = 30.0;
 /// Corner radius of a capsule container.
-pub const RADIUS_CAPSULE: f32 = 10.0;
+pub const RADIUS_CAPSULE: f32 = 9.0;
 /// Corner radius of a button inside a capsule.
-pub const RADIUS_CAPSULE_BTN: f32 = 7.0;
+pub const RADIUS_CAPSULE_BTN: f32 = 6.0;
 /// Corner radius of a sidebar row.
-pub const RADIUS_ROW: f32 = 8.0;
+pub const RADIUS_ROW: f32 = 6.0;
 /// Corner radius of a device card.
-pub const RADIUS_CARD: f32 = 12.0;
+pub const RADIUS_CARD: f32 = 10.0;
 /// Height of the bottom status strip.
 pub const STATUSBAR_H: f32 = 30.0;
 /// Full-pill radius, used for badges and LEDs.
