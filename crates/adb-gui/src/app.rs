@@ -4211,18 +4211,46 @@ impl AdbShareApp {
             .h(px(theme::CAPSULE_H))
             .px(px(12.0))
             .rounded(px(theme::RADIUS_CAPSULE))
+            .when(active > 0, |d| {
+                d.bg(t.accent_soft)
+                    .border_1()
+                    .border_color(t.accent_border)
+            })
             .cursor_pointer()
             .text_size(t.text(14.0))
-            .text_color(t.text_dim)
+            .text_color(if active > 0 {
+                t.text_header
+            } else {
+                t.text_dim
+            })
             .hover(|s| s.bg(t.hover).text_color(t.text_header))
             .child(icons::icon(
                 names::EMBLEM_SYNC,
                 15.0,
-                ui::icon_tint(names::EMBLEM_SYNC, t),
+                if active > 0 {
+                    t.accent
+                } else {
+                    ui::icon_tint(names::EMBLEM_SYNC, t)
+                },
             ))
-            .child("Transfers")
+            .child(div().ml(px(5.0)).child("Transfers"))
             .when(active > 0, |d| {
-                d.child(div().mx(px(6.0)).child(ui::led(t.success)))
+                d.child(
+                    div()
+                        .ml(px(7.0))
+                        .min_w(px(18.0))
+                        .h(px(18.0))
+                        .px(px(5.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(theme::RADIUS_PILL))
+                        .bg(t.accent)
+                        .text_size(t.text(10.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(t.text_on_light)
+                        .child(active.to_string()),
+                )
             })
             .on_click(cx.listener(|this, _e, _w, cx| {
                 this.transfers_open = !this.transfers_open;

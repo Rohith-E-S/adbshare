@@ -330,17 +330,18 @@ pub fn mono(text: impl Into<gpui::SharedString>, t: &Palette) -> Div {
         .child(text.into())
 }
 
-/// The uppercase monospace sidebar headings.
+/// A quiet section label for the sidebar's three navigation groups.
 pub fn section_heading(text: impl Into<gpui::SharedString>, t: &Palette) -> Div {
     div()
         .flex()
-        .items_end()
-        .h(px(24.0))
-        .px(px(4.0))
-        .text_size(t.text(11.0))
+        .items_center()
+        .h(px(28.0))
+        .mt(px(7.0))
+        .px(px(8.0))
+        .text_size(t.text(11.5))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(t.text_muted)
-        .child(text.into().to_uppercase())
+        .text_color(t.text_dim)
+        .child(text.into())
 }
 
 /// A `Ctrl+U` style shortcut hint, matching `.shortcut-label`.
