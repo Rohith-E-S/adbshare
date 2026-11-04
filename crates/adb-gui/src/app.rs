@@ -4212,9 +4212,7 @@ impl AdbShareApp {
             .px(px(12.0))
             .rounded(px(theme::RADIUS_CAPSULE))
             .when(active > 0, |d| {
-                d.bg(t.accent_soft)
-                    .border_1()
-                    .border_color(t.accent_border)
+                d.bg(t.accent_soft).border_1().border_color(t.accent_border)
             })
             .cursor_pointer()
             .text_size(t.text(14.0))
