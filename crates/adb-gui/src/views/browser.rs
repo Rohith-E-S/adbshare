@@ -37,9 +37,13 @@ pub enum ViewMode {
 /// How much one Ctrl+= / Ctrl+- press changes the icon size.
 const ZOOM_STEP: f32 = 12.0;
 /// Space around a grid tile, on top of the icon. Also the grid's outer inset.
-const GRID_TILE_PAD: f32 = 14.0;
+/// 20 rather than 14: at the default zoom the caption is `zoom + 2*PAD - 2*PAD_X`
+/// wide, and 14 left it ~60px — under ten characters at 11.5px, so "Documents"
+/// wrapped mid-word into "Document / s". The tile is the icon's footprint plus
+/// this pad on both sides, so widening it widens the caption too.
+const GRID_TILE_PAD: f32 = 20.0;
 /// Horizontal padding inside a grid tile.
-const GRID_TILE_PAD_X: f32 = 8.0;
+const GRID_TILE_PAD_X: f32 = 6.0;
 /// Vertical padding inside a grid tile.
 const GRID_TILE_PAD_Y: f32 = 10.0;
 
@@ -329,10 +333,10 @@ impl Render for DragGhost {
         div()
             .px(px(10.0))
             .py(px(5.0))
-            .rounded(px(6.0))
+            .rounded(px(theme::RADIUS_CAPSULE_BTN))
             .border_1()
-            .border_color(t.capsule_border)
-            .bg(t.capsule_bg)
+            .border_color(t.border)
+            .bg(t.card)
             .text_size(t.text(11.0))
             .text_color(t.text_primary)
             .child(self.label.clone())
@@ -641,6 +645,13 @@ impl Browser {
     pub fn breadcrumbs(&self) -> Vec<(String, PathBuf)> {
         let first_label = if self.local_mode {
             "This computer".to_string()
+        } else if self.device.is_none() {
+            // Idle: nothing is connected, so the bar must not claim to be
+            // browsing a phone. `device_label`'s "Phone" fallback made the
+            // paused-on-launch window read as a device called "Phone" at
+            // its root, contradicting the "Connect your phone" pane below it
+            // and the sidebar's own "No phone connected" card.
+            "No phone connected".to_string()
         } else {
             self.device_label()
         };
@@ -1790,6 +1801,26 @@ pub fn list_row_height(icon: f32) -> f32 {
     icon + (LIST_ROW_H - LIST_ICON)
 }
 
+/// A name prepared for the grid caption's two wrapped lines.
+///
+/// The shaper breaks a word that is wider than the caption mid-word —
+/// "Wallpapers" became "Wallpaper / s" — because a caption has no word
+/// boundary to wrap at. Real file names are mostly separators, so a
+/// zero-width space after each `_`, `-` and `.` gives the shaper a break
+/// that is not mid-word, the way Nautilus wraps `java_error_in_studio.hprof`
+/// at its underscores. Display only: the zero-width space is invisible and
+/// the entry's real name is untouched everywhere else.
+pub fn wrap_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        out.push(ch);
+        if matches!(ch, '_' | '-' | '.') {
+            out.push('\u{200b}');
+        }
+    }
+    out
+}
+
 /// Number of grid tiles that fit across `container_w`.
 pub fn grid_columns(container_w: f32, tile_w: f32, gap: f32) -> usize {
     if tile_w <= 0.0 || container_w <= 0.0 {
@@ -1888,11 +1919,10 @@ fn empty_state(t: &theme::Palette) -> Div {
         .justify_center()
         .gap(px(10.0))
         .size_full()
-        .child(icons::icon(
-            names::PHONE,
-            40.0,
-            ui::icon_tint(names::PHONE, t),
-        ))
+        // The one accent glyph in an otherwise monochrome window: this is
+        // the focal point of the empty state, so it earns the accent the
+        // way a live transfer does, rather than the dim ink chrome wears.
+        .child(icons::icon(names::PHONE, 40.0, t.accent))
         .child(
             div()
                 .text_size(t.text(19.0))
@@ -1938,13 +1968,13 @@ fn transfer_bar(browser: &Browser, t: &theme::Palette) -> AnyElement {
     div()
         .w(px(120.0))
         .h(px(4.0))
-        .rounded(px(2.0))
+        .rounded(px(theme::RADIUS_PILL))
         .bg(t.border_soft)
         .child(
             div()
                 .w(px(120.0 * fraction))
                 .h_full()
-                .rounded(px(2.0))
+                .rounded(px(theme::RADIUS_PILL))
                 .bg(t.accent),
         )
         .into_any_element()
@@ -2049,7 +2079,7 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
                     .items_center()
                     .justify_center()
                     .size(px(22.0))
-                    .rounded(px(6.0))
+                    .rounded(px(theme::RADIUS_CAPSULE_BTN))
                     .cursor_pointer()
                     .hover(|s| s.bg(t.hover))
                     .child(icons::icon(
@@ -2086,7 +2116,7 @@ fn status_bar(browser: &Browser, t: &theme::Palette, owner: &Entity<Browser>) ->
                     .items_center()
                     .justify_center()
                     .size(px(22.0))
-                    .rounded(px(6.0))
+                    .rounded(px(theme::RADIUS_CAPSULE_BTN))
                     .cursor_pointer()
                     .hover(|s| s.bg(t.hover))
                     .child(icons::icon(
@@ -2400,7 +2430,7 @@ impl Browser {
             } else {
                 t.text_secondary
             })
-            .child(entry.name.clone());
+            .child(wrap_name(&entry.name));
 
         // A folder has no meaningful size, and an em dash under every folder was
         // just noise. Only files get the second line.
@@ -2442,7 +2472,7 @@ impl Browser {
             .pt(px(GRID_TILE_PAD_Y))
             .px(px(GRID_TILE_PAD_X))
             .pb(px(GRID_TILE_PAD_Y))
-            .rounded(px(8.0))
+            .rounded(px(theme::RADIUS_ROW))
             .cursor_pointer()
             // A tile is exactly `tile_w` wide by construction, and
             // `grid_geometry` hit-tests against that width. Left shrinkable, a
@@ -2536,7 +2566,7 @@ impl Browser {
             .h(px(self.list_row_h()))
             .mx(px(10.0))
             .px(px(8.0))
-            .rounded(px(6.0))
+            .rounded(px(theme::RADIUS_CAPSULE_BTN))
             .border_b_1()
             .border_color(t.row_divider)
             .cursor_pointer()
@@ -2824,6 +2854,20 @@ mod tests {
             below_icon >= needed,
             "caption needs {needed}px, tile has {below_icon}px"
         );
+    }
+
+    /// The wrap helper only inserts invisible break opportunities: the name
+    /// still reads the same, and a name with no separators is untouched.
+    #[test]
+    fn wrap_name_only_adds_break_opportunities() {
+        assert_eq!(wrap_name("Documents"), "Documents");
+        assert_eq!(
+            wrap_name("java_error_in_studio.hprof"),
+            "java_\u{200b}error_\u{200b}in_\u{200b}studio.\u{200b}hprof"
+        );
+        // What is drawn is the name: stripping the zero-width spaces the
+        // shaper was given gets the entry's name back exactly.
+        assert_eq!(wrap_name("a-b.c_d").replace('\u{200b}', ""), "a-b.c_d");
     }
 
     /// Ctrl+= / Ctrl+- have to change something in the list too. They only

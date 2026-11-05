@@ -307,109 +307,41 @@ pub fn icon_or_art(key: &'static str, size: f32, color: Rgba) -> AnyElement {
 // ── Icon hues ─────────────────────────────────────────────────────────────────
 //
 // Material Symbols are single-path outlines, tinted through that path's alpha,
-// so an icon has
-// no colour of its own until something gives it one. Rather than let every call
-// site reach for the palette's muted ink — which is what made every icon in the
-// UI the same grey — each icon is given the hue its meaning suggests and the
-// call site asks for the icon by name.
+// so an icon has no colour of its own until something gives it one.
 //
-// The hues are a closed set rather than a colour per icon, so the UI reads as
-// one system: six families from the app's theme, plus `Neutral` for the
-// direction and editing verbs that would only be noise if they were coloured.
+// Chrome is monochrome, the way Nautilus and every other GNOME toolbar is:
+// each glyph wears the dim ink, and state — the toggled-on view button, the
+// active transfer, the selected place — is what earns colour, applied by the
+// call site that knows the state (`icon_button_active`, the accent tokens),
+// not by the icon's name. The previous scheme gave every glyph the hue its
+// "meaning suggested", so one toolbar held a yellow send, a blue download and
+// a green phone: decoration, not state, and the bar read as a web dashboard.
+//
+// Two hues survive because they are meaning, not decoration: destructive and
+// error icons are red, and a warning dialog is amber. Everything else —
+// including the file-type glyphs, whose real colour comes from the theme
+// artwork and thumbnails beside them — is [`IconHue::Neutral`].
 // [`crate::theme::Palette::hue`] turns one into a colour.
 
 /// What an icon means, which is what decides its colour.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IconHue {
-    /// Anything that acts: refresh, send, open, info.
-    Accent,
-    /// Radios and storage: Wi-Fi, the terminal, a disk.
-    Cyan,
-    /// Motion and arrival: play, install, a download landing.
-    Success,
-    /// Things being made or moved: a new folder, a package, a warning.
-    Warning,
-    /// Anything destructive or stopped: trash, delete, close.
-    Danger,
-    /// Places and pictures: home, a photo, a sound file.
-    Violet,
-    /// Verbs with no colour of their own: back, forward, copy, paste, undo.
+    /// Chrome at rest: every icon that is neither destructive nor a warning.
     Neutral,
+    /// Anything destructive or stopped: trash, delete, cancel, an error.
+    Danger,
+    /// A warning presented as a warning, not a verb that happens to be amber.
+    Warning,
 }
 
 /// The hue a chrome icon wears, from the icon's own asset key.
 ///
 /// Keys with no meaning of their own — the full-colour artwork, which is not
-/// tinted at all — come back [`IconHue::Accent`] and are never asked.
+/// tinted at all — come back [`IconHue::Neutral`] and are never asked.
 pub fn hue(key: &str) -> IconHue {
     match key {
-        // Acts
-        names::REFRESH
-        | names::SEND_TO
-        | names::DOCUMENT
-        | names::DOCUMENT_OPEN
-        | names::EMBLEM_SYNC
-        | names::FILE_MANAGER
-        | names::HELP_ABOUT
-        | names::OBJECT_SELECT
-        | names::CHECKBOX_CHECKED
-        | names::DIALOG_INFORMATION => IconHue::Accent,
-
-        // Radios, storage and the shell
-        names::WIRELESS | names::DRIVE_HARDDISK | names::TERMINAL => IconHue::Cyan,
-
-        // Motion, arrival, and the phone those transfers are for. `DOWNLOAD` is
-        // deliberately absent: it is the same asset as `SOFTWARE_INSTALL`, so
-        // listing both would make this arm unreachable.
-        names::PLAY | names::SOFTWARE_INSTALL | names::FOLDER_UPLOAD | names::PHONE => {
-            IconHue::Success
-        }
-
-        // Things being made, moved or flagged
-        names::PAUSE
-        | names::FOLDER_NEW
-        | names::PACKAGE
-        | names::DOCUMENT_EDIT
-        | names::DIALOG_WARNING => IconHue::Warning,
-
-        // Anything destructive or stopped. `VIDEO_GENERIC` is here because a
-        // video reads as red the way it does on every desktop.
-        names::TRASH
-        | names::EDIT_DELETE
-        | names::STOP
-        | names::VIDEO_GENERIC
-        | names::DIALOG_ERROR => IconHue::Danger,
-
-        // Places, pictures and sound
-        names::HOME | names::IMAGE_GENERIC | names::AUDIO_GENERIC | names::CAMERA_PHOTO => {
-            IconHue::Violet
-        }
-
-        // Direction and editing verbs, the window controls and the grid/list
-        // switch — which has to read as a matched pair, so both halves share a
-        // hue rather than each picking one. A file's own name is on the row
-        // beside it, so `TEXT_GENERIC` needs no colour of its own either.
-        names::GO_NEXT
-        | names::GO_PREVIOUS
-        | names::GO_UP
-        | names::VIEW_GRID
-        | names::VIEW_LIST
-        |         names::VIEW_MORE
-        | names::SIDEBAR_SHOW
-        | names::EDIT_COPY
-        | names::EDIT_FIND
-        | names::EDIT_PASTE
-        | names::EDIT_UNDO
-        | names::TEXT_GENERIC
-        // The text-size rows are a setting, not a direction, so they take the
-        // neutral ink the other settings take rather than four different hues.
-        | names::TEXT_SMALLER
-        | names::TEXT_DEFAULT
-        | names::TEXT_LARGER
-        | names::TEXT_LARGEST => IconHue::Neutral,
-
-        // Anything this module does not know a name for, which in practice
-        // means full-colour artwork — never tinted, so never asked.
+        names::TRASH | names::EDIT_DELETE | names::STOP | names::DIALOG_ERROR => IconHue::Danger,
+        names::DIALOG_WARNING => IconHue::Warning,
         _ => IconHue::Neutral,
     }
 }

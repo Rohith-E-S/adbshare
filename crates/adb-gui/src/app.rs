@@ -4105,9 +4105,11 @@ impl AdbShareApp {
                 .h(px(theme::CAPSULE_H))
                 .px(px(6.0))
                 .rounded(px(theme::RADIUS_CAPSULE))
-                .bg(t.capsule_bg)
+                // A typed path is a field, so it gets a field's fill and
+                // outline rather than the top bar's flat chrome.
+                .bg(t.secondary_bg)
                 .border_1()
-                .border_color(t.capsule_border)
+                .border_color(t.border_soft)
                 .w(px(584.0))
                 .child(field)
                 .into_any_element();
@@ -4130,7 +4132,7 @@ impl AdbShareApp {
                     .items_center()
                     .h(px(26.0))
                     .px(px(8.0))
-                    .rounded(px(6.0))
+                    .rounded(px(theme::RADIUS_CAPSULE_BTN))
                     .text_size(t.text(12.0))
                     .cursor_pointer()
                     .text_color(if is_current {
@@ -4169,11 +4171,8 @@ impl AdbShareApp {
             .min_w_0()
             .px(px(8.0))
             .rounded(px(theme::RADIUS_CAPSULE))
-            // `toolbar.background`: the darker step Zed uses for its strips,
-            // which is what a path bar is.
-            .bg(t.topbar_raised)
-            .border_1()
-            .border_color(t.border_soft)
+            // Flat like the rest of the top bar: the breadcrumbs read by
+            // their separators and the hover fills, not by a raised strip.
             .id("crumbs")
             .overflow_x_scroll()
             .scrollbar_width(px(0.0))
@@ -4301,11 +4300,9 @@ impl AdbShareApp {
                     .gap(px(8.0))
                     .px(px(18.0))
                     .py(px(28.0))
-                    .child(icons::icon(
-                        names::EMBLEM_SYNC,
-                        28.0,
-                        ui::icon_tint(names::EMBLEM_SYNC, t),
-                    ))
+                    // Focal glyph of the empty state, so accent rather than
+                    // the dim ink chrome wears (see `browser::empty_state`).
+                    .child(icons::icon(names::EMBLEM_SYNC, 28.0, t.accent))
                     .child(
                         div()
                             .text_size(t.text(14.0))
@@ -4359,11 +4356,11 @@ impl AdbShareApp {
                         .flex()
                         .flex_col()
                         .w(px(POPOVER_W))
-                        .rounded(px(12.0))
+                        .rounded(px(theme::RADIUS_CARD))
                         .bg(t.card)
                         .border_1()
                         .border_color(t.border)
-                        .shadow_xl()
+                        .shadow_sm()
                         .overflow_hidden()
                         .child(rows)
                         .child(conflict_policy_row(t, &overwrite, verify, &owner))
@@ -4444,7 +4441,7 @@ impl AdbShareApp {
             .h_full()
             .flex_shrink_0()
             .cursor_col_resize()
-            .hover(|s| s.bg(t.capsule_border))
+            .hover(|s| s.bg(t.hover))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _e, _w, cx| {
@@ -4495,7 +4492,7 @@ impl AdbShareApp {
                     .gap(px(4.0))
                     .px(px(10.0))
                     .py(px(9.0))
-                    .rounded(px(10.0))
+                    .rounded(px(theme::RADIUS_CARD))
                     .bg(t.danger_soft)
                     .border_1()
                     .border_color(t.danger_border)
@@ -4581,7 +4578,7 @@ impl AdbShareApp {
                 .gap(px(8.0))
                 .h(px(32.0))
                 .my(px(4.0))
-                .rounded(px(8.0))
+                .rounded(px(theme::RADIUS_CAPSULE_BTN))
                 .cursor_pointer()
                 .text_size(t.text(12.0))
                 .text_color(t.text_dim)
@@ -4726,7 +4723,7 @@ fn onboarding_card(t: &theme::Palette) -> gpui::Div {
         .gap(px(6.0))
         .px(px(10.0))
         .py(px(10.0))
-        .rounded(px(10.0))
+        .rounded(px(theme::RADIUS_CARD))
         // The sidebar is pure black, one step below the canvas, so a card on it
         // has to use the raised step to read as sitting above the pane.
         .bg(t.card)
@@ -4967,7 +4964,7 @@ fn place_row(
                     .top(px(6.0))
                     .bottom(px(6.0))
                     .w(px(3.0))
-                    .rounded(px(2.0))
+                    .rounded(px(theme::RADIUS_PILL))
                     .bg(t.accent),
             )
         })
@@ -5092,7 +5089,7 @@ fn conflict_policy_row(
                 .gap(px(4.0))
                 .px(px(7.0))
                 .h(px(24.0))
-                .rounded(px(6.0))
+                .rounded(px(theme::RADIUS_CAPSULE_BTN))
                 .bg(t.hover)
                 .cursor_pointer()
                 .text_size(t.text(11.0))
@@ -5122,7 +5119,7 @@ fn conflict_policy_row(
                 .gap(px(5.0))
                 .h(px(24.0))
                 .px(px(7.0))
-                .rounded(px(6.0))
+                .rounded(px(theme::RADIUS_CAPSULE_BTN))
                 .cursor_pointer()
                 .text_size(t.text(11.0))
                 .text_color(if verify { t.text_header } else { t.text_muted })
@@ -5184,6 +5181,9 @@ fn retry_row(t: &theme::Palette, owner: &Entity<AdbShareApp>) -> gpui::Stateful<
 
 impl Render for AdbShareApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Follow the system appearance (light/dark) before reading the
+        // palette, so a switch mid-session repaints in the other mode.
+        theme::sync_appearance(cx);
         // The palette is `Copy`, so take a value: a borrow of `cx` would collide
         // with the closures below that need `&mut cx`.
         let t = *cx.theme();
@@ -5338,9 +5338,14 @@ impl Render for AdbShareApp {
             .size_full()
             .bg(t.canvas)
             .text_color(t.text_primary)
+            // The system sans, resolved at install: GPUI's own default on
+            // Linux is IBM Plex Sans, which is why the app did not look
+            // like the desktop it runs on. Set once here, the cascade
+            // carries it to every child text run; only monospace overrides.
+            .font_family(theme::font_family(cx))
             .track_focus(&self.focus)
             .child(self.topbar(&t, cx))
-            .child(self.search_row(&t, cx))
+            .child(self.search_row(&t, cx, content_x))
             .child(body)
             // Before the overlays, so it paints under them and they stay
             // clickable.
@@ -5358,7 +5363,19 @@ impl Render for AdbShareApp {
 
 impl AdbShareApp {
     /// The search strip, shown only while search is active.
-    fn search_row(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+    ///
+    /// `left_inset` is the content pane's left edge (sidebar width plus the
+    /// divider, or 0 when the sidebar is hidden): the strip belongs to the
+    /// file pane, so it starts there rather than running the full window
+    /// width over the sidebar. A full-width strip put "Search this folder"
+    /// in the top-left corner, visually a second top bar, with the sidebar
+    /// headings pushed below it.
+    fn search_row(
+        &mut self,
+        t: &theme::Palette,
+        cx: &mut Context<Self>,
+        left_inset: f32,
+    ) -> AnyElement {
         // The debloat view has its own search box, in its own header.
         if self.pane == Pane::Debloat {
             return div().into_any_element();
@@ -5370,6 +5387,7 @@ impl AdbShareApp {
             .flex()
             .items_center()
             .gap(px(8.0))
+            .ml(px(left_inset))
             .px(px(14.0))
             .py(px(6.0))
             .border_b_1()

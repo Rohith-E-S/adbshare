@@ -1226,7 +1226,7 @@ where
                 .mb(px(8.0))
                 .px(px(10.0))
                 .py(px(8.0))
-                .rounded(px(6.0))
+                .rounded(px(theme::RADIUS_CAPSULE_BTN))
                 .bg(t.danger_soft)
                 .border_1()
                 .border_color(t.danger_border)
@@ -1247,7 +1247,7 @@ where
                 .mb(px(8.0))
                 .px(px(10.0))
                 .py(px(8.0))
-                .rounded(px(6.0))
+                .rounded(px(theme::RADIUS_CAPSULE_BTN))
                 .bg(t.warning_soft)
                 .text_size(t.text(11.5))
                 .text_color(t.warning)
@@ -1627,8 +1627,8 @@ fn card(t: &Palette, width: f32, rows: Vec<AnyElement>) -> AnyElement {
     ui::surface(t, rows)
         .w(px(width))
         .max_w(relative(0.94))
-        .rounded(px(14.0))
-        .shadow_2xl()
+        .rounded(px(theme::RADIUS_DIALOG))
+        .shadow_md()
         .into_any_element()
 }
 
@@ -2262,7 +2262,7 @@ where
                         .max_w(px(PREVIEW_MAX))
                         .max_h(px(PREVIEW_MAX))
                         .object_fit(gpui::ObjectFit::Contain)
-                        .rounded(px(8.0)),
+                        .rounded(px(theme::RADIUS_CAPSULE_BTN)),
                 )
                 .into_any_element(),
             buttons(
@@ -2316,7 +2316,7 @@ where
                         .items_center()
                         .justify_center()
                         .size(px(48.0))
-                        .rounded(px(14.0))
+                        .rounded(px(theme::RADIUS_DIALOG))
                         .bg(t.hover)
                         .child(icons::icon(
                             names::PHONE,

@@ -128,34 +128,27 @@ pub fn icon_button_disabled(t: &Palette, icon: &'static str, size: f32) -> Div {
         .child(icons::icon(icon, size * 0.53, icon_tint(icon, t)))
 }
 
-/// A rounded container that groups 2–4 icon buttons, matching `.pill-capsule`.
+/// A flat group of 2–4 icon buttons on the top bar.
 ///
-/// It takes the `capsule_bg` / `capsule_border` pair — the theme's
-/// `--toolbar-control` fill and its `--input` outline — because that is what
-/// makes a group of buttons read as one control. Without them the capsules
-/// were invisible containers, so three bare icon groups floated next to the
-/// path bar's filled, bordered pill, which is the only other thing on the bar
-/// that used those tokens.
-pub fn capsule(t: &Palette, children: impl IntoIterator<Item = AnyElement>) -> impl IntoElement {
+/// No fill, no outline: a bordered pill around every group is what made the
+/// top bar read as a web dashboard rather than a file manager's toolbar,
+/// where Nautilus and its peers put bare buttons separated by hairlines.
+/// Grouping reads from the separators between buttons and the gaps between
+/// groups, so the palette's capsule tokens are gone. The height and the
+/// radius keep the group's box where it was, so nothing downstream moves.
+pub fn capsule(_t: &Palette, children: impl IntoIterator<Item = AnyElement>) -> impl IntoElement {
     div()
         .flex()
         .items_center()
         .h(px(theme::CAPSULE_H))
         .px(px(2.0))
         .rounded(px(theme::RADIUS_CAPSULE))
-        .bg(t.capsule_bg)
-        .border_1()
-        .border_color(t.capsule_border)
         .children(children)
 }
 
-/// A 1px vertical rule between capsule buttons.
+/// A 1px vertical rule between buttons in a group.
 pub fn capsule_separator(t: &Palette) -> Div {
-    div()
-        .w(px(1.0))
-        .h(px(18.0))
-        .my(px(8.0))
-        .bg(t.capsule_border)
+    div().w(px(1.0)).h(px(18.0)).my(px(8.0)).bg(t.divider)
 }
 
 /// A capsule button with a word on it, not just a glyph.
@@ -206,7 +199,7 @@ pub fn danger_button(
         .items_center()
         .h(px(32.0))
         .px(px(14.0))
-        .rounded(px(8.0))
+        .rounded(px(theme::RADIUS_CAPSULE_BTN))
         .text_size(t.text(14.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(t.text_inverse)
@@ -242,7 +235,7 @@ pub fn button(
         .items_center()
         .h(px(32.0))
         .px(px(14.0))
-        .rounded(px(8.0))
+        .rounded(px(theme::RADIUS_CAPSULE_BTN))
         .text_size(t.text(14.0))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
@@ -285,7 +278,7 @@ pub fn progress_bar(t: &Palette, fraction: f32, height: f32) -> Div {
 
 /// A small status dot, used for the device LEDs.
 pub fn led(color: Rgba) -> Div {
-    div().size(px(7.0)).rounded_full().bg(color).shadow_sm()
+    div().size(px(7.0)).rounded_full().bg(color)
 }
 
 /// A small text badge, matching `.usb-badge` / `.battery-pill` /
@@ -367,15 +360,20 @@ pub fn scroll_area(content: impl IntoIterator<Item = AnyElement>) -> Stateful<Di
 }
 
 /// Chrome for a popover, a context menu or a dialog panel: the `.card` look.
+///
+/// A hairline border defines the surface now, not a large drop shadow: the
+/// old `shadow_xl` on every overlay was the web-card look, and a 1px edge at
+/// this density already separates card from canvas. `shadow_sm` keeps the
+/// faintest lift so the surface does not look printed on.
 pub fn surface(t: &Palette, content: impl IntoIterator<Item = AnyElement>) -> Div {
     div()
         .flex()
         .flex_col()
-        .rounded(px(12.0))
+        .rounded(px(theme::RADIUS_CARD))
         .bg(t.card)
         .border_1()
         .border_color(t.border_soft)
-        .shadow_xl()
+        .shadow_sm()
         .overflow_hidden()
         .children(content)
 }
@@ -553,13 +551,13 @@ impl Render for Tooltip {
             .max_w(px(280.0))
             .px(px(9.0))
             .py(px(6.0))
-            .rounded(px(6.0))
+            .rounded(px(theme::RADIUS_CAPSULE_BTN))
             // A tooltip is an overlay, so it sits above every surface.
             .bg(t.tooltip)
             .text_color(t.tooltip_text)
             .border_1()
             .border_color(t.tooltip_border)
-            .shadow_lg()
+            .shadow_sm()
             .text_size(t.text(11.0))
             .line_height(relative(1.35))
             .whitespace_normal()
