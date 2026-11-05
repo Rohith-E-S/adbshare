@@ -30,8 +30,10 @@
 //! has no scrollbar colour API at all, so a palette entry for it would be a
 //! value nothing could read.
 //!
-//! Dark only, as the previous GTK build was. A light palette is one more
-//! constructor here plus a branch in [`install`].
+//! Both appearances exist ([`Palette::t3_dark`] and [`Palette::t3_light`]),
+//! following the system via GPUI's window appearance, with a forced choice
+//! from the `ADBSHARE_APPEARANCE` environment variable. The GTK build was
+//! dark only; this one is not.
 
 use gpui::{App, Global, Rgba, px, rgba};
 
@@ -46,8 +48,6 @@ pub struct Palette {
     pub canvas: Rgba,
     /// The top navigation bar, one step above the canvas.
     pub topbar: Rgba,
-    /// The raised step every control and strip on the toolbar sits on.
-    pub topbar_raised: Rgba,
     /// The chrome behind the bottom status strip.
     pub statusbar: Rgba,
     /// The sidebar pane, elevated from the canvas so the layout reads as panes
@@ -86,12 +86,7 @@ pub struct Palette {
     pub selected_strong: Rgba,
     /// A pressed element.
     pub pressed: Rgba,
-    /// A group of icon buttons: the raised `#121216` control fill.
-    pub capsule_bg: Rgba,
-    /// The outline around a capsule.
-    pub capsule_border: Rgba,
-    /// A resting raised control: a secondary button, a neutral badge. The same
-    /// `--input` step a capsule is outlined with.
+    /// A resting raised control: a secondary button, a neutral badge.
     pub secondary_bg: Rgba,
     /// One step past `secondary_bg`, for that control under the pointer.
     pub secondary_bg_hover: Rgba,
@@ -173,24 +168,18 @@ impl Palette {
 
     /// The colour an icon of this hue wears.
     ///
-    /// Four of the six families already exist in the palette as its semantic
-    /// colours, so a red icon and a red error are the same red. `Violet` and
-    /// `Cyan` have no semantic token — nothing in the UI is a violet warning —
-    /// and come from the app theme's own accent families, at the same lightness
-    /// as the rest so a row of icons reads as one set.
-    ///
-    /// `Neutral` is body text rather than a hue: the direction and editing verbs
-    /// are grey because a coloured back-arrow would be noise, not because grey
-    /// is a colour they chose.
+    /// Chrome is monochrome (see [`crate::icons::IconHue`]), so this is mostly
+    /// one answer: `Neutral` is the dim ink every resting glyph wears, and the
+    /// two semantic hues reuse the palette's own warning and error colours,
+    /// so a red icon and a red error are the same red. Accent is not a hue
+    /// here at all — it is state, and the call sites that know the state
+    /// (a toggled button, a live transfer, a focal empty-state glyph) ask
+    /// for [`Self::accent`] directly.
     pub fn hue(&self, hue: crate::icons::IconHue) -> Rgba {
         use crate::icons::IconHue;
         match hue {
-            IconHue::Accent => self.accent,
-            IconHue::Success => self.success,
             IconHue::Warning => self.warning,
             IconHue::Danger => self.danger,
-            IconHue::Violet => rgba(0x8B84C9FF),
-            IconHue::Cyan => rgba(0x5CB6D9FF),
             IconHue::Neutral => self.text_dim,
         }
     }
@@ -203,7 +192,6 @@ impl Palette {
             // visible step so the window reads as panes on one instrument.
             canvas: rgba(0x0B0E12FF),
             topbar: rgba(0x10141AFF),
-            topbar_raised: rgba(0x161C24FF),
             statusbar: rgba(0x0E1217FF),
             sidebar: rgba(0x0E1217FF),
             card: rgba(0x171D26FF),
@@ -226,9 +214,6 @@ impl Palette {
             selected: rgba(0xFFFFFF14),
             selected_strong: rgba(0xFFFFFF21),
             pressed: rgba(0xFFFFFF1C),
-            // A capsule is a raised control on the top bar.
-            capsule_bg: rgba(0x161C24FF),
-            capsule_border: rgba(0x27313CFF),
             // A resting control, and one step denser under the pointer.
             secondary_bg: rgba(0xFFFFFF12),
             secondary_bg_hover: rgba(0xFFFFFF22),
@@ -275,10 +260,84 @@ impl Palette {
             font_scale: TEXT_SCALES[TEXT_DEFAULT_STEP],
         }
     }
+
+    /// The light theme: the same slate instrument, inverted.
+    ///
+    /// Surfaces climb from a cool paper canvas to white cards; text walks
+    /// down from near-black ink. The accent is the dark palette's cyan
+    /// darkened until it passes contrast on white, and the semantic hues
+    /// darken with it. Interaction fills are percentages of *black* here,
+    /// where the dark palette's are percentages of white — one value that
+    /// works over every surface in either mode. Tooltips stay dark in both
+    /// modes, as GNOME's do.
+    pub fn t3_light() -> Self {
+        Self {
+            canvas: rgba(0xF4F6F9FF),
+            topbar: rgba(0xE9EDF2FF),
+            statusbar: rgba(0xEDF0F4FF),
+            sidebar: rgba(0xEDF0F4FF),
+            card: rgba(0xFFFFFFFF),
+            card_hover: rgba(0xF0F3F7FF),
+            sidebar_active: rgba(0xDCE5EEFF),
+            row_hover: rgba(0xEEF1F5FF),
+            divider: rgba(0xD6DDE5FF),
+            row_divider: rgba(0xE3E8EEFF),
+            device_active_bg: rgba(0x1F7FA81A),
+            device_active_border: rgba(0x1F7FA8B3),
+            accent_soft: rgba(0x1F7FA81F),
+            accent_border: rgba(0x1F7FA88C),
+
+            hover: rgba(0x0000000D),
+            selected: rgba(0x00000014),
+            selected_strong: rgba(0x00000021),
+            pressed: rgba(0x0000001C),
+            secondary_bg: rgba(0x0000000F),
+            secondary_bg_hover: rgba(0x0000001F),
+            track: rgba(0x00000014),
+            fill_soft: rgba(0x1F2933D9),
+
+            text_header: rgba(0x11161CFF),
+            text_primary: rgba(0x1C242EFF),
+            text_secondary: rgba(0x3A4552FF),
+            text_dim: rgba(0x5C6875FF),
+            text_muted: rgba(0x8A95A1FF),
+            text_inverse: rgba(0xFFFFFFFF),
+            text_on_light: rgba(0xFFFFFFFF),
+
+            border: rgba(0xC3CDD7FF),
+            border_soft: rgba(0xDDE3EAFF),
+
+            accent: rgba(0x1F7FA8FF),
+            success: rgba(0x0E9F6EFF),
+            warning: rgba(0xB7791FFF),
+            danger: rgba(0xD64550FF),
+            success_soft: rgba(0x0E9F6E29),
+            warning_soft: rgba(0xB7791F29),
+            danger_soft: rgba(0xD6455029),
+            danger_border: rgba(0xD6455080),
+
+            tooltip: rgba(0x1A222CF2),
+            tooltip_text: rgba(0xF3F6F8FF),
+            tooltip_border: rgba(0x2A3642FF),
+
+            font_scale: TEXT_SCALES[TEXT_DEFAULT_STEP],
+        }
+    }
 }
 
-/// Wraps [`Palette`] so it can live in GPUI's global registry.
-pub struct Theme(pub Palette);
+/// Wraps [`Palette`] so it can live in GPUI's global registry, along with
+/// which appearance it was built for.
+pub struct Theme {
+    pub palette: Palette,
+    /// Whether [`Self::palette`] is the dark one. Compared against the
+    /// window appearance on every render, so a system switch to light (or
+    /// back) swaps the palette live rather than on the next launch.
+    pub dark: bool,
+    /// A forced appearance from `ADBSHARE_APPEARANCE` (`light`/`dark`), so
+    /// the light palette can be reached — and screenshotted — on a dark
+    /// system. `None` follows the system.
+    pub forced: Option<bool>,
+}
 
 impl Global for Theme {}
 
@@ -289,13 +348,66 @@ pub trait Themed {
 
 impl Themed for App {
     fn theme(&self) -> &Palette {
-        &self.global::<Theme>().0
+        &self.global::<Theme>().palette
     }
 }
 
+/// Whether the system currently wants dark windows, per GPUI's appearance
+/// (the XDG portal's `color-scheme` on Linux).
+fn system_dark(app: &App) -> bool {
+    matches!(
+        app.window_appearance(),
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    )
+}
+
 /// Install the palette as the app-wide theme. Called once from `main`.
+///
+/// The initial choice is only a first guess: on Linux the portal's
+/// appearance report can arrive after startup, so [`sync_appearance`]
+/// re-checks on every render and swaps if the system has since spoken.
 pub fn install(app: &mut App) {
-    app.set_global(Theme(Palette::t3_dark()));
+    let forced = std::env::var("ADBSHARE_APPEARANCE").ok().and_then(|v| {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(false),
+            "dark" => Some(true),
+            _ => None,
+        }
+    });
+    let dark = forced.unwrap_or_else(|| system_dark(app));
+    app.set_global(Theme {
+        palette: if dark {
+            Palette::t3_dark()
+        } else {
+            Palette::t3_light()
+        },
+        dark,
+        forced,
+    });
+    app.set_global(UiFont(resolve_system_font(app)));
+}
+
+/// Swap the palette if the appearance has changed since it was built.
+///
+/// Called from the app root's render, before the palette is read. The text
+/// scale lives in the palette, so it is carried across the swap — a theme
+/// change must not silently reset the user's text size.
+pub fn sync_appearance(app: &mut App) {
+    let want_dark = app
+        .global::<Theme>()
+        .forced
+        .unwrap_or_else(|| system_dark(app));
+    let theme = app.global_mut::<Theme>();
+    if theme.dark != want_dark {
+        let scale = theme.palette.font_scale;
+        theme.palette = if want_dark {
+            Palette::t3_dark()
+        } else {
+            Palette::t3_light()
+        };
+        theme.palette.font_scale = scale;
+        theme.dark = want_dark;
+    }
 }
 
 /// Set the text scale [`Palette::text`] sizes by.
@@ -304,7 +416,75 @@ pub fn install(app: &mut App) {
 /// for the same reason the palette itself is a global: a view deep in the tree
 /// needs it and has no `Context` of its own to ask.
 pub fn set_font_scale(app: &mut App, scale: f32) {
-    app.global_mut::<Theme>().0.font_scale = scale;
+    app.global_mut::<Theme>().palette.font_scale = scale;
+}
+
+/// The UI font family, resolved once at install.
+pub struct UiFont(pub gpui::SharedString);
+
+impl Global for UiFont {}
+
+/// The resolved UI font, for the app root to set on its element tree.
+pub fn font_family(app: &App) -> gpui::SharedString {
+    app.global::<UiFont>().0.clone()
+}
+
+/// The system sans-serif family, as a name GPUI's text system can load.
+///
+/// GPUI on Linux maps its `.SystemUIFont` to "IBM Plex Sans" (its own TODO
+/// says the proper system font is undetermined), so the app would render in
+/// a bundled-looking font on every desktop. Ask fontconfig which family its
+/// sans-serif alias resolves to — Cantarell on GNOME, Noto Sans on KDE —
+/// and fall back to the first well-known system sans the text system
+/// actually has, then to GPUI's default.
+fn resolve_system_font(app: &App) -> gpui::SharedString {
+    let available: std::collections::HashSet<String> =
+        app.text_system().all_font_names().into_iter().collect();
+    let known = |name: &str| available.contains(name);
+
+    // The desktop's own interface font first: GNOME records it in
+    // `org.gnome.desktop.interface font-name` ("Adwaita Sans 11", family
+    // plus size), which is what every GTK app renders in — fontconfig's
+    // bare "sans-serif" alias resolves to Liberation Sans here, which is
+    // nobody's interface font.
+    let gsettings_family = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "font-name"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| {
+            let value = value.trim().trim_matches('\'').to_string();
+            match value.rsplit_once(' ') {
+                Some((name, size)) if size.chars().all(|c| c.is_ascii_digit()) => name.to_string(),
+                _ => value,
+            }
+        });
+    if let Some(family) = gsettings_family.filter(|name| known(name)) {
+        return family.into();
+    }
+    let fc_family = std::process::Command::new("fc-match")
+        .args(["-f", "%{family}", "sans-serif"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|family| family.split(',').next().map(str::trim).map(str::to_string));
+    if let Some(first) = fc_family.filter(|name| known(name)) {
+        return first.into();
+    }
+    for candidate in [
+        "Cantarell",
+        "Adwaita Sans",
+        "Noto Sans",
+        "DejaVu Sans",
+        "Inter",
+    ] {
+        if known(candidate) {
+            return candidate.into();
+        }
+    }
+    ".SystemUIFont".into()
 }
 
 // ── Text size steps ───────────────────────────────────────────────────────────
@@ -370,14 +550,20 @@ pub const WINDOW_MIN_W: f32 = 360.0;
 pub const WINDOW_MIN_H: f32 = 400.0;
 /// Height of the top bar.
 pub const TOPBAR_H: f32 = 45.0;
-/// Height of the breadcrumb / path capsule.
+/// Height of the top-bar controls: the path bar and the button groups.
 pub const CAPSULE_H: f32 = 34.0;
-/// Edge length of a square icon button inside a capsule.
+/// Edge length of a square icon button in the top bar.
 pub const CAPSULE_BTN: f32 = 30.0;
-/// Corner radius of a capsule container.
+/// Corner radius of a button group container. Groups are flat now (no fill,
+/// no outline — see `ui::capsule`), so this only rounds the group's box.
 pub const RADIUS_CAPSULE: f32 = 9.0;
-/// Corner radius of a button inside a capsule.
+/// Corner radius of a control: a button, a menu row, a text field. One
+/// radius for every control in the app.
 pub const RADIUS_CAPSULE_BTN: f32 = 6.0;
+/// Corner radius of a dialog, one step past a card: a modal sits above the
+/// popovers and reads as the topmost surface by its radius as well as its
+/// backdrop.
+pub const RADIUS_DIALOG: f32 = 12.0;
 /// Corner radius of a sidebar row.
 pub const RADIUS_ROW: f32 = 6.0;
 /// Corner radius of a device card.

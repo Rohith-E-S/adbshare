@@ -12,7 +12,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, IntoElement, Styled, Window, div, px};
 
 use crate::icons::{self, names};
-use crate::theme::Palette;
+use crate::theme::{self, Palette};
 use crate::views::ui;
 
 /// How long a toast stays before it can be dismissed.
@@ -183,11 +183,11 @@ where
         .py(px(10.0))
         .pl(px(12.0))
         .pr(px(12.0))
-        .rounded(px(10.0))
+        .rounded(px(theme::RADIUS_CARD))
         .bg(t.card)
         .border_1()
         .border_color(t.border)
-        .shadow_lg()
+        .shadow_sm()
         .child(div().w(px(3.0)).h(px(20.0)).rounded_full().bg(accent))
         .child(icons::icon(toast.tone.icon(), 15.0, accent))
         .child(
@@ -209,7 +209,7 @@ where
                     .items_center()
                     .h(px(24.0))
                     .px(px(10.0))
-                    .rounded(px(6.0))
+                    .rounded(px(theme::RADIUS_CAPSULE_BTN))
                     .text_size(t.text(11.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(t.text_header)

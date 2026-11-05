@@ -709,7 +709,7 @@ impl Render for TextField {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .h(px(32.0))
             .px(px(10.0))
-            .rounded(px(8.0))
+            .rounded(px(theme::RADIUS_CAPSULE_BTN))
             .bg(rgba(0x0000004D))
             .border_1()
             .border_color(if focused { t.text_dim } else { t.border })

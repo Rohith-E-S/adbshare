@@ -926,7 +926,7 @@ impl Debloat {
                 .h(px(ROW_H))
                 .mx(px(10.0))
                 .px(px(8.0))
-                .rounded(px(6.0))
+                .rounded(px(theme::RADIUS_CAPSULE_BTN))
                 .cursor_pointer()
                 .when_some(resting_bg, |d, bg| d.bg(bg))
                 .hover(move |d| d.bg(hover_bg))
