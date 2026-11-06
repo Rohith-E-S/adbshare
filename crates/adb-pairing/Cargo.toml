@@ -16,10 +16,8 @@ tracing.workspace = true
 curve25519-dalek.workspace = true
 subtle.workspace = true
 sha2.workspace = true
-sha2-011 = { package = "sha2", version = "0.11" }
 hkdf.workspace = true
 hmac.workspace = true
-typenum = "1"
 aes-gcm.workspace = true
 bytes.workspace = true
 rand.workspace = true

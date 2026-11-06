@@ -1,11 +1,10 @@
 //! AES-128-GCM transport for `PeerInfo`, keyed by HKDF-SHA256 over the
 //! SPAKE2 shared secret (AOSP `pairing_auth/aes_128_gcm.cpp`).
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Nonce};
+use aes_gcm::Aes128Gcm;
+use aes_gcm::aead::{Aead, KeyInit, Nonce};
 use hkdf::Hkdf;
-use sha2_011::Sha256;
-use typenum::U12;
+use sha2::Sha256;
 
 use crate::error::Error;
 
@@ -23,10 +22,10 @@ pub fn derive_key(shared_secret: &[u8; 64]) -> [u8; 16] {
 
 /// Counter nonce: sequence number little-endian in the first 8 bytes, the
 /// rest zero, per direction, each starting at 0.
-fn nonce(sequence: u64) -> Nonce<U12> {
+fn nonce(sequence: u64) -> Nonce<Aes128Gcm> {
     let mut bytes = [0u8; 12];
     bytes[..8].copy_from_slice(&sequence.to_le_bytes());
-    Nonce::from(bytes)
+    *Nonce::<Aes128Gcm>::from_slice(&bytes)
 }
 
 /// Both directions of one connection's ciphertexts.

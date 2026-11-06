@@ -39,7 +39,7 @@ fn build_query(query_id: u16, service_type: &str) -> Vec<u8> {
     msg.extend_from_slice(&[0x00, 0x00]); // arcount
     write_name(&mut msg, service_type);
     msg.extend_from_slice(&[0x00, 0x0C]); // TYPE PTR
-    msg.extend_from_slice(&[0x00, 0x01]); // CLASS IN
+    msg.extend_from_slice(&[0x80, 0x01]); // CLASS IN with unicast-response (QU) bit
     msg
 }
 
@@ -55,6 +55,15 @@ fn write_name(msg: &mut Vec<u8>, name: &str) {
 }
 
 fn read_name(msg: &[u8], offset: &mut usize) -> Result<String, Error> {
+    read_name_depth(msg, offset, 0)
+}
+
+fn read_name_depth(msg: &[u8], offset: &mut usize, depth: usize) -> Result<String, Error> {
+    if depth > 10 {
+        return Err(Error::Protocol(
+            "dns compression loop or recursion limit".into(),
+        ));
+    }
     let mut parts: Vec<String> = Vec::new();
     loop {
         let len = *msg
@@ -71,16 +80,20 @@ fn read_name(msg: &[u8], offset: &mut usize) -> Result<String, Error> {
                 .get(*offset)
                 .ok_or(Error::Protocol("dns ptr overrun".into()))? as usize;
             *offset += 1;
-            let mut ptr = (hi << 8) | lo;
-            let suffix = read_name_at(msg, ptr)?;
+            let ptr = (hi << 8) | lo;
+            if ptr >= msg.len() {
+                return Err(Error::Protocol("dns ptr out of bounds".into()));
+            }
+            let mut ptr_offset = ptr;
+            let suffix = read_name_depth(msg, &mut ptr_offset, depth + 1)?;
             if !suffix.is_empty() {
                 let mut all = parts.join(".");
-                all.push('.');
+                if !all.is_empty() {
+                    all.push('.');
+                }
                 all.push_str(&suffix);
                 return Ok(all);
             }
-            ptr = 0;
-            let _ = ptr;
             return Ok(parts.join("."));
         }
         let label = msg
@@ -90,11 +103,6 @@ fn read_name(msg: &[u8], offset: &mut usize) -> Result<String, Error> {
         *offset += len;
     }
     Ok(parts.join("."))
-}
-
-fn read_name_at(msg: &[u8], offset: usize) -> Result<String, Error> {
-    let mut off = offset;
-    read_name(msg, &mut off)
 }
 
 #[derive(Debug, Clone)]
@@ -301,5 +309,13 @@ mod tests {
             service_instance_name(PAIRING_TYPE, "studio-AbC123._adb-tls-pairing._tcp.local"),
             "studio-AbC123"
         );
+    }
+
+    #[test]
+    fn cyclic_compression_pointer_is_rejected() {
+        // A pointer pointing back to itself (infinite cycle).
+        let msg = [0xC0, 0x00];
+        let mut offset = 0;
+        assert!(read_name(&msg, &mut offset).is_err());
     }
 }

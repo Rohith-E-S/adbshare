@@ -1044,24 +1044,7 @@ async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
 /// and the command runs as `adb -s <serial> shell <argv…>` — never through
 /// a local shell — so a crafted value cannot break out into the host.
 const SHELL_ALLOWLIST: &[&str] = &[
-    "pm",
-    "am",
-    "svc",
-    "settings",
-    "wm",
-    "getprop",
-    "dumpsys",
-    "cmd",
-    "input",
-    "ime",
-    "content",
-    "service",
-    "uiautomator",
-    "run-as",
-    "appops",
-    "dpm",
-    "device_config",
-    "monkey",
+    "pm", "am", "svc", "settings", "wm", "getprop", "dumpsys", "input", "monkey",
 ];
 
 /// True for an argument safe to hand to `adb shell` as a separate word.
@@ -1073,14 +1056,8 @@ fn is_safe_shell_arg(arg: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+%".contains(c))
 }
 
-/// Run an allowlisted shell command on a device, returning its output.
-///
-/// `argv` is a JSON array of words; the first must be on
-/// [`SHELL_ALLOWLIST`]. Output is capped so a `dumpsys` dump cannot grow
-/// the D-Bus reply without bound.
-async fn run_shell_json(serial: &str, argv_json: &str) -> anyhow::Result<String> {
-    let argv: Vec<String> = serde_json::from_str(argv_json)
-        .map_err(|e| anyhow::anyhow!("argv is not a JSON array: {e}"))?;
+/// Restrict shell calls from D-Bus to expected tool commands and safe subcommands.
+fn validate_shell_argv(argv: &[String]) -> anyhow::Result<()> {
     let Some(head) = argv.first() else {
         anyhow::bail!("empty argv");
     };
@@ -1090,11 +1067,86 @@ async fn run_shell_json(serial: &str, argv_json: &str) -> anyhow::Result<String>
     if !argv.iter().all(|a| is_safe_shell_arg(a)) {
         anyhow::bail!("argument contains unsafe characters");
     }
-    let out = adb_run_output(
-        &adb_args(serial, &["shell", &argv.join(" ")]),
-        Duration::from_secs(15),
-    )
-    .await?;
+    match head.as_str() {
+        "getprop" | "dumpsys" => Ok(()),
+        "svc" => {
+            let target = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            let action = argv.get(2).map(|s| s.as_str()).unwrap_or("");
+            if matches!(target, "wifi" | "data" | "bluetooth")
+                && matches!(action, "enable" | "disable")
+            {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed svc command: {argv:?}");
+            }
+        }
+        "settings" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "get" | "put") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed settings subcommand: {sub}");
+            }
+        }
+        "wm" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "size" | "density") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed wm subcommand: {sub}");
+            }
+        }
+        "am" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "force-stop") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed am subcommand: {sub}");
+            }
+        }
+        "pm" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "clear" | "grant" | "revoke" | "list" | "path") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed pm subcommand: {sub}");
+            }
+        }
+        "input" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "tap" | "text" | "keyevent" | "swipe") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed input subcommand: {sub}");
+            }
+        }
+        "monkey" => {
+            if argv.len() == 6
+                && argv.get(1).map(|s| s.as_str()) == Some("-p")
+                && argv.get(3).map(|s| s.as_str()) == Some("-c")
+                && argv.get(4).map(|s| s.as_str()) == Some("android.intent.category.LAUNCHER")
+                && argv.get(5).map(|s| s.as_str()) == Some("1")
+            {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed monkey invocation");
+            }
+        }
+        other => anyhow::bail!("command not allowed: {other}"),
+    }
+}
+
+/// Run an allowlisted shell command on a device, returning its output.
+///
+/// Output is capped so a `dumpsys` dump cannot grow the D-Bus reply
+/// without bound.
+async fn run_shell_json(serial: &str, argv_json: &str) -> anyhow::Result<String> {
+    let argv: Vec<String> = serde_json::from_str(argv_json)
+        .map_err(|e| anyhow::anyhow!("argv is not a JSON array: {e}"))?;
+    validate_shell_argv(&argv)?;
+    let mut args: Vec<&str> = vec!["-s", serial, "shell"];
+    args.extend(argv.iter().map(|s| s.as_str()));
+    let out = adb_run_output(&args, Duration::from_secs(15)).await?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     if text.len() > 200_000 {
         text.truncate(200_000);
@@ -3364,5 +3416,30 @@ mod tests {
         assert!(is_device_local_path("/data/local/tmp/app.apk"));
         // An absolute path that is not on this computer is on the phone.
         assert!(is_device_local_path("/somewhere/else/app.apk"));
+    }
+
+    #[test]
+    fn validate_shell_argv_enforces_safety() {
+        let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(validate_shell_argv(&to_vec(&["settings", "get", "global", "wifi_on"])).is_ok());
+        assert!(validate_shell_argv(&to_vec(&["svc", "wifi", "enable"])).is_ok());
+        assert!(validate_shell_argv(&to_vec(&["input", "tap", "100", "200"])).is_ok());
+        assert!(validate_shell_argv(&to_vec(&["pm", "clear", "com.example.app"])).is_ok());
+
+        // Dangerous or unapproved heads and subcommands are blocked
+        assert!(validate_shell_argv(&to_vec(&["rm", "-rf", "/"])).is_err());
+        assert!(
+            validate_shell_argv(&to_vec(&[
+                "content",
+                "delete",
+                "--uri",
+                "content://contacts"
+            ]))
+            .is_err()
+        );
+        assert!(validate_shell_argv(&to_vec(&["svc", "power", "shutdown"])).is_err());
+        assert!(validate_shell_argv(&to_vec(&["settings", "delete", "system", "foo"])).is_err());
+        assert!(validate_shell_argv(&to_vec(&["monkey", "10000"])).is_err());
+        assert!(validate_shell_argv(&to_vec(&["input", "roll"])).is_err());
     }
 }

@@ -16,6 +16,7 @@ use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::traits::Identity;
 use sha2::{Digest, Sha512};
+use subtle::{Choice, ConditionallySelectable};
 
 use crate::error::Error;
 
@@ -44,15 +45,16 @@ const ORDER: [u8; 32] = [
 ///
 /// BoringSSL's `x25519_ge_scalarmult` walks all 256 bits of the unreduced
 /// scalar; a reduced `Scalar` multiply would lose the small-order component
-/// the mask arithmetic depends on. Double-and-add over Edwards points.
+/// the mask arithmetic depends on. Double-and-add over Edwards points with
+/// constant-time conditional assignment to protect the secret scalar.
 fn mul_wide(point: &EdwardsPoint, scalar: &[u8; 32]) -> EdwardsPoint {
     let mut result = EdwardsPoint::identity();
     let mut addend = *point;
     for &byte in scalar.as_ref() {
         for i in 0..8 {
-            if (byte >> i) & 1 == 1 {
-                result = &result + &addend;
-            }
+            let bit = Choice::from((byte >> i) & 1);
+            let sum = &result + &addend;
+            result.conditional_assign(&sum, bit);
             addend = &addend + &addend;
         }
     }
