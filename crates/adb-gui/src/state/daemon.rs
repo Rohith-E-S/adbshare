@@ -100,6 +100,20 @@ pub trait Manager {
         user: u16,
         actions: &str,
     ) -> zbus::Result<String>;
+    async fn run_shell(&self, device: &str, argv: &str) -> zbus::Result<String>;
+    async fn screenshot(&self, device: &str) -> zbus::Result<String>;
+    async fn start_logcat(&self, device: &str) -> zbus::Result<bool>;
+    async fn stop_logcat(&self, device: &str) -> zbus::Result<bool>;
+    async fn logcat_lines(&self, device: &str, since: u64, max: u32) -> zbus::Result<String>;
+    async fn reboot(&self, device: &str, mode: &str) -> zbus::Result<bool>;
+    async fn list_forwards(&self) -> zbus::Result<String>;
+    async fn add_forward(&self, device: &str, local_port: u16, remote: &str) -> zbus::Result<bool>;
+    async fn remove_forward(&self, device: &str, local_port: u16) -> zbus::Result<bool>;
+    async fn bugreport(&self, device: &str) -> zbus::Result<String>;
+    async fn start_record(&self, device: &str) -> zbus::Result<bool>;
+    async fn stop_record(&self, device: &str) -> zbus::Result<String>;
+    async fn qr_pair_start(&self) -> zbus::Result<String>;
+    async fn qr_pair_status(&self) -> zbus::Result<String>;
 }
 
 /// Handle to the pinned tokio runtime.
@@ -627,6 +641,176 @@ pub async fn apply_package_actions(
         let json = proxy.apply_package_actions(&device, user, &payload).await?;
         serde_json::from_str::<Vec<PackageResultDto>>(&json)
             .map_err(|e| anyhow::anyhow!("apply_package_actions decode: {e}"))
+    })
+    .await
+}
+
+// ── Device tools ─────────────────────────────────────────────────────────────
+
+/// Run an allowlisted shell command on a device; `argv` is a JSON array.
+pub async fn run_shell(device: &str, argv_words: &[&str]) -> Result<String, String> {
+    let (device, payload) = (
+        device.to_string(),
+        serde_json::to_string(argv_words).map_err(|e| format!("encode argv: {e}"))?,
+    );
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.run_shell(&device, &payload).await?)
+    })
+    .await
+}
+
+/// Take a screenshot into `~/Pictures`; returns the local path.
+pub async fn screenshot(device: &str) -> Result<String, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.screenshot(&device).await?)
+    })
+    .await
+}
+
+/// Start (or restart) the device's logcat stream.
+pub async fn start_logcat(device: &str) -> Result<bool, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.start_logcat(&device).await?)
+    })
+    .await
+}
+
+/// Stop the device's logcat stream.
+pub async fn stop_logcat(device: &str) -> Result<bool, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.stop_logcat(&device).await?)
+    })
+    .await
+}
+
+/// One logcat line: sequence number plus text.
+pub type LogcatLine = (u64, String);
+
+/// Logcat lines since a cursor: `(next_cursor, lines)`.
+pub async fn logcat_lines(
+    device: &str,
+    since: u64,
+    max: u32,
+) -> Result<(u64, Vec<LogcatLine>), String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        let json = proxy.logcat_lines(&device, since, max).await?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("logcat decode: {e}"))?;
+        let next = parsed.get("next").and_then(|v| v.as_u64()).unwrap_or(since);
+        let lines = parsed
+            .get("lines")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let seq = row.get(0)?.as_u64()?;
+                        let text = row.get(1)?.as_str()?.to_string();
+                        Some((seq, text))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((next, lines))
+    })
+    .await
+}
+
+/// Reboot the device (`""`, `"bootloader"`, or `"recovery"`).
+pub async fn reboot(device: &str, mode: &str) -> Result<bool, String> {
+    let (device, mode) = (device.to_string(), mode.to_string());
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.reboot(&device, &mode).await?)
+    })
+    .await
+}
+
+/// Active `adb forward` entries as text, one per line.
+pub async fn list_forwards() -> Result<String, String> {
+    dispatch(|| async {
+        let proxy = get_manager().await?;
+        Ok(proxy.list_forwards().await?)
+    })
+    .await
+}
+
+/// Forward `tcp:<local_port>` to a device-side endpoint.
+pub async fn add_forward(device: &str, local_port: u16, remote: &str) -> Result<bool, String> {
+    let (device, remote) = (device.to_string(), remote.to_string());
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.add_forward(&device, local_port, &remote).await?)
+    })
+    .await
+}
+
+/// Remove a forward for a local port.
+pub async fn remove_forward(device: &str, local_port: u16) -> Result<bool, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.remove_forward(&device, local_port).await?)
+    })
+    .await
+}
+
+/// Collect a bug report zip into `~/Downloads`; returns the local path.
+pub async fn bugreport(device: &str) -> Result<String, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.bugreport(&device).await?)
+    })
+    .await
+}
+
+/// Start a screen recording on the device (max 3 minutes).
+pub async fn start_record(device: &str) -> Result<bool, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.start_record(&device).await?)
+    })
+    .await
+}
+
+/// Stop the recording and pull it into `~/Videos`; returns the path.
+pub async fn stop_record(device: &str) -> Result<String, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.stop_record(&device).await?)
+    })
+    .await
+}
+
+/// Begin a QR pairing session; returns JSON
+/// `{instance, password, payload}` for drawing a QR code.
+pub async fn qr_pair_start() -> Result<serde_json::Value, String> {
+    dispatch(|| async {
+        let proxy = get_manager().await?;
+        let json = proxy.qr_pair_start().await?;
+        Ok(serde_json::from_str(&json)?)
+    })
+    .await
+}
+
+/// Poll the QR pairing session as JSON
+/// `{state, guid, connect_address, error}`.
+pub async fn qr_pair_status() -> Result<serde_json::Value, String> {
+    dispatch(|| async {
+        let proxy = get_manager().await?;
+        let json = proxy.qr_pair_status().await?;
+        Ok(serde_json::from_str(&json)?)
     })
     .await
 }

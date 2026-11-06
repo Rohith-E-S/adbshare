@@ -69,6 +69,14 @@ pub enum WifiStep {
     Address,
     /// Address accepted; waiting for the six-digit code shown on the phone.
     Pairing { address: String },
+    /// Studio-style QR pairing: the phone scans the code, then pairs and
+    /// auto-connects. `status` is the daemon's word for where it is.
+    Qr {
+        payload: String,
+        instance: String,
+        password: String,
+        status: String,
+    },
     /// `adb pair` succeeded; the user can now connect.
     Paired { address: String },
     /// A step failed; `message` says why.
@@ -314,7 +322,7 @@ impl Dialog {
 
 /// Whether a pairing step can be backed out of.
 fn step_is_dismissible(step: &WifiStep) -> bool {
-    !matches!(step, WifiStep::Pairing { .. })
+    !matches!(step, WifiStep::Pairing { .. } | WifiStep::Qr { .. })
 }
 
 /// The title for a pairing step.
@@ -322,6 +330,7 @@ fn step_heading(step: &WifiStep) -> &'static str {
     match step {
         WifiStep::Address => "Connect ADB via IP",
         WifiStep::Pairing { .. } => "Pair with this phone",
+        WifiStep::Qr { .. } => "Scan with your phone",
         WifiStep::Paired { .. } => "Paired",
         WifiStep::Failed { .. } => "Could not connect",
     }
@@ -341,8 +350,11 @@ pub enum DialogResult {
     DeletePermanently(Vec<DirEntry>),
     /// Copy the rendered report to the clipboard.
     CopyDiagnostics(String),
+    CopyText(String),
     /// Step 1: pair with this address.
     PairAddress(String),
+    /// Start a QR pairing session with the daemon.
+    StartQrPairing,
     /// Step 2: finish pairing with the code shown on the phone.
     PairCode {
         address: String,
@@ -1652,6 +1664,77 @@ fn header(t: &Palette, icon: &'static str, accent: gpui::Rgba, title: &str) -> g
 }
 
 /// A paragraph of dialog body copy.
+/// A QR code on a white card, drawn with the canvas painter.
+///
+/// Always black-on-white: a phone camera needs the quiet white border and
+/// full contrast, whatever the app theme says. Modules are filled rects;
+/// the quiet zone is part of the QR spec (4 modules), so it is drawn in.
+fn qr_code(payload: &str) -> AnyElement {
+    let code = qrcode::QrCode::new(payload.as_bytes()).ok();
+    let size = 230.0f32;
+    div()
+        .flex()
+        .justify_center()
+        .pb(px(16.0))
+        .child(
+            gpui::canvas(
+                move |bounds, _window, _cx| {
+                    let _ = bounds;
+                },
+                {
+                    move |bounds, _t, window, _cx| {
+                        let modules: Vec<bool> = match &code {
+                            Some(code) => code
+                                .to_colors()
+                                .iter()
+                                .map(|c| *c == qrcode::types::Color::Dark)
+                                .collect(),
+                            None => vec![false; 21 * 21],
+                        };
+                        let width = code.as_ref().map(|c| c.width()).unwrap_or(21);
+                        let quiet = 4usize;
+                        let cells = width + quiet * 2;
+                        let cell = size / cells as f32;
+                        window.paint_quad(gpui::quad(
+                            gpui::Bounds {
+                                origin: bounds.origin,
+                                size: gpui::size(px(size), px(size)),
+                            },
+                            gpui::px(0.0),
+                            gpui::white(),
+                            gpui::px(0.0),
+                            gpui::transparent_black(),
+                            gpui::BorderStyle::default(),
+                        ));
+                        for (i, dark) in modules.iter().enumerate() {
+                            if !dark {
+                                continue;
+                            }
+                            let x = (i % width) + quiet;
+                            let y = (i / width) + quiet;
+                            window.paint_quad(gpui::quad(
+                                gpui::Bounds {
+                                    origin: bounds.origin
+                                        + gpui::point(px(x as f32 * cell), px(y as f32 * cell)),
+                                    size: gpui::size(px(cell), px(cell)),
+                                },
+                                gpui::px(0.0),
+                                gpui::black(),
+                                gpui::px(0.0),
+                                gpui::transparent_black(),
+                                gpui::BorderStyle::default(),
+                            ));
+                        }
+                    }
+                },
+            )
+            .w(px(size))
+            .h(px(size))
+            .rounded(px(theme::RADIUS_PILL)),
+        )
+        .into_any_element()
+}
+
 fn body_text(t: &Palette, text: &str) -> gpui::Div {
     div()
         .px(px(18.0))
@@ -1983,6 +2066,29 @@ where
                 Button::primary("connect", DialogResult::ConnectWireless(address.clone())),
             ],
         ),
+        WifiStep::Qr {
+            payload,
+            instance,
+            password,
+            status,
+        } => (
+            names::WIRELESS,
+            t.accent,
+            "Scan with your phone",
+            format!(
+                "Point the phone's camera at this code (Wireless debugging → Pair with QR \
+                 code). It starts pairing and connects by itself.\n\nInstance {instance}\n\
+                 Password {password}\n\n{status}"
+            ),
+            None,
+            vec![
+                Button::normal("cancel", DialogResult::Dismiss),
+                Button::normal_owned(
+                    "Copy payload".into(),
+                    DialogResult::CopyText(payload.clone()),
+                ),
+            ],
+        ),
         WifiStep::Failed { message } => (
             names::DIALOG_ERROR,
             t.danger,
@@ -1999,6 +2105,7 @@ where
     let row: Vec<Button> = match step {
         WifiStep::Address => vec![
             Button::normal("cancel", DialogResult::Dismiss),
+            Button::normal_owned("Scan QR code".into(), DialogResult::StartQrPairing),
             Button::submit(
                 "next",
                 "Next",
@@ -2028,6 +2135,9 @@ where
         header(t, icon, accent, title).into_any_element(),
         body_text(t, &body).into_any_element(),
     ];
+    if let WifiStep::Qr { payload, .. } = step {
+        rows.push(qr_code(payload).into_any_element());
+    }
     if let Some(field) = field {
         rows.push(
             div()

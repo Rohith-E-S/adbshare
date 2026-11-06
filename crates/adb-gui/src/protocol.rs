@@ -262,6 +262,20 @@ pub struct DeviceInfoDto {
     /// Primary CPU architecture, e.g. `arm64-v8a`. None on older daemons.
     #[serde(default)]
     pub abi: Option<String>,
+    #[serde(default)]
+    pub battery_health: Option<String>,
+    #[serde(default)]
+    pub battery_temp_c: Option<i32>,
+    #[serde(default)]
+    pub battery_voltage_mv: Option<u32>,
+    #[serde(default)]
+    pub android_version: Option<String>,
+    #[serde(default)]
+    pub api_level: Option<u32>,
+    #[serde(default)]
+    pub display_width: Option<u32>,
+    #[serde(default)]
+    pub display_height: Option<u32>,
 }
 
 impl DeviceInfoDto {

@@ -42,6 +42,7 @@ use crate::views::filechooser::{self, Pick};
 use crate::views::menu::{self, MenuItem};
 use crate::views::textinput::{TextField, TextFieldEvent};
 use crate::views::toast::{ActionId, ToastStack, ToastTone};
+use crate::views::tools::Tools;
 use crate::views::ui;
 
 /// The application's name, as it appears in a window title.
@@ -286,6 +287,8 @@ pub struct AdbShareApp {
     /// The debloat view: the phone's packages, and the curated list's advice
     /// on them.
     debloat: Entity<Debloat>,
+    /// The device tools view.
+    tools: Entity<Tools>,
     /// What the main pane is showing.
     pane: Pane,
     /// What the debloat list says about each phone, for the sidebar badge.
@@ -302,6 +305,8 @@ enum Pane {
     Browser,
     /// The debloat view.
     Debloat,
+    /// The device tools view.
+    Tools,
 }
 
 /// What one in-flight install needs remembered between the start call and
@@ -472,6 +477,7 @@ impl AdbShareApp {
             subscriptions: Vec::new(),
             install_watch: None,
             debloat: cx.new(Debloat::new),
+            tools: cx.new(Tools::new),
             pane: Pane::Browser,
             debloat_counts: HashMap::new(),
         }
@@ -553,6 +559,21 @@ impl AdbShareApp {
         let debloat = view.read(cx).debloat.clone();
         let sub = cx.subscribe(&debloat, move |_view, event: &DebloatEvent, cx| {
             me.update(cx, |this, cx| this.on_debloat_event(event, cx));
+        });
+        view.update(cx, |this, _cx| this.subscriptions.push(sub));
+
+        // The tools view's package filter.
+        let me = view.clone();
+        let search = view.read(cx).tools.read(cx).apps_search_field().clone();
+        let sub = cx.subscribe(&search, move |_field, event: &TextFieldEvent, cx| {
+            if let TextFieldEvent::Changed(query) = event {
+                let query = query.to_string();
+                me.update(cx, |this, cx| {
+                    this.tools.update(cx, |t, cx| {
+                        t.set_apps_query(query, cx);
+                    });
+                });
+            }
         });
         view.update(cx, |this, _cx| this.subscriptions.push(sub));
 
@@ -2322,6 +2343,27 @@ impl AdbShareApp {
         self.open_debloat_for(&device, cx);
     }
 
+    /// Open the device tools view on the selected phone (or the empty
+    /// state when none is selected).
+    fn open_tools(&mut self, cx: &mut Context<Self>) {
+        self.pane = Pane::Tools;
+        let device = self.target_device();
+        let label = device
+            .as_ref()
+            .and_then(|serial| {
+                self.devices
+                    .iter()
+                    .find(|d| &d.serial == serial)
+                    .map(|d| d.display_name().to_string())
+            })
+            .unwrap_or_default();
+        self.tools.update(cx, |t, cx| {
+            t.set_device_label(label, cx);
+            t.set_device(device, cx);
+        });
+        cx.notify();
+    }
+
     /// Open the debloat view on one particular phone.
     ///
     /// The phone is named rather than taken from the selection, so the row in
@@ -3004,6 +3046,9 @@ impl AdbShareApp {
                 self.dialog = Dialog::None;
                 self.delete_permanently(entries.clone(), cx);
             }
+            DialogResult::CopyText(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            }
             DialogResult::CopyDiagnostics(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 self.toasts
@@ -3029,6 +3074,9 @@ impl AdbShareApp {
                     return;
                 }
                 self.run_pair(address.clone(), code.clone(), cx);
+            }
+            DialogResult::StartQrPairing => {
+                self.run_qr_pair(cx);
             }
             DialogResult::ConnectWireless(address) => {
                 self.dialog = Dialog::None;
@@ -3147,6 +3195,107 @@ impl AdbShareApp {
                 }
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Start a QR pairing session and poll it to completion, updating the
+    /// dialog as it goes. Terminal states land on Paired (with the connect
+    /// address the daemon found) or Failed.
+    fn run_qr_pair(&mut self, cx: &mut Context<Self>) {
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let started = daemon::qr_pair_start().await;
+            let (payload, instance, password) = match started {
+                Ok(value) => (
+                    value
+                        .get("payload")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    value
+                        .get("instance")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    value
+                        .get("password")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                Err(err) => {
+                    me.update(cx, |this, cx| {
+                        this.pairing_step(WifiStep::Failed {
+                            message: format!("Could not start QR pairing: {err}"),
+                        });
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            me.update(cx, |this, cx| {
+                this.pairing_step(WifiStep::Qr {
+                    payload: payload.clone(),
+                    instance: instance.clone(),
+                    password: password.clone(),
+                    status: "Waiting for the phone to scan…".into(),
+                });
+                cx.notify();
+            })
+            .ok();
+            loop {
+                gpui::Timer::after(std::time::Duration::from_millis(900)).await;
+                let status = daemon::qr_pair_status().await;
+                let Ok(status) = status else {
+                    continue;
+                };
+                let state = status
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("waiting")
+                    .to_string();
+                match state.as_str() {
+                    "failed" => {
+                        let error = status
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("pairing failed")
+                            .to_string();
+                        me.update(cx, |this, cx| {
+                            this.pairing_step(WifiStep::Failed { message: error });
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    "connected" => {
+                        let address = status
+                            .get("connect_address")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        me.update(cx, |this, cx| {
+                            this.pairing_step(WifiStep::Paired { address });
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    "paired" => {
+                        me.update(cx, |this, cx| {
+                            this.pairing_step(WifiStep::Paired {
+                                address: String::new(),
+                            });
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
         })
         .detach();
     }
@@ -3464,6 +3613,7 @@ impl AdbShareApp {
             }
             "diagnostics" => self.open_diagnostics(cx),
             "debloat" => self.open_debloat(cx),
+            "tools" => self.open_tools(cx),
             "shortcuts" => self.dialog = Dialog::Shortcuts,
             "about" => self.dialog = Dialog::About,
             "connect-wifi" => {
@@ -3553,6 +3703,16 @@ impl AdbShareApp {
                     "Debloat phone…"
                 },
                 Some("Ctrl+Shift+D"),
+            ),
+            MenuItem::with_icon(
+                "tools",
+                names::TERMINAL,
+                if self.pane == Pane::Tools {
+                    "Browse files"
+                } else {
+                    "Device tools…"
+                },
+                None,
             ),
             MenuItem::with_icon("open-external", names::FILE_MANAGER, "Open in Files", None),
             MenuItem::with_icon("open-terminal", names::TERMINAL, "Open in terminal", None),
@@ -4001,6 +4161,33 @@ impl AdbShareApp {
                             },
                             self.pane == Pane::Debloat,
                             cx.listener(|this, _e, _w, cx| this.toggle_pane(cx)),
+                        )
+                        .into_any_element(),
+                        ui::capsule_separator(t).into_any_element(),
+                        // The tools view, the same deal as debloat: a word,
+                        // not a glyph, and the way back out.
+                        ui::capsule_button(
+                            t,
+                            "tools",
+                            if self.pane == Pane::Tools {
+                                names::FILE_MANAGER
+                            } else {
+                                names::TERMINAL
+                            },
+                            if self.pane == Pane::Tools {
+                                "Files"
+                            } else {
+                                "Tools"
+                            },
+                            self.pane == Pane::Tools,
+                            cx.listener(|this, _e, _w, cx| {
+                                if this.pane == Pane::Tools {
+                                    this.pane = Pane::Browser;
+                                    cx.notify();
+                                } else {
+                                    this.open_tools(cx);
+                                }
+                            }),
                         )
                         .into_any_element(),
                     ],
@@ -5273,6 +5460,7 @@ impl Render for AdbShareApp {
         let pane: AnyElement = match self.pane {
             Pane::Browser => self.browser.clone().into_any_element(),
             Pane::Debloat => self.debloat.clone().into_any_element(),
+            Pane::Tools => self.tools.clone().into_any_element(),
         };
 
         let body = div()

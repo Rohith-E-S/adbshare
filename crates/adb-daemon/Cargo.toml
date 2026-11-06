@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 adb-device = { path = "../adb-device" }
+adb-pairing = { path = "../adb-pairing" }
 adb-proxy = { path = "../adb-proxy" }
 adbfs = { path = "../adbfs" }
 transfer-engine = { path = "../transfer-engine" }
@@ -23,3 +24,5 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
+dirs.workspace = true
+chrono.workspace = true

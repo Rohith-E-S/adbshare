@@ -12,6 +12,7 @@
 //! 6. Expose `org.adbshare.Manager` D-Bus interface for the GUI.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -120,6 +121,52 @@ struct State {
     /// must be held rather than dropped, so an in-process transport
     /// (`TcpTransport`/`UsbTransport`) has a key to authenticate with.
     auth_key: Option<Arc<adb_device::AdbKey>>,
+    /// Running logcat streams, serial -> stream. At most one per device.
+    logcat: HashMap<String, LogcatStream>,
+    /// Screen recordings in progress, serial -> remote path + start time.
+    recording: HashMap<String, Recording>,
+    /// The QR pairing session in flight, if any.
+    qr: Option<QrState>,
+}
+
+/// One Studio-style QR pairing session, driven by a background task.
+#[derive(Debug)]
+struct QrState {
+    session: adb_pairing::QrSession,
+    /// `waiting` | `discovered` | `paired` | `connected` | `failed`.
+    state: String,
+    guid: Option<String>,
+    connect_address: Option<String>,
+    error: Option<String>,
+}
+
+/// A running `adb logcat` subprocess feeding a shared ring buffer.
+///
+/// The GUI polls `logcat_lines` with a cursor instead of holding a D-Bus
+/// signal subscription: the GUI already polls jobs and device info on a
+/// timer, so a cursor poll fits the existing architecture and survives
+/// GUI restarts (the stream lives in the daemon, not the window).
+#[derive(Debug)]
+struct LogcatStream {
+    buffer: Arc<Mutex<LogcatBuffer>>,
+    /// Sending stops the reader task, which kills the child.
+    stop: tokio::sync::oneshot::Sender<()>,
+}
+
+#[derive(Debug, Default)]
+struct LogcatBuffer {
+    /// `(seq, line)`, oldest first, capped — logcat is a firehose, so an
+    /// unbounded buffer would eat the daemon's memory on a chatty phone.
+    lines: std::collections::VecDeque<(u64, String)>,
+    next: u64,
+}
+
+const LOGCAT_CAP: usize = 10_000;
+
+/// A screen recording in flight on the device.
+#[derive(Debug)]
+struct Recording {
+    remote_path: String,
 }
 
 /// Mountpoint for a device under `mount_base`, or None if the serial can't be
@@ -274,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 adb_device::watcher::WatchEvent::Removed(id) => {
                     info!(?id, "device removed");
+                    stop_logcat(&state_clone, id.as_str());
                     let slot = state_clone.lock().devices.remove(&id);
                     if let Some(slot) = slot {
                         // Kill the on-device proxy and drop our forward
@@ -985,6 +1033,374 @@ async fn adb_shell(serial: &str, cmd: &str) -> anyhow::Result<String> {
     adb_shell_with(serial, cmd, Duration::from_secs(5)).await
 }
 
+// ── Device tools (shell surface) ─────────────────────────────────────────────
+
+/// Command heads the GUI may run on a phone through `run_shell`.
+///
+/// Everything here is a read-only or switch-style device command. File
+/// transfer, installs and debloat keep their bespoke paths; this list exists
+/// so a new tool does not need a new D-Bus method and a new bespoke parser
+/// in the daemon. Each argument is validated against a conservative charset
+/// and the command runs as `adb -s <serial> shell <argv…>` — never through
+/// a local shell — so a crafted value cannot break out into the host.
+const SHELL_ALLOWLIST: &[&str] = &[
+    "pm", "am", "svc", "settings", "wm", "getprop", "dumpsys", "input", "monkey",
+];
+
+/// True for an argument safe to hand to `adb shell` as a separate word.
+fn is_safe_shell_arg(arg: &str) -> bool {
+    !arg.is_empty()
+        && arg.len() <= 512
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@,+%".contains(c))
+}
+
+/// Restrict shell calls from D-Bus to expected tool commands and safe subcommands.
+fn validate_shell_argv(argv: &[String]) -> anyhow::Result<()> {
+    let Some(head) = argv.first() else {
+        anyhow::bail!("empty argv");
+    };
+    if !SHELL_ALLOWLIST.contains(&head.as_str()) {
+        anyhow::bail!("command not allowed: {head}");
+    }
+    if !argv.iter().all(|a| is_safe_shell_arg(a)) {
+        anyhow::bail!("argument contains unsafe characters");
+    }
+    match head.as_str() {
+        "getprop" | "dumpsys" => Ok(()),
+        "svc" => {
+            let target = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            let action = argv.get(2).map(|s| s.as_str()).unwrap_or("");
+            if matches!(target, "wifi" | "data" | "bluetooth")
+                && matches!(action, "enable" | "disable")
+            {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed svc command: {argv:?}");
+            }
+        }
+        "settings" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "get" | "put") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed settings subcommand: {sub}");
+            }
+        }
+        "wm" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "size" | "density") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed wm subcommand: {sub}");
+            }
+        }
+        "am" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "force-stop") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed am subcommand: {sub}");
+            }
+        }
+        "pm" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "clear" | "grant" | "revoke" | "list" | "path") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed pm subcommand: {sub}");
+            }
+        }
+        "input" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
+            if matches!(sub, "tap" | "text" | "keyevent" | "swipe") {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed input subcommand: {sub}");
+            }
+        }
+        "monkey" => {
+            if argv.len() == 6
+                && argv.get(1).map(|s| s.as_str()) == Some("-p")
+                && argv.get(3).map(|s| s.as_str()) == Some("-c")
+                && argv.get(4).map(|s| s.as_str()) == Some("android.intent.category.LAUNCHER")
+                && argv.get(5).map(|s| s.as_str()) == Some("1")
+            {
+                Ok(())
+            } else {
+                anyhow::bail!("disallowed monkey invocation");
+            }
+        }
+        other => anyhow::bail!("command not allowed: {other}"),
+    }
+}
+
+/// Run an allowlisted shell command on a device, returning its output.
+///
+/// Output is capped so a `dumpsys` dump cannot grow the D-Bus reply
+/// without bound.
+async fn run_shell_json(serial: &str, argv_json: &str) -> anyhow::Result<String> {
+    let argv: Vec<String> = serde_json::from_str(argv_json)
+        .map_err(|e| anyhow::anyhow!("argv is not a JSON array: {e}"))?;
+    validate_shell_argv(&argv)?;
+    let mut args: Vec<&str> = vec!["-s", serial, "shell"];
+    args.extend(argv.iter().map(|s| s.as_str()));
+    let out = adb_run_output(&args, Duration::from_secs(15)).await?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if text.len() > 200_000 {
+        text.truncate(200_000);
+        text.push_str("\n…(truncated)");
+    }
+    Ok(text)
+}
+
+/// `adb` arguments for one device: `-s <serial>` plus the rest.
+fn adb_args<'a>(serial: &'a str, rest: &[&'a str]) -> Vec<&'a str> {
+    let mut v = vec!["-s", serial];
+    v.extend_from_slice(rest);
+    v
+}
+
+/// Take a screenshot into `~/Pictures` and return the local path.
+///
+/// `exec-out` streams the PNG to stdout, so no staging file on the phone
+/// and no proxy round trip is needed.
+async fn screenshot_json(serial: &str) -> anyhow::Result<String> {
+    let out = adb_run_output(
+        &adb_args(serial, &["exec-out", "screencap", "-p"]),
+        Duration::from_secs(15),
+    )
+    .await?;
+    if out.stdout.is_empty() {
+        anyhow::bail!("screencap produced no output");
+    }
+    let dir = dirs::picture_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Pictures")))
+        .ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    std::fs::create_dir_all(&dir)?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let path = dir.join(format!("adbshare-screenshot-{stamp}.png"));
+    std::fs::write(&path, &out.stdout)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Start a logcat stream for a device, replacing any already running.
+fn start_logcat(state: &Arc<Mutex<State>>, serial: &str) -> anyhow::Result<()> {
+    stop_logcat(state, serial);
+    let buffer = Arc::new(Mutex::new(LogcatBuffer::default()));
+    let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut s = state.lock();
+        s.logcat.insert(
+            serial.to_string(),
+            LogcatStream {
+                buffer: buffer.clone(),
+                stop,
+            },
+        );
+    }
+    let serial = serial.to_string();
+    tokio::spawn(async move {
+        let mut child = match adb_command()
+            .arg("-s")
+            .arg(&serial)
+            .args(["logcat", "-v", "threadtime"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(%serial, error = %e, "logcat spawn failed");
+                return;
+            }
+        };
+        let mut stdout = match child.stdout.take() {
+            Some(o) => tokio::io::BufReader::new(o),
+            None => return,
+        };
+        let mut stop_rx = stop_rx;
+        let mut line = String::new();
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => {
+                    let _ = child.kill().await;
+                    break;
+                }
+                result = tokio::io::AsyncBufReadExt::read_line(&mut stdout, &mut line) => {
+                    match result {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let text = std::mem::take(&mut line);
+                            let text = text.trim_end_matches(['\n', '\r']).to_string();
+                            if !text.is_empty() {
+                                let mut buf = buffer.lock();
+                                let seq = buf.next;
+                                buf.next += 1;
+                                buf.lines.push_back((seq, text));
+                                while buf.lines.len() > LOGCAT_CAP {
+                                    buf.lines.pop_front();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = child.kill().await;
+    });
+    Ok(())
+}
+
+/// Stop a device's logcat stream, if any.
+fn stop_logcat(state: &Arc<Mutex<State>>, serial: &str) {
+    if let Some(stream) = state.lock().logcat.remove(serial) {
+        let _ = stream.stop.send(());
+    }
+}
+
+/// Run one QR pairing session as far as it can go: mDNS discovery of the
+/// phone's pairing server, the pairing exchange, then discovery of the
+/// wireless-debugging endpoint and an `adb connect`.
+///
+/// The phone is the pairing *server* (it starts advertising when the user
+/// scans the QR), so discovery is passive: query for the requested
+/// `studio-…` instance until it appears or the deadline passes.
+async fn qr_pair_run(
+    state: Arc<Mutex<State>>,
+    session: adb_pairing::QrSession,
+    pkcs8_der: Vec<u8>,
+    pubkey: String,
+) {
+    let set_state = |state: &Arc<Mutex<State>>, f: &dyn Fn(&mut QrState)| {
+        let mut s = state.lock();
+        if let Some(qr) = &mut s.qr {
+            f(qr);
+        }
+    };
+    let discovered = tokio::task::spawn_blocking({
+        let instance = session.instance.clone();
+        move || {
+            adb_pairing::mdns::discover(
+                adb_pairing::mdns::PAIRING_TYPE,
+                Some(&instance),
+                Duration::from_secs(100),
+            )
+            .map(|ep| SocketAddr::new(ep.ip, ep.port))
+        }
+    })
+    .await;
+    let addr = match discovered {
+        Ok(Ok(addr)) => addr,
+        Ok(Err(_)) | Err(_) => {
+            set_state(&state, &|qr| {
+                qr.state = "failed".into();
+                qr.error = Some(
+                    "The phone did not appear. On the phone open Wireless debugging → Pair with QR code, scan, and wait here.".into(),
+                );
+            });
+            return;
+        }
+    };
+    set_state(&state, &|qr| qr.state = "discovered".into());
+    let password = session.password.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        adb_pairing::pair(
+            addr,
+            password.as_bytes(),
+            &pkcs8_der,
+            &pubkey,
+            Duration::from_secs(30),
+        )
+    })
+    .await;
+    let outcome = match outcome {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(e)) => {
+            let msg = match e {
+                adb_pairing::Error::CodeMismatch => {
+                    "The phone refused the pairing. Start a new QR code and scan again.".to_string()
+                }
+                other => format!("Pairing failed: {other}"),
+            };
+            set_state(&state, &|qr| {
+                qr.state = "failed".into();
+                qr.error = Some(msg.clone());
+            });
+            return;
+        }
+        Err(_) => {
+            set_state(&state, &|qr| {
+                qr.state = "failed".into();
+                qr.error = Some("Pairing was interrupted.".into());
+            });
+            return;
+        }
+    };
+    // The device answers PeerInfo type 1 with `adb-<guid>`, which is the
+    // `_adb-tls-connect` instance name.
+    let guid = outcome
+        .peer_info
+        .first()
+        .map(|_| {
+            String::from_utf8_lossy(&outcome.peer_info[1..])
+                .trim_matches('\0')
+                .to_string()
+        })
+        .filter(|_| outcome.peer_info.first() == Some(&1));
+    set_state(&state, &|qr| {
+        qr.state = "paired".into();
+        qr.guid = guid.clone();
+    });
+    // Auto-connect to the wireless debugging endpoint, if discoverable.
+    if let Some(guid) = guid {
+        let connect = tokio::task::spawn_blocking(move || {
+            adb_pairing::mdns::discover(
+                adb_pairing::mdns::CONNECT_TYPE,
+                Some(&guid),
+                Duration::from_secs(10),
+            )
+            .map(|ep| format!("{}:{}", ep.ip, ep.port))
+        })
+        .await;
+        if let Ok(Ok(address)) = connect {
+            let out = adb_run(&["connect", &address], Duration::from_secs(15)).await;
+            if out.is_ok_and(|status| status.success()) {
+                set_state(&state, &|qr| {
+                    qr.state = "connected".into();
+                    qr.connect_address = Some(address.clone());
+                });
+                return;
+            }
+        }
+    }
+    set_state(&state, &|qr| {
+        qr.guid = qr.guid.clone();
+    });
+}
+
+/// Lines since a cursor, as JSON `{next, lines: [[seq, text], …]}`.
+fn logcat_lines_json(state: &Arc<Mutex<State>>, serial: &str, since: u64, max: usize) -> String {
+    let buffer = {
+        let s = state.lock();
+        s.logcat.get(serial).map(|stream| stream.buffer.clone())
+    };
+    let Some(buffer) = buffer else {
+        return serde_json::json!({ "next": since, "lines": [] }).to_string();
+    };
+    let buf = buffer.lock();
+    let lines: Vec<(u64, &str)> = buf
+        .lines
+        .iter()
+        .filter(|(seq, _)| *seq >= since)
+        .take(max.max(1))
+        .map(|(seq, text)| (*seq, text.as_str()))
+        .collect();
+    serde_json::json!({ "next": buf.next, "lines": lines }).to_string()
+}
+
 // ── Package installs ─────────────────────────────────────────────────────────
 
 /// True when a path names a file on the phone rather than on this computer.
@@ -1412,11 +1828,25 @@ struct DeviceInfoDto {
     /// "usb" or "wifi", inferred from the serial format.
     transport: &'static str,
     battery_pct: Option<u8>,
+    /// Battery health word from `dumpsys battery` (`good`, `overheat`, …).
+    battery_health: Option<String>,
+    /// Battery temperature in tenths of a degree Celsius, as integer °C.
+    battery_temp_c: Option<i32>,
+    /// Battery voltage in millivolts.
+    battery_voltage_mv: Option<u32>,
     storage_used: Option<u64>,
     storage_total: Option<u64>,
     /// Primary CPU architecture, e.g. `arm64-v8a`, for the install card's
     /// ABI warning. The GUI matches it against the APK's native libs.
     abi: Option<String>,
+    /// Android release (`14`, `15`, …) and API level, for capability
+    /// gating: a feature the phone's Android refuses should be hidden or
+    /// explained before the user tries it, not fail as a raw error.
+    android_version: Option<String>,
+    api_level: Option<u32>,
+    /// Display size in pixels (`wm size`), for tap-coordinate scaling.
+    display_width: Option<u32>,
+    display_height: Option<u32>,
 }
 
 async fn device_info_json(serial: &str) -> anyhow::Result<String> {
@@ -1426,48 +1856,71 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
         "usb"
     };
 
-    let (props_raw, battery_raw, df_raw) = tokio::join!(
+    let (props_raw, battery_raw, df_raw, wm_raw) = tokio::join!(
         adb_shell(serial, "getprop"),
         adb_shell(serial, "dumpsys battery"),
         adb_shell(serial, "df -k /sdcard"),
+        adb_shell(serial, "wm size"),
     );
 
-    let abi = match &props_raw {
-        Ok(raw) => parse_getprop(raw)
-            .get("ro.product.cpu.abi")
-            .filter(|s| !s.is_empty())
-            .cloned(),
-        Err(_) => None,
-    };
-
-    let model = match props_raw {
-        Ok(raw) => {
-            let props = parse_getprop(&raw);
-            props
-                .get("ro.product.marketname")
-                .filter(|s| !s.is_empty() && s.as_str() != "UNRECOGNIZED")
-                .or_else(|| props.get("ro.product.model"))
-                .filter(|s| !s.is_empty())
-                .cloned()
-        }
+    let props = match &props_raw {
+        Ok(raw) => parse_getprop(raw),
         Err(e) => {
             warn!(serial, error = %e, "getprop failed");
-            None
+            HashMap::new()
         }
     };
+    let abi = props
+        .get("ro.product.cpu.abi")
+        .filter(|s| !s.is_empty())
+        .cloned();
+    let model = props
+        .get("ro.product.marketname")
+        .filter(|s| !s.is_empty() && s.as_str() != "UNRECOGNIZED")
+        .or_else(|| props.get("ro.product.model"))
+        .filter(|s| !s.is_empty())
+        .cloned();
+    let android_version = props
+        .get("ro.build.version.release")
+        .filter(|s| !s.is_empty())
+        .cloned();
+    let api_level = props
+        .get("ro.build.version.sdk")
+        .and_then(|s| s.parse::<u32>().ok());
 
-    let battery_pct = battery_raw.ok().and_then(|raw| {
-        for line in raw.lines() {
-            let line = line.trim();
-            if let Some(v) = line
-                .strip_prefix("level:")
-                .and_then(|v| v.trim().parse::<u8>().ok())
-            {
-                return Some(v.min(100));
-            }
-        }
-        None
-    });
+    let battery_raw = battery_raw.ok().unwrap_or_default();
+    let battery_field = |key: &str| {
+        battery_raw.lines().find_map(|line| {
+            line.trim().strip_prefix(key).and_then(|v| {
+                let v = v.trim();
+                (!v.is_empty()).then_some(v.to_string())
+            })
+        })
+    };
+    let battery_pct = battery_field("level:")
+        .and_then(|v| v.parse::<u8>().ok())
+        .map(|v| v.min(100));
+    let battery_health = battery_field("health:").filter(|v| v != "unknown");
+    let battery_temp_c = battery_field("temperature:")
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|tenths| tenths / 10);
+    let battery_voltage_mv = battery_field("voltage:").and_then(|v| v.parse::<u32>().ok());
+
+    // `wm size` prints "Physical size: 1080x2400" (and an "Override size"
+    // line when the user has scaled the display). The physical size is the
+    // coordinate space `input tap` works in, so prefer it.
+    let (display_width, display_height) = wm_raw
+        .ok()
+        .and_then(|raw| {
+            raw.lines().find_map(|line| {
+                let line = line.trim();
+                let size = line.strip_prefix("Physical size: ")?.trim();
+                let (w, h) = size.split_once('x')?;
+                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+            })
+        })
+        .map(|(w, h)| (Some(w), Some(h)))
+        .unwrap_or((None, None));
 
     // toybox `df -k` last line: Filesystem 1K-blocks Used Available Use% Mounted
     let (storage_used, storage_total) = match df_raw {
@@ -1498,9 +1951,16 @@ async fn device_info_json(serial: &str) -> anyhow::Result<String> {
         model,
         transport,
         battery_pct,
+        battery_health,
+        battery_temp_c,
+        battery_voltage_mv,
         storage_used,
         storage_total,
         abi,
+        android_version,
+        api_level,
+        display_width,
+        display_height,
     })
     .map_err(|e| anyhow::anyhow!("serialize device info: {e}"))
 }
@@ -2439,6 +2899,284 @@ impl ManagerInterface {
         }
         Ok(())
     }
+
+    // ── Device tools ──────────────────────────────────────────────────────
+
+    /// Run an allowlisted shell command on a device; see
+    /// [`SHELL_ALLOWLIST`]. Returns combined output as text.
+    async fn run_shell(&self, device: &str, argv: &str) -> zbus::fdo::Result<String> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        client_for(&self.state, device)?;
+        run_shell_json(device, argv)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("run_shell: {e}")))
+    }
+
+    /// Take a screenshot into `~/Pictures`; returns the local path.
+    async fn screenshot(&self, device: &str) -> zbus::fdo::Result<String> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        client_for(&self.state, device)?;
+        screenshot_json(device)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("screenshot: {e}")))
+    }
+
+    /// Start streaming logcat for a device (one stream per device).
+    async fn start_logcat(&self, device: &str) -> zbus::fdo::Result<bool> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        client_for(&self.state, device)?;
+        start_logcat(&self.state, device)
+            .map(|()| true)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("logcat: {e}")))
+    }
+
+    /// Stop the device's logcat stream.
+    async fn stop_logcat(&self, device: &str) -> zbus::fdo::Result<bool> {
+        stop_logcat(&self.state, device);
+        Ok(true)
+    }
+
+    /// Logcat lines since a sequence cursor, as JSON
+    /// `{next, lines: [[seq, text], …]}`.
+    async fn logcat_lines(&self, device: &str, since: u64, max: u32) -> zbus::fdo::Result<String> {
+        Ok(logcat_lines_json(&self.state, device, since, max as usize))
+    }
+
+    /// Reboot the device. `mode` is empty, `bootloader`, or `recovery`.
+    async fn reboot(&self, device: &str, mode: &str) -> zbus::fdo::Result<bool> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        if !["", "bootloader", "recovery"].contains(&mode) {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "unknown reboot mode: {mode}"
+            )));
+        }
+        client_for(&self.state, device)?;
+        let mut args = adb_args(device, &["reboot"]);
+        if !mode.is_empty() {
+            args.push(mode);
+        }
+        adb_run(&args, Duration::from_secs(10))
+            .await
+            .map(|_| true)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("reboot: {e}")))
+    }
+
+    /// Active `adb forward` entries, as text (one per line).
+    async fn list_forwards(&self) -> zbus::fdo::Result<String> {
+        let out = adb_run_output(&["forward", "--list"], Duration::from_secs(10))
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("forward --list: {e}")))?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Forward a local port to a device-side endpoint, e.g.
+    /// `tcp:8080` -> `localdevice:8080`.
+    async fn add_forward(
+        &self,
+        device: &str,
+        local_port: u16,
+        remote: &str,
+    ) -> zbus::fdo::Result<bool> {
+        if device.is_empty() || remote.is_empty() || !is_safe_shell_arg(remote) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "device and a safe remote endpoint are required".into(),
+            ));
+        }
+        client_for(&self.state, device)?;
+        let local = format!("tcp:{local_port}");
+        adb_run(
+            &adb_args(device, &["forward", &local, remote]),
+            Duration::from_secs(10),
+        )
+        .await
+        .map(|_| true)
+        .map_err(|e| zbus::fdo::Error::Failed(format!("forward: {e}")))
+    }
+
+    /// Remove a forward previously added for a local port.
+    async fn remove_forward(&self, device: &str, local_port: u16) -> zbus::fdo::Result<bool> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        client_for(&self.state, device)?;
+        let local = format!("tcp:{local_port}");
+        adb_run(
+            &adb_args(device, &["forward", "--remove", &local]),
+            Duration::from_secs(10),
+        )
+        .await
+        .map(|_| true)
+        .map_err(|e| zbus::fdo::Error::Failed(format!("forward --remove: {e}")))
+    }
+
+    /// Collect a bug report zip into `~/Downloads`; returns the local path.
+    async fn bugreport(&self, device: &str) -> zbus::fdo::Result<String> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        client_for(&self.state, device)?;
+        let dir = dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+            .ok_or_else(|| zbus::fdo::Error::Failed("no home directory".into()))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("mkdir: {e}")))?;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let path = dir.join(format!("adbshare-bugreport-{stamp}.zip"));
+        let path_str = path.to_string_lossy().into_owned();
+        adb_run(
+            &adb_args(device, &["bugreport", &path_str]),
+            Duration::from_secs(300),
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(format!("bugreport: {e}")))?;
+        Ok(path_str)
+    }
+
+    /// Begin a QR pairing session; returns JSON
+    /// `{instance, password, payload}` for the GUI to draw as a QR code.
+    /// Discovery and pairing run in the background — poll
+    /// `qr_pair_status`.
+    async fn qr_pair_start(&self) -> zbus::fdo::Result<String> {
+        let (pkcs8_der, pubkey) = {
+            let s = self.state.lock();
+            let key = s
+                .auth_key
+                .as_ref()
+                .ok_or_else(|| zbus::fdo::Error::Failed("no adb key loaded".into()))?;
+            let raw = key.ssh_public();
+            let trimmed = raw
+                .iter()
+                .rposition(|b| *b != 0)
+                .map(|i| i + 1)
+                .unwrap_or(raw.len());
+            (
+                key.pkcs8_der().to_vec(),
+                String::from_utf8_lossy(&raw[..trimmed]).into_owned(),
+            )
+        };
+        let session = adb_pairing::qr::new_session();
+        let payload = adb_pairing::qr::payload(&session);
+        self.state.lock().qr = Some(QrState {
+            state: "waiting".into(),
+            session: session.clone(),
+            guid: None,
+            connect_address: None,
+            error: None,
+        });
+        let instance = session.instance.clone();
+        let password = session.password.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            qr_pair_run(state, session, pkcs8_der, pubkey).await;
+        });
+        serde_json::to_string(&serde_json::json!({
+            "instance": instance,
+            "password": password,
+            "payload": payload,
+        }))
+        .map_err(|e| zbus::fdo::Error::Failed(format!("serialize: {e}")))
+    }
+
+    /// Poll the QR pairing session as JSON
+    /// `{state, guid, connect_address, error}`.
+    async fn qr_pair_status(&self) -> zbus::fdo::Result<String> {
+        let s = self.state.lock();
+        let json = match &s.qr {
+            Some(qr) => serde_json::json!({
+                "state": qr.state,
+                "instance": qr.session.instance,
+                "guid": qr.guid,
+                "connect_address": qr.connect_address,
+                "error": qr.error,
+            }),
+            None => serde_json::json!({ "state": "none" }),
+        };
+        Ok(json.to_string())
+    }
+
+    /// Start a screen recording on the device (max 3 minutes).
+    async fn start_record(&self, device: &str) -> zbus::fdo::Result<bool> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        client_for(&self.state, device)?;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let remote = format!("/sdcard/adbshare-rec-{stamp}.mp4");
+        let mut s = self.state.lock();
+        s.recording.insert(
+            device.to_string(),
+            Recording {
+                remote_path: remote.clone(),
+            },
+        );
+        drop(s);
+        // `screenrecord` blocks until the time limit or SIGINT, so it runs
+        // detached: a 5s `adb_run` timeout would kill it after five seconds.
+        // `stop_record` finalises it with SIGINT and pulls the file.
+        let device = device.to_string();
+        tokio::spawn(async move {
+            let _ = adb_run(
+                &adb_args(
+                    &device,
+                    &["shell", &format!("screenrecord --time-limit 180 {remote}")],
+                ),
+                Duration::from_secs(200),
+            )
+            .await;
+        });
+        Ok(true)
+    }
+
+    /// Stop the recording and pull it into `~/Videos`; returns the path.
+    async fn stop_record(&self, device: &str) -> zbus::fdo::Result<String> {
+        let remote = self
+            .state
+            .lock()
+            .recording
+            .remove(device)
+            .map(|r| r.remote_path);
+        let Some(remote) = remote else {
+            return Err(zbus::fdo::Error::Failed("no recording in progress".into()));
+        };
+        // SIGINT finalises the MP4 (moov atom); SIGKILL would corrupt it.
+        let _ = adb_run(
+            &adb_args(device, &["shell", "pkill", "-INT", "screenrecord"]),
+            Duration::from_secs(10),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let dir = dirs::video_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
+            .ok_or_else(|| zbus::fdo::Error::Failed("no home directory".into()))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("mkdir: {e}")))?;
+        let name = std::path::Path::new(&remote)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "adbshare-recording.mp4".to_string());
+        let local = dir.join(name);
+        let local_str = local.to_string_lossy().into_owned();
+        adb_run(
+            &adb_args(device, &["pull", &remote, &local_str]),
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(format!("pull recording: {e}")))?;
+        let _ = adb_run(
+            &adb_args(device, &["shell", &format!("rm -f {remote}")]),
+            Duration::from_secs(10),
+        )
+        .await;
+        Ok(local_str)
+    }
 }
 
 #[allow(dead_code)]
@@ -2678,5 +3416,30 @@ mod tests {
         assert!(is_device_local_path("/data/local/tmp/app.apk"));
         // An absolute path that is not on this computer is on the phone.
         assert!(is_device_local_path("/somewhere/else/app.apk"));
+    }
+
+    #[test]
+    fn validate_shell_argv_enforces_safety() {
+        let to_vec = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(validate_shell_argv(&to_vec(&["settings", "get", "global", "wifi_on"])).is_ok());
+        assert!(validate_shell_argv(&to_vec(&["svc", "wifi", "enable"])).is_ok());
+        assert!(validate_shell_argv(&to_vec(&["input", "tap", "100", "200"])).is_ok());
+        assert!(validate_shell_argv(&to_vec(&["pm", "clear", "com.example.app"])).is_ok());
+
+        // Dangerous or unapproved heads and subcommands are blocked
+        assert!(validate_shell_argv(&to_vec(&["rm", "-rf", "/"])).is_err());
+        assert!(
+            validate_shell_argv(&to_vec(&[
+                "content",
+                "delete",
+                "--uri",
+                "content://contacts"
+            ]))
+            .is_err()
+        );
+        assert!(validate_shell_argv(&to_vec(&["svc", "power", "shutdown"])).is_err());
+        assert!(validate_shell_argv(&to_vec(&["settings", "delete", "system", "foo"])).is_err());
+        assert!(validate_shell_argv(&to_vec(&["monkey", "10000"])).is_err());
+        assert!(validate_shell_argv(&to_vec(&["input", "roll"])).is_err());
     }
 }
