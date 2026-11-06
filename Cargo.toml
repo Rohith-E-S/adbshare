@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/adb-pairing",
     "crates/adb-device",
     "crates/adb-proxy",
     "crates/adbfs",
@@ -37,6 +38,16 @@ sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 zbus = { version = "4.4", features = ["tokio"] }
+curve25519-dalek = "5"
+subtle = "2"
+hkdf = "0.13"
+hmac = "0.13"
+aes-gcm = "0.11"
+rand = "0.9"
+base64 = "0.22"
+pem = "3"
+rustls-pki-types = "1"
+webpki-roots = "1"
 
 # FUSE
 fuser = "0.18"

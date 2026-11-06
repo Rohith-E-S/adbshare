@@ -5,4 +5,5 @@ pub mod filechooser;
 pub mod menu;
 pub mod textinput;
 pub mod toast;
+pub mod tools;
 pub mod ui;
