@@ -6,6 +6,7 @@ members = [
     "crates/adb-proxy",
     "crates/adbfs",
     "crates/transfer-engine",
+    "crates/adb-remote",
     "crates/adb-daemon",
     "crates/adb-gui",
     "crates/adbshare-proxy-device",

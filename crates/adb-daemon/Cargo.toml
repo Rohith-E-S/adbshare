@@ -13,6 +13,7 @@ path = "src/main.rs"
 adb-device = { path = "../adb-device" }
 adb-pairing = { path = "../adb-pairing" }
 adb-proxy = { path = "../adb-proxy" }
+adb-remote = { path = "../adb-remote" }
 adbfs = { path = "../adbfs" }
 transfer-engine = { path = "../transfer-engine" }
 tokio.workspace = true

@@ -9,6 +9,7 @@ dependencies = [
  "adb-device",
  "adb-pairing",
  "adb-proxy",
+ "adb-remote",
  "adbfs",
  "anyhow",
  "chrono",
@@ -53,6 +54,7 @@ dependencies = [
 name = "adb-gui"
 version = "0.1.0"
 dependencies = [
+ "adb-remote",
  "anyhow",
  "ashpd 0.13.13",
  "async-channel 2.5.0",
@@ -113,6 +115,13 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "adb-remote"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]
