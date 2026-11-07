@@ -114,6 +114,10 @@ pub trait Manager {
     async fn stop_record(&self, device: &str) -> zbus::Result<String>;
     async fn qr_pair_start(&self) -> zbus::Result<String>;
     async fn qr_pair_status(&self) -> zbus::Result<String>;
+    async fn start_remote(&self, device: &str, options_json: &str) -> zbus::Result<String>;
+    async fn stop_remote(&self, device: &str) -> zbus::Result<bool>;
+    async fn remote_status(&self, device: &str) -> zbus::Result<String>;
+    async fn remote_frame(&self, device: &str) -> zbus::Result<String>;
 }
 
 /// Handle to the pinned tokio runtime.
@@ -813,6 +817,158 @@ pub async fn qr_pair_status() -> Result<serde_json::Value, String> {
         Ok(serde_json::from_str(&json)?)
     })
     .await
+}
+
+// ── Remote control ───────────────────────────────────────────────────────────
+
+/// Start a remote-control session; returns session info as JSON.
+pub async fn start_remote(device: &str, options_json: &str) -> Result<serde_json::Value, String> {
+    let (device, options_json) = (device.to_string(), options_json.to_string());
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        let json = proxy.start_remote(&device, &options_json).await?;
+        Ok(serde_json::from_str(&json)?)
+    })
+    .await
+}
+
+/// Stop the remote-control session; true if one ran.
+pub async fn stop_remote(device: &str) -> Result<bool, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.stop_remote(&device).await?)
+    })
+    .await
+}
+
+/// Live status of the remote-control session as JSON.
+pub async fn remote_status(device: &str) -> Result<serde_json::Value, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        let json = proxy.remote_status(&device).await?;
+        Ok(serde_json::from_str(&json)?)
+    })
+    .await
+}
+
+/// Capture a preview frame into the runtime directory without polluting ~/Pictures.
+#[allow(dead_code)]
+pub async fn remote_frame(device: &str) -> Result<String, String> {
+    let device = device.to_string();
+    dispatch(move || async move {
+        let proxy = get_manager().await?;
+        Ok(proxy.remote_frame(&device).await?)
+    })
+    .await
+}
+
+/// Send a sequence of high-frequency control messages over a single Unix socket connection.
+pub async fn send_remote_controls(
+    socket_path: std::path::PathBuf,
+    msgs: Vec<adb_remote::input::ControlMessage>,
+    delay_between_ms: u64,
+) -> Result<(), String> {
+    dispatch(move || async move {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to {}: {e}", socket_path.display()))?;
+        let len = msgs.len();
+        for (i, msg) in msgs.into_iter().enumerate() {
+            let payload = msg.serialize();
+            let frame = adb_remote::proxy::frame(&payload);
+            stream
+                .write_all(&frame)
+                .await
+                .map_err(|e| anyhow::anyhow!("write to control socket: {e}"))?;
+            if delay_between_ms > 0 && i + 1 < len {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_between_ms)).await;
+            }
+        }
+        let _ = stream.flush().await;
+        Ok(())
+    })
+    .await
+}
+
+/// Send a high-frequency control message directly to the device's Unix socket proxy.
+#[allow(dead_code)]
+pub async fn send_remote_control(
+    socket_path: std::path::PathBuf,
+    msg: adb_remote::input::ControlMessage,
+) -> Result<(), String> {
+    send_remote_controls(socket_path, vec![msg], 0).await
+}
+
+/// Open a persistent background worker connected to the remote control Unix socket.
+///
+/// Returns an unbounded sender that can be used from GPUI handlers without blocking.
+/// Closing or dropping the sender terminates the worker task and closes the socket.
+pub fn open_remote_control(
+    socket_path: std::path::PathBuf,
+) -> Result<async_channel::Sender<adb_remote::input::ControlMessage>, String> {
+    let handle = runtime().map_err(|err| err.to_string())?;
+    let (tx, rx) = async_channel::unbounded::<adb_remote::input::ControlMessage>();
+    handle.spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tracing::info!(path = %socket_path.display(), "remote control worker starting");
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.ok();
+        if stream.is_some() {
+            tracing::info!("remote control worker connected to socket");
+        } else {
+            tracing::warn!("remote control worker failed initial socket connect");
+        }
+        let mut drain_buf = [0u8; 4096];
+        loop {
+            if let Some(ref mut s) = stream {
+                tokio::select! {
+                    msg = rx.recv() => {
+                        let Ok(msg) = msg else { break; };
+                        let payload = msg.serialize();
+                        let frame = adb_remote::proxy::frame(&payload);
+                        if s.write_all(&frame).await.is_err() || s.flush().await.is_err() {
+                            tracing::warn!("remote control socket write failed, resetting connection");
+                            stream = None;
+                        }
+                    }
+                    read_res = s.read(&mut drain_buf) => {
+                        match read_res {
+                            Ok(0) | Err(_) => {
+                                tracing::warn!("remote control socket closed by peer");
+                                stream = None;
+                            }
+                            Ok(_n) => {
+                                // Drained metadata/clipboard from daemon without blocking
+                            }
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    msg = rx.recv() => {
+                        let Ok(msg) = msg else { break; };
+                        if let Ok(mut new_s) = tokio::net::UnixStream::connect(&socket_path).await {
+                            let payload = msg.serialize();
+                            let frame = adb_remote::proxy::frame(&payload);
+                            let _ = new_s.write_all(&frame).await;
+                            let _ = new_s.flush().await;
+                            stream = Some(new_s);
+                        }
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        if let Ok(new_s) = tokio::net::UnixStream::connect(&socket_path).await {
+                            tracing::info!("remote control reconnected");
+                            stream = Some(new_s);
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!("remote control worker terminated");
+    });
+    Ok(tx)
 }
 
 // ── Wireless pairing ─────────────────────────────────────────────────────────

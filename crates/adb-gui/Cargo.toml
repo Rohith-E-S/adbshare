@@ -10,6 +10,7 @@ name = "adb-gui"
 path = "src/main.rs"
 
 [dependencies]
+adb-remote = { path = "../adb-remote" }
 gpui = "0.2.2"
 tokio.workspace = true
 zbus.workspace = true

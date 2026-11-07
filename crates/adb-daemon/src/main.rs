@@ -16,13 +16,18 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use adb_device::{DeviceId, DeviceWatcher};
 use adb_proxy::{DEFAULT_PROXY_PORT, PROXY_BIN_PATH, ProxyClient, ProxyError, ops::DirEntry};
+use adb_remote::protocol::{parse_codec_id, parse_device_message, parse_device_name};
+use adb_remote::{Packet, PacketReader};
 use clap::Parser;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 use zbus::{ConnectionBuilder, interface};
@@ -123,6 +128,8 @@ struct State {
     auth_key: Option<Arc<adb_device::AdbKey>>,
     /// Running logcat streams, serial -> stream. At most one per device.
     logcat: HashMap<String, LogcatStream>,
+    /// Real-time remote-control sessions, serial -> session. At most one per device.
+    remote: HashMap<String, RemoteSession>,
     /// Screen recordings in progress, serial -> remote path + start time.
     recording: HashMap<String, Recording>,
     /// The QR pairing session in flight, if any.
@@ -162,6 +169,35 @@ struct LogcatBuffer {
 }
 
 const LOGCAT_CAP: usize = 10_000;
+
+/// A real-time remote-control session for one device.
+///
+/// The daemon owns the adb tunnels, the on-device server process and the
+/// Unix socket the GUI talks to; the GUI never touches ADB. Sending on
+/// `stop` ends the proxy task and kills the server child (same pattern as
+/// [`LogcatStream`]).
+#[derive(Debug)]
+struct RemoteSession {
+    scid: i32,
+    host_port: u16,
+    tunnel_forward: bool,
+    socket_path: PathBuf,
+    stop: tokio::sync::oneshot::Sender<()>,
+    stats: Arc<RemoteStats>,
+    started: Instant,
+    codec: String,
+    device_name: String,
+    preset: String,
+}
+
+/// Live counters updated by the proxy task, read by `remote_status`.
+#[derive(Debug, Default)]
+struct RemoteStats {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    width: AtomicU64,
+    height: AtomicU64,
+}
 
 /// A screen recording in flight on the device.
 #[derive(Debug)]
@@ -322,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
                 adb_device::watcher::WatchEvent::Removed(id) => {
                     info!(?id, "device removed");
                     stop_logcat(&state_clone, id.as_str());
+                    stop_remote_session(&state_clone, id.as_str()).await;
                     let slot = state_clone.lock().devices.remove(&id);
                     if let Some(slot) = slot {
                         // Kill the on-device proxy and drop our forward
@@ -423,6 +460,9 @@ async fn main() -> anyhow::Result<()> {
     // Idle loop.
     tokio::signal::ctrl_c().await?;
     info!("shutting down");
+    // Remote sessions own adb tunnels and server processes; stop them before
+    // the device slots are torn down.
+    stop_all_remote(&state).await;
     // Drain first: holding the state lock across `await` would block every
     // device_info reader for the length of the teardown.
     let devices = std::mem::take(&mut state.lock().devices);
@@ -1162,6 +1202,34 @@ fn adb_args<'a>(serial: &'a str, rest: &[&'a str]) -> Vec<&'a str> {
     v
 }
 
+/// Parse the `start_remote` options JSON into [`adb_remote::SessionOptions`].
+/// Unknown fields are ignored; a missing preset defaults to Balanced.
+fn parse_remote_options(options_json: &str) -> adb_remote::SessionOptions {
+    let v: serde_json::Value =
+        serde_json::from_str(options_json).unwrap_or(serde_json::Value::Null);
+    let preset = match v
+        .get("preset")
+        .and_then(|p| p.as_str())
+        .unwrap_or("balanced")
+    {
+        "performance" => adb_remote::PRESET_PERFORMANCE,
+        "quality" => adb_remote::PRESET_QUALITY,
+        _ => adb_remote::PRESET_BALANCED,
+    };
+    let mut opts = adb_remote::SessionOptions::new(preset);
+    opts.audio = v.get("audio").and_then(|a| a.as_bool()).unwrap_or(false);
+    if let Some(max_size) = v.get("max_size").and_then(|n| n.as_u64()) {
+        opts.preset.max_size = max_size as u32;
+    }
+    if let Some(max_fps) = v.get("max_fps").and_then(|n| n.as_u64()) {
+        opts.preset.max_fps = max_fps as u32;
+    }
+    if let Some(bitrate) = v.get("bit_rate").and_then(|n| n.as_u64()) {
+        opts.preset.bit_rate = bitrate as u32;
+    }
+    opts
+}
+
 /// Take a screenshot into `~/Pictures` and return the local path.
 ///
 /// `exec-out` streams the PNG to stdout, so no staging file on the phone
@@ -1181,6 +1249,36 @@ async fn screenshot_json(serial: &str) -> anyhow::Result<String> {
     std::fs::create_dir_all(&dir)?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let path = dir.join(format!("adbshare-screenshot-{stamp}.png"));
+    std::fs::write(&path, &out.stdout)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Return the path to the live decoded frame, or capture a single frame if not streaming.
+async fn remote_frame_path(state: &Arc<Mutex<State>>, serial: &str) -> anyhow::Result<String> {
+    let remote_dir = dirs::runtime_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
+        .map(|d| d.join("adbshare").join("remote"))
+        .ok_or_else(|| anyhow::anyhow!("no runtime directory"))?;
+    std::fs::create_dir_all(&remote_dir)?;
+    let safe = sanitize_mount_name(serial).unwrap_or_else(|| "device".to_string());
+    let jpg_path = remote_dir.join(format!("{safe}-frame.jpg"));
+    if jpg_path.exists() {
+        return Ok(jpg_path.to_string_lossy().into_owned());
+    }
+
+    if state.lock().remote.contains_key(serial) {
+        anyhow::bail!("waiting for first live video frame");
+    }
+
+    let out = adb_run_output(
+        &adb_args(serial, &["exec-out", "screencap", "-p"]),
+        Duration::from_secs(10),
+    )
+    .await?;
+    if out.stdout.is_empty() {
+        anyhow::bail!("screencap produced no output");
+    }
+    let path = remote_dir.join(format!("{safe}-frame.png"));
     std::fs::write(&path, &out.stdout)?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -1258,6 +1356,608 @@ fn start_logcat(state: &Arc<Mutex<State>>, serial: &str) -> anyhow::Result<()> {
 fn stop_logcat(state: &Arc<Mutex<State>>, serial: &str) {
     if let Some(stream) = state.lock().logcat.remove(serial) {
         let _ = stream.stop.send(());
+    }
+}
+
+/// Locate the scrcpy server jar. Order mirrors `locate_proxy_binary`:
+/// env override, user data dir, next-to-exe, system dirs, PATH.
+fn locate_scrcpy_server() -> anyhow::Result<PathBuf> {
+    if let Some(env_path) = std::env::var_os("ADBSHARE_SCRCPY_SERVER").map(PathBuf::from)
+        && env_path.exists()
+    {
+        return Ok(env_path);
+    }
+    if let Some(data_dir) = dirs::data_dir() {
+        let p = data_dir.join("adbshare").join("scrcpy-server.jar");
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe_dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+    for c in [
+        exe_dir.join("scrcpy-server.jar"),
+        PathBuf::from("/usr/lib/adbshare/scrcpy-server.jar"),
+        PathBuf::from("/app/bin/scrcpy-server.jar"),
+        PathBuf::from("target/release/scrcpy-server.jar"),
+        PathBuf::from("target/debug/scrcpy-server.jar"),
+    ] {
+        if c.exists() {
+            return Ok(c);
+        }
+    }
+    if let Ok(p) = which_("scrcpy-server") {
+        return Ok(p);
+    }
+    anyhow::bail!(
+        "scrcpy-server.jar not found. Download the scrcpy release, copy \
+         scrcpy-server (or scrcpy-server.jar) to ~/.local/share/adbshare/scrcpy-server.jar, \
+         or set ADBSHARE_SCRCPY_SERVER to its path."
+    )
+}
+
+/// Start a remote-control session for `serial`.
+///
+/// Pushes the server jar, sets up `adb reverse` (falling back to `adb forward`),
+/// starts the server via `app_process`, accepts the video+control sockets,
+/// then serves a Unix socket the GUI connects to. Returns the session info as
+/// JSON for the GUI.
+async fn start_remote_session(
+    state: &Arc<Mutex<State>>,
+    serial: &str,
+    opts: adb_remote::SessionOptions,
+) -> anyhow::Result<serde_json::Value> {
+    // One session per device.
+    if state.lock().remote.contains_key(serial) {
+        anyhow::bail!("remote control is already running for this device");
+    }
+    // The device must be set up (proxy reachable) before we start.
+    client_for(state, serial).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let jar = locate_scrcpy_server()?;
+    let jar_str = jar.to_string_lossy().into_owned();
+    let scid = adb_remote::random_scid();
+    let socket_name = adb_remote::socket_name(scid);
+    let version = opts.server_version.clone();
+    let preset = opts.preset;
+
+    // Push the server jar (it is small; a plain push is fine).
+    let status = adb_run(
+        &[
+            "-s",
+            serial,
+            "push",
+            &jar_str,
+            adb_remote::SERVER_REMOTE_PATH,
+        ],
+        ADB_PUSH_TIMEOUT,
+    )
+    .await?;
+    if !status.success() {
+        anyhow::bail!("pushing scrcpy-server failed: {status}");
+    }
+
+    let host_port = allocate_host_port()?;
+
+    // Reverse tunnel: the server connects back to us. If that fails (older
+    // adb), fall back to forward: the server listens, we connect.
+    let reverse = adb_run(
+        &[
+            "-s",
+            serial,
+            "reverse",
+            &format!("localabstract:{socket_name}"),
+            &format!("tcp:{host_port}"),
+        ],
+        ADB_CMD_TIMEOUT,
+    )
+    .await;
+    let tunnel_forward = match reverse {
+        Ok(s) if s.success() => false,
+        _ => {
+            let s = adb_run(
+                &[
+                    "-s",
+                    serial,
+                    "forward",
+                    &format!("tcp:{host_port}"),
+                    &format!("localabstract:{socket_name}"),
+                ],
+                ADB_CMD_TIMEOUT,
+            )
+            .await?;
+            if !s.success() {
+                let _ = adb_run(
+                    &[
+                        "-s",
+                        serial,
+                        "reverse",
+                        "--remove",
+                        &format!("localabstract:{socket_name}"),
+                    ],
+                    ADB_CMD_TIMEOUT,
+                )
+                .await;
+                anyhow::bail!("setting up the remote tunnel failed: {s}");
+            }
+            true
+        }
+    };
+
+    // Bind the listener BEFORE starting the server (reverse mode).
+    let listener = TcpListener::bind(("127.0.0.1", host_port)).await?;
+    let server_args = format!(
+        "CLASSPATH={} app_process / {} {} scid={scid:08x} log_level=info video=true audio={} control=true \
+         max_size={} max_fps={} video_bit_rate={} tunnel_forward={} cleanup=false",
+        adb_remote::SERVER_REMOTE_PATH,
+        adb_remote::SERVER_MAIN_CLASS,
+        version,
+        opts.audio,
+        preset.max_size,
+        preset.max_fps,
+        preset.bit_rate,
+        tunnel_forward,
+    );
+    let mut cmd = adb_command();
+    cmd.arg("-s")
+        .arg(serial)
+        .arg("shell")
+        .arg(&server_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("starting scrcpy-server: {e}"))?;
+    let child_out = child.stdout.take();
+    let child_err = child.stderr.take();
+
+    // Accept (reverse) or connect (forward) video, then control.
+    let accept_timeout = Duration::from_secs(20);
+    let (mut video, control): (TcpStream, TcpStream) = if tunnel_forward {
+        let mut v =
+            tokio::time::timeout(accept_timeout, TcpStream::connect(("127.0.0.1", host_port)))
+                .await
+                .map_err(|_| anyhow::anyhow!("scrcpy-server did not connect (video)"))??;
+        // Forward mode sends one dummy byte on the first socket; read it before
+        // the device-name field. Ignore the result: in reverse mode there is
+        // no dummy byte and `v` is already bound below.
+        let mut dummy = [0u8; 1];
+        let _ = tokio::time::timeout(Duration::from_secs(5), v.read_exact(&mut dummy)).await;
+        let c = tokio::time::timeout(accept_timeout, TcpStream::connect(("127.0.0.1", host_port)))
+            .await
+            .map_err(|_| anyhow::anyhow!("scrcpy-server did not connect (control)"))??;
+        (v, c)
+    } else {
+        let (v, _) = tokio::time::timeout(accept_timeout, listener.accept())
+            .await
+            .map_err(|_| anyhow::anyhow!("scrcpy-server did not connect (video)"))??;
+        let (c, _) = tokio::time::timeout(accept_timeout, listener.accept())
+            .await
+            .map_err(|_| anyhow::anyhow!("scrcpy-server did not connect (control)"))??;
+        (v, c)
+    };
+
+    // Device name (64-byte field) + codec id, on the video socket.
+    let mut name_field = [0u8; adb_remote::protocol::DEVICE_NAME_FIELD_LENGTH];
+    tokio::time::timeout(Duration::from_secs(10), video.read_exact(&mut name_field))
+        .await
+        .map_err(|_| anyhow::anyhow!("reading device name from server"))??;
+    let device_name = parse_device_name(&name_field);
+    let mut codec_bytes = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), video.read_exact(&mut codec_bytes))
+        .await
+        .map_err(|_| anyhow::anyhow!("reading codec id from server"))??;
+    let codec = parse_codec_id(&codec_bytes)
+        .ok_or_else(|| anyhow::anyhow!("server sent an unknown codec id"))?;
+    let mut size_bytes = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(10), video.read_exact(&mut size_bytes))
+        .await
+        .map_err(|_| anyhow::anyhow!("reading video size from server"))??;
+    let init_width =
+        u32::from_be_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]);
+    let init_height =
+        u32::from_be_bytes([size_bytes[4], size_bytes[5], size_bytes[6], size_bytes[7]]);
+
+    // Unix socket for the GUI. Video bytes flow daemon→GUI verbatim after the
+    // codec id; GUI→daemon control messages are length-prefixed frames.
+    let remote_dir = dirs::runtime_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
+        .map(|d| d.join("adbshare").join("remote"))
+        .ok_or_else(|| anyhow::anyhow!("no runtime directory"))?;
+    std::fs::create_dir_all(&remote_dir)?;
+    let safe = sanitize_mount_name(serial).unwrap_or_else(|| "device".to_string());
+    let socket_path = remote_dir.join(format!("{safe}.sock"));
+    let _ = std::fs::remove_file(&socket_path);
+    let gui_listener = UnixListener::bind(&socket_path)?;
+
+    info!(
+        serial,
+        preset = preset.name,
+        codec = codec.as_str(),
+        width = init_width,
+        height = init_height,
+        "remote session started"
+    );
+
+    let stats = Arc::new(RemoteStats::default());
+    stats.width.store(init_width as u64, Ordering::Relaxed);
+    stats.height.store(init_height as u64, Ordering::Relaxed);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let started = Instant::now();
+    let state_for_proxy = state.clone();
+    let serial_owned = serial.to_string();
+    let stats_for_proxy = stats.clone();
+    tokio::spawn(async move {
+        remote_proxy_task(
+            state_for_proxy,
+            serial_owned,
+            gui_listener,
+            video,
+            control,
+            codec_bytes,
+            init_width,
+            init_height,
+            stats_for_proxy,
+            stop_rx,
+        )
+        .await;
+    });
+
+    // Monitor the server process: when it exits, tear the session down.
+    let state_for_monitor = state.clone();
+    let serial_owned = serial.to_string();
+    if let Some(stdout) = child_out {
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                debug!("scrcpy stdout: {line}");
+            }
+        });
+    }
+    if let Some(stderr) = child_err {
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                debug!("scrcpy stderr: {line}");
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+        let session = state_for_monitor.lock().remote.remove(&serial_owned);
+        if let Some(session) = session {
+            let _ = session.stop.send(());
+            teardown_remote_tunnel(
+                &serial_owned,
+                session.host_port,
+                session.tunnel_forward,
+                scid,
+            )
+            .await;
+            let _ = std::fs::remove_file(&session.socket_path);
+        }
+    });
+
+    state.lock().remote.insert(
+        serial.to_string(),
+        RemoteSession {
+            scid,
+            host_port,
+            tunnel_forward,
+            socket_path: socket_path.clone(),
+            stop: stop_tx,
+            stats,
+            started,
+            codec: codec.as_str().to_string(),
+            device_name,
+            preset: preset.name.to_string(),
+        },
+    );
+
+    let device_name = state
+        .lock()
+        .remote
+        .get(serial)
+        .map(|s| s.device_name.clone())
+        .unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "socket": socket_path.to_string_lossy(),
+        "codec": codec.as_str(),
+        "device_name": device_name,
+        "width": init_width,
+        "height": init_height,
+        "preset": preset.name,
+        "max_size": preset.max_size,
+        "max_fps": preset.max_fps,
+        "bit_rate": preset.bit_rate,
+        "audio": opts.audio,
+    }))
+}
+
+/// Spawn a real-time ffmpeg instance that pipes H.264 NAL units to JPEG in tmpfs with zero delay.
+fn spawn_ffmpeg(frame_file: &std::path::Path) -> Option<tokio::process::Child> {
+    tokio::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-f",
+            "h264",
+            "-r",
+            "60",
+            "-i",
+            "pipe:0",
+            "-vf",
+            "scale='if(gte(iw,ih),min(960,iw),-2)':'if(gte(iw,ih),-2,min(960,ih))'",
+            "-fps_mode",
+            "passthrough",
+            "-strict",
+            "unofficial",
+            "-f",
+            "image2",
+            "-update",
+            "1",
+            "-atomic_writing",
+            "1",
+            "-q:v",
+            "3",
+        ])
+        .arg(frame_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Accept one GUI connection at a time and splice it to the video/control
+/// sockets. Video bytes are forwarded verbatim (codec id first); control
+/// messages from the GUI are length-prefixed frames written to the control
+/// socket; device messages (clipboard etc.) are framed back to the GUI.
+#[allow(clippy::too_many_arguments)]
+async fn remote_proxy_task(
+    state: Arc<Mutex<State>>,
+    serial: String,
+    listener: UnixListener,
+    mut video: TcpStream,
+    mut control: TcpStream,
+    codec_bytes: [u8; 4],
+    init_width: u32,
+    init_height: u32,
+    stats: Arc<RemoteStats>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut reader = PacketReader::new();
+    let mut control_buf: Vec<u8> = Vec::new();
+    let mut gui: Option<UnixStream> = None;
+    let mut frame_reader = adb_remote::proxy::FrameReader::new();
+    let mut gui_read_buf = [0u8; 16 * 1024];
+    let mut video_buf = [0u8; 64 * 1024];
+    let mut control_read_buf = [0u8; 8 * 1024];
+
+    let safe = sanitize_mount_name(&serial).unwrap_or_else(|| "device".to_string());
+    let remote_dir = dirs::runtime_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
+        .map(|d| d.join("adbshare").join("remote"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let frame_file = remote_dir.join(format!("{safe}-frame.jpg"));
+
+    let mut ffmpeg = spawn_ffmpeg(&frame_file);
+    let mut cached_config: Option<Vec<u8>> = None;
+
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        // Meta frame first, so the GUI knows what it is decoding:
+                        // [TAG_META (1)][codec (4)][width (4)][height (4)]
+                        let mut s = stream;
+                        let mut meta = vec![adb_remote::proxy::TAG_META];
+                        meta.extend_from_slice(&codec_bytes);
+                        meta.extend_from_slice(&init_width.to_be_bytes());
+                        meta.extend_from_slice(&init_height.to_be_bytes());
+                        if s.write_all(&adb_remote::proxy::frame(&meta)).await.is_err() {
+                            continue;
+                        }
+                        if let Some(old) = gui.take() {
+                            task_shutdown(old);
+                        }
+                        gui = Some(s);
+                    }
+                    Err(e) => {
+                        debug!(serial, error = %e, "remote gui accept failed");
+                        break;
+                    }
+                }
+            }
+            n = video.read(&mut video_buf) => {
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let chunk = &video_buf[..n];
+                        stats.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        if let Ok(packets) = reader.feed(chunk) {
+                            for p in packets {
+                                match p {
+                                    Packet::Session { width, height, .. } => {
+                                        stats.width.store(width as u64, Ordering::Relaxed);
+                                        stats.height.store(height as u64, Ordering::Relaxed);
+                                    }
+                                    Packet::Media {
+                                        is_config, data, ..
+                                    } => {
+                                        stats.frames.fetch_add(1, Ordering::Relaxed);
+                                        if is_config {
+                                            cached_config = Some(data.clone());
+                                        }
+                                        if ffmpeg.is_none()
+                                            && let Some(mut new_ff) = spawn_ffmpeg(&frame_file)
+                                        {
+                                            if let (Some(stdin), Some(cfg)) =
+                                                (new_ff.stdin.as_mut(), &cached_config)
+                                            {
+                                                let _ = stdin.write_all(cfg).await;
+                                                let _ = stdin.flush().await;
+                                            }
+                                            ffmpeg = Some(new_ff);
+                                        }
+                                        if let Some(stdin) =
+                                            ffmpeg.as_mut().and_then(|ff| ff.stdin.as_mut())
+                                            && (stdin.write_all(&data).await.is_err()
+                                                || stdin.flush().await.is_err())
+                                        {
+                                            ffmpeg = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            n = control.read(&mut control_read_buf) => {
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        control_buf.extend_from_slice(&control_read_buf[..n]);
+                        loop {
+                            if control_buf.is_empty() {
+                                break;
+                            }
+                            match parse_device_message(&control_buf) {
+                                Some((_msg, consumed)) => {
+                                    let mut wire = Vec::with_capacity(1 + consumed);
+                                    wire.push(adb_remote::proxy::TAG_CONTROL);
+                                    wire.extend_from_slice(&control_buf[..consumed]);
+                                    let frame = adb_remote::proxy::frame(&wire);
+                                    if let Some(g) = gui.as_mut() {
+                                        let _ = g.write_all(&frame).await;
+                                    }
+                                    control_buf.drain(..consumed);
+                                }
+                                None if control_buf[0] > 2 => {
+                                    // Unknown message type: drop one byte to resync.
+                                    control_buf.remove(0);
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            }
+            n = read_gui(&mut gui, &mut gui_read_buf) => {
+                match n {
+                    Ok(0) | Err(_) => {
+                        gui = None;
+                    }
+                    Ok(n) => {
+                        for payload in frame_reader.feed(&gui_read_buf[..n]) {
+                            if control.write_all(&payload).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(mut ff) = ffmpeg {
+        let _ = ff.kill().await;
+    }
+    let _ = std::fs::remove_file(&frame_file);
+    let _ = state;
+    let _ = &mut video;
+    let _ = &mut control;
+}
+
+fn task_shutdown(mut stream: UnixStream) {
+    // Best-effort: the old GUI connection is being replaced; dropping it would
+    // also close the socket, but an explicit shutdown sends EOF first.
+    tokio::spawn(async move {
+        let _ = stream.shutdown().await;
+    });
+}
+
+async fn read_gui(gui: &mut Option<UnixStream>, buf: &mut [u8]) -> std::io::Result<usize> {
+    match gui.as_mut() {
+        Some(s) => s.read(buf).await,
+        None => std::future::pending::<std::io::Result<usize>>().await,
+    }
+}
+
+/// Stop a remote session (best-effort; safe to call when none exists).
+async fn stop_remote_session(state: &Arc<Mutex<State>>, serial: &str) {
+    let session = state.lock().remote.remove(serial);
+    if let Some(session) = session {
+        info!(serial, "remote session stopping");
+        let _ = session.stop.send(());
+        teardown_remote_tunnel(
+            serial,
+            session.host_port,
+            session.tunnel_forward,
+            session.scid,
+        )
+        .await;
+        let _ = std::fs::remove_file(&session.socket_path);
+        let _ = adb_run(
+            &[
+                "-s",
+                serial,
+                "shell",
+                &format!("pkill -f {}", adb_remote::SERVER_REMOTE_PATH),
+            ],
+            Duration::from_secs(5),
+        )
+        .await;
+    }
+}
+
+/// Stop every remote session (daemon shutdown).
+async fn stop_all_remote(state: &Arc<Mutex<State>>) {
+    let serials: Vec<String> = state.lock().remote.keys().cloned().collect();
+    for serial in serials {
+        stop_remote_session(state, &serial).await;
+    }
+}
+
+/// Remove our adb tunnel for a remote session (only ours).
+async fn teardown_remote_tunnel(serial: &str, host_port: u16, tunnel_forward: bool, scid: i32) {
+    if tunnel_forward {
+        let _ = adb_run(
+            &[
+                "-s",
+                serial,
+                "forward",
+                "--remove",
+                &format!("tcp:{host_port}"),
+            ],
+            ADB_CMD_TIMEOUT,
+        )
+        .await;
+    } else {
+        let name = adb_remote::socket_name(scid);
+        let _ = adb_run(
+            &[
+                "-s",
+                serial,
+                "reverse",
+                "--remove",
+                &format!("localabstract:{name}"),
+            ],
+            ADB_CMD_TIMEOUT,
+        )
+        .await;
     }
 }
 
@@ -3100,6 +3800,86 @@ impl ManagerInterface {
             None => serde_json::json!({ "state": "none" }),
         };
         Ok(json.to_string())
+    }
+
+    /// Start a real-time remote-control session for a device. Returns the
+    /// session info as JSON (socket path, codec, preset) for the GUI.
+    async fn start_remote(&self, device: &str, options_json: &str) -> zbus::fdo::Result<String> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        let opts = parse_remote_options(options_json);
+        let info = start_remote_session(&self.state, device, opts)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("remote: {e}")))?;
+        Ok(info.to_string())
+    }
+
+    /// Stop the remote-control session for a device. Returns true if one ran.
+    async fn stop_remote(&self, device: &str) -> zbus::fdo::Result<bool> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        let was_running = self.state.lock().remote.contains_key(device);
+        stop_remote_session(&self.state, device).await;
+        Ok(was_running)
+    }
+
+    /// Live status of the remote-control session as JSON.
+    async fn remote_status(&self, device: &str) -> zbus::fdo::Result<String> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        let (stats, started, codec, preset, device_name, socket_path) = {
+            let s = self.state.lock();
+            match s.remote.get(device) {
+                Some(session) => (
+                    (
+                        session.stats.frames.load(Ordering::Relaxed),
+                        session.stats.bytes.load(Ordering::Relaxed),
+                        session.stats.width.load(Ordering::Relaxed),
+                        session.stats.height.load(Ordering::Relaxed),
+                    ),
+                    session.started,
+                    session.codec.clone(),
+                    session.preset.clone(),
+                    session.device_name.clone(),
+                    session.socket_path.to_string_lossy().into_owned(),
+                ),
+                None => return Ok(serde_json::json!({ "running": false }).to_string()),
+            }
+        };
+        let uptime = started.elapsed().as_secs();
+        let frames = stats.0;
+        let fps = if uptime > 0 {
+            (frames * 10 / uptime.max(1)) as u32
+        } else {
+            0
+        };
+        Ok(serde_json::json!({
+            "running": true,
+            "codec": codec,
+            "preset": preset,
+            "device_name": device_name,
+            "socket": socket_path,
+            "frames": frames,
+            "bytes": stats.1,
+            "width": stats.2,
+            "height": stats.3,
+            "fps_x10": fps,
+            "uptime_secs": uptime,
+        })
+        .to_string())
+    }
+
+    /// Capture a single preview frame to the runtime directory without polluting ~/Pictures.
+    async fn remote_frame(&self, device: &str) -> zbus::fdo::Result<String> {
+        if device.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("device is required".into()));
+        }
+        remote_frame_path(&self.state, device)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("remote frame: {e}")))
     }
 
     /// Start a screen recording on the device (max 3 minutes).

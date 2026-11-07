@@ -40,6 +40,7 @@ use crate::views::dialogs::{
 };
 use crate::views::filechooser::{self, Pick};
 use crate::views::menu::{self, MenuItem};
+use crate::views::mirror::Mirror;
 use crate::views::textinput::{TextField, TextFieldEvent};
 use crate::views::toast::{ActionId, ToastStack, ToastTone};
 use crate::views::tools::Tools;
@@ -289,6 +290,8 @@ pub struct AdbShareApp {
     debloat: Entity<Debloat>,
     /// The device tools view.
     tools: Entity<Tools>,
+    /// The screen mirror view.
+    mirror: Entity<Mirror>,
     /// What the main pane is showing.
     pane: Pane,
     /// What the debloat list says about each phone, for the sidebar badge.
@@ -307,6 +310,8 @@ enum Pane {
     Debloat,
     /// The device tools view.
     Tools,
+    /// The screen mirror view.
+    Mirror,
 }
 
 /// What one in-flight install needs remembered between the start call and
@@ -478,6 +483,7 @@ impl AdbShareApp {
             install_watch: None,
             debloat: cx.new(Debloat::new),
             tools: cx.new(Tools::new),
+            mirror: cx.new(Mirror::new),
             pane: Pane::Browser,
             debloat_counts: HashMap::new(),
         }
@@ -923,6 +929,21 @@ impl AdbShareApp {
         self.browser.update(cx, |b, cx| {
             b.set_device(serial, &display, cx);
         });
+        // Keep the active pane on the same phone: the tools/mirror views only
+        // refresh on open otherwise, so switching devices while one is open
+        // would leave it reading a different phone than the sidebar shows.
+        if self.pane == Pane::Tools {
+            self.tools.update(cx, |t, cx| {
+                t.set_device_label(display.clone(), cx);
+                t.set_device(Some(serial.to_string()), cx);
+            });
+        } else if self.pane == Pane::Mirror {
+            self.mirror.update(cx, |m, cx| {
+                m.stop(cx);
+                m.set_device_label(display.clone(), cx);
+                m.set_device(Some(serial.to_string()), cx);
+            });
+        }
         self.fetch_dir(serial.to_string(), cx);
         self.fetch_mountpoint(serial.to_string(), cx);
     }
@@ -2346,6 +2367,9 @@ impl AdbShareApp {
     /// Open the device tools view on the selected phone (or the empty
     /// state when none is selected).
     fn open_tools(&mut self, cx: &mut Context<Self>) {
+        if self.pane == Pane::Mirror {
+            self.mirror.update(cx, |m, cx| m.stop(cx));
+        }
         self.pane = Pane::Tools;
         let device = self.target_device();
         let label = device
@@ -2364,11 +2388,35 @@ impl AdbShareApp {
         cx.notify();
     }
 
+    /// Open the mirror view on the selected phone (or the empty state when
+    /// none is selected).
+    fn open_mirror(&mut self, cx: &mut Context<Self>) {
+        self.pane = Pane::Mirror;
+        let device = self.target_device();
+        let label = device
+            .as_ref()
+            .and_then(|serial| {
+                self.devices
+                    .iter()
+                    .find(|d| &d.serial == serial)
+                    .map(|d| d.display_name().to_string())
+            })
+            .unwrap_or_default();
+        self.mirror.update(cx, |m, cx| {
+            m.set_device_label(label, cx);
+            m.set_device(device, cx);
+        });
+        cx.notify();
+    }
+
     /// Open the debloat view on one particular phone.
     ///
     /// The phone is named rather than taken from the selection, so the row in
     /// the sidebar can open the right one whichever phone it belongs to.
     fn open_debloat_for(&mut self, device: &str, cx: &mut Context<Self>) {
+        if self.pane == Pane::Mirror {
+            self.mirror.update(cx, |m, cx| m.stop(cx));
+        }
         self.pane = Pane::Debloat;
         let label = self
             .devices
@@ -3614,6 +3662,15 @@ impl AdbShareApp {
             "diagnostics" => self.open_diagnostics(cx),
             "debloat" => self.open_debloat(cx),
             "tools" => self.open_tools(cx),
+            "mirror" => {
+                if self.pane == Pane::Mirror {
+                    self.mirror.update(cx, |m, cx| m.stop(cx));
+                    self.pane = Pane::Browser;
+                    cx.notify();
+                } else {
+                    self.open_mirror(cx);
+                }
+            }
             "shortcuts" => self.dialog = Dialog::Shortcuts,
             "about" => self.dialog = Dialog::About,
             "connect-wifi" => {
@@ -3711,6 +3768,16 @@ impl AdbShareApp {
                     "Browse files"
                 } else {
                     "Device tools…"
+                },
+                None,
+            ),
+            MenuItem::with_icon(
+                "mirror",
+                names::PHONE,
+                if self.pane == Pane::Mirror {
+                    "Browse files"
+                } else {
+                    "Mirror screen…"
                 },
                 None,
             ),
@@ -4186,6 +4253,33 @@ impl AdbShareApp {
                                     cx.notify();
                                 } else {
                                     this.open_tools(cx);
+                                }
+                            }),
+                        )
+                        .into_any_element(),
+                        ui::capsule_separator(t).into_any_element(),
+                        // Mirror view, same deal: word + way back out.
+                        ui::capsule_button(
+                            t,
+                            "mirror",
+                            if self.pane == Pane::Mirror {
+                                names::FILE_MANAGER
+                            } else {
+                                names::PHONE
+                            },
+                            if self.pane == Pane::Mirror {
+                                "Files"
+                            } else {
+                                "Mirror"
+                            },
+                            self.pane == Pane::Mirror,
+                            cx.listener(|this, _e, _w, cx| {
+                                if this.pane == Pane::Mirror {
+                                    this.mirror.update(cx, |m, cx| m.stop(cx));
+                                    this.pane = Pane::Browser;
+                                    cx.notify();
+                                } else {
+                                    this.open_mirror(cx);
                                 }
                             }),
                         )
@@ -5449,6 +5543,9 @@ impl Render for AdbShareApp {
         self.browser.update(cx, |b, cx| {
             b.set_viewport(content_x, content_y, content_w, content_h, cx)
         });
+        self.mirror.update(cx, |m, cx| {
+            m.set_viewport(content_x, content_y, content_w, content_h, cx)
+        });
 
         // The divider sits between the sidebar and the browser, so the file area
         // starts after it.
@@ -5461,6 +5558,7 @@ impl Render for AdbShareApp {
             Pane::Browser => self.browser.clone().into_any_element(),
             Pane::Debloat => self.debloat.clone().into_any_element(),
             Pane::Tools => self.tools.clone().into_any_element(),
+            Pane::Mirror => self.mirror.clone().into_any_element(),
         };
 
         let body = div()
@@ -5564,8 +5662,9 @@ impl AdbShareApp {
         cx: &mut Context<Self>,
         left_inset: f32,
     ) -> AnyElement {
-        // The debloat view has its own search box, in its own header.
-        if self.pane == Pane::Debloat {
+        // The debloat/Tools/Mirror views have their own headers; the search
+        // strip belongs to the file pane.
+        if self.pane != Pane::Browser {
             return div().into_any_element();
         }
         if !self.browser.read(cx).search_active() {
