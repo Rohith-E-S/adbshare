@@ -88,6 +88,7 @@ asset_table! {
     "icons/text-increase.svg" => "../assets/icons/text-increase.svg",
     "icons/text-largest.svg" => "../assets/icons/text-largest.svg",
     "icons/text-x-generic.svg" => "../assets/icons/text-x-generic.svg",
+    "icons/trackpad.svg" => "../assets/icons/trackpad.svg",
     "icons/user-home.svg" => "../assets/icons/user-home.svg",
     "icons/user-trash.svg" => "../assets/icons/user-trash.svg",
     "icons/utilities-terminal.svg" => "../assets/icons/utilities-terminal.svg",
@@ -248,7 +249,6 @@ pub mod names {
     pub const PLAY: &str = "icons/media-playback-start.svg";
     pub const REFRESH: &str = "icons/view-refresh.svg";
     pub const SEND_TO: &str = "icons/send-to.svg";
-    pub const SIDEBAR_SHOW: &str = "icons/sidebar-show.svg";
     pub const SOFTWARE_INSTALL: &str = "icons/system-software-install.svg";
     pub const STOP: &str = "icons/process-stop.svg";
     pub const TERMINAL: &str = "icons/utilities-terminal.svg";
@@ -259,6 +259,7 @@ pub mod names {
     pub const TEXT_LARGER: &str = "icons/text-increase.svg";
     pub const TEXT_LARGEST: &str = "icons/text-largest.svg";
     pub const TRASH: &str = "icons/user-trash.svg";
+    pub const TRACKPAD: &str = "icons/trackpad.svg";
     pub const VIDEO_GENERIC: &str = "icons/video-x-generic.svg";
     pub const VIEW_GRID: &str = "icons/view-grid.svg";
     pub const VIEW_LIST: &str = "icons/view-list.svg";

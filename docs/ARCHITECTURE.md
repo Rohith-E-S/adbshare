@@ -73,10 +73,11 @@ control sessions via `scrcpy-server 3.3` + `ffmpeg`, and exposes a D-Bus
 interface (`org.adbshare.Manager`) for the GUI.
 
 ### `adb-gui`
-GPUI (the framework behind Zed), rendering with Vulkan. A top bar over a
-resizable sidebar/content split: devices and place shortcuts on the left,
-a file browser on the right, transfers in a popover. A two-step dialog
-handles wireless pairing. Talks to the daemon over D-Bus.
+GPUI (the framework behind Zed), rendering with Vulkan. A header (device
+pill, transfer summary, overflow) over a left rail of four destinations —
+Transfer, Debloat, Mirror, Trackpad — with a persistent transfer dock at the
+bottom. Transfer keeps a resizable places column for shortcuts. A two-step
+dialog handles wireless pairing. Talks to the daemon over D-Bus.
 
 The GUI owns no ADB logic. The file browser is a separate entity that
 emits events; the app root turns those into D-Bus calls or local

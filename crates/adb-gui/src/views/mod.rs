@@ -8,4 +8,5 @@ pub mod mirror;
 pub mod textinput;
 pub mod toast;
 pub mod tools;
+pub mod trackpad;
 pub mod ui;

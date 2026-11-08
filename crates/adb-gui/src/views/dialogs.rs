@@ -2255,7 +2255,7 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "View",
         &[
-            ("Toggle sidebar", "F9 / Ctrl+B"),
+            ("Toggle places column", "F9 / Ctrl+B"),
             ("Switch grid / list", "Alt+T"),
             ("Zoom out / in", "Ctrl+minus / Ctrl+plus"),
             ("Search this folder", "Ctrl+F"),

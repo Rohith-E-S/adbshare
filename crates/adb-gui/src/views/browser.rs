@@ -650,7 +650,7 @@ impl Browser {
             // browsing a phone. `device_label`'s "Phone" fallback made the
             // paused-on-launch window read as a device called "Phone" at
             // its root, contradicting the "Connect your phone" pane below it
-            // and the sidebar's own "No phone connected" card.
+            // and the header's own "No phone connected" onboarding.
             "No phone connected".to_string()
         } else {
             self.device_label()
@@ -1939,7 +1939,7 @@ fn empty_state(t: &theme::Palette) -> Div {
                 .whitespace_normal()
                 .child(
                     "Plug it in over USB and accept the debugging prompt, or pick a device \
-                     in the sidebar to start browsing.",
+                     in the header to start browsing.",
                 ),
         )
 }

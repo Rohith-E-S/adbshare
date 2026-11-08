@@ -828,7 +828,7 @@ impl Debloat {
                     div()
                         .text_size(t.text(12.0))
                         .text_color(t.text_muted)
-                        .child("Pick a phone in the sidebar to see what is on it."),
+                        .child("Pick a phone in the header to see what is on it."),
                 )
                 .into_any_element();
         }

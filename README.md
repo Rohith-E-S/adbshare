@@ -159,10 +159,10 @@ Run both as your normal desktop user, not with `sudo`. The GUI communicates with
 
 ## Your first transfer
 
-1. Select your phone in the sidebar. Devices appear after the daemon has connected and deployed the helper successfully.
-2. Open **Download** or another phone folder. The initial phone location is `/sdcard/Download`.
+1. Select your phone in the header. Devices appear after the daemon has connected and deployed the helper successfully.
+2. In the **Transfer** rail destination, open **Download** or another phone folder. The initial phone location is `/sdcard/Download`.
 3. Choose **Send to phone** (`Ctrl+U`) and select a local file. You can also drop local files onto the phone folder.
-4. Open **Transfers** in the top bar to watch progress.
+4. Watch progress in the transfer dock at the bottom; open its **View queue** for the full queue.
 5. To copy a file back, select it on the phone and use **Save to computer** (`Ctrl+Shift+C`). One file opens a Save As dialog; multiple files open a destination-folder chooser.
 6. Press `F5` if the folder listing has not updated after the transfer finishes.
 
@@ -170,8 +170,9 @@ Queued phone transfers use the conflict policy selected in the Transfers popover
 
 ### Finding your way around
 
-- **Sidebar:** switch between connected phones, phone storage shortcuts, Home, Downloads, and local Trash.
-- **Top bar:** back/forward/up navigation, current path, new folder, send/save controls, view switch, search, transfers, and more options.
+- **Left rail:** switch between the four jobs — **Transfer**, **Debloat**, **Mirror**, and **Trackpad** (in development).
+- **Header:** pick the active phone, and see the transfer summary and more options.
+- **Transfer pane:** phone storage shortcuts, Home, Downloads, and local Trash in the places column; back/forward/up navigation, current path, new folder, send/save controls, view switch, and search in the toolbar above the files.
 - **Path bar:** click breadcrumbs or press `Ctrl+L` to enter a path.
 - **Search:** filters names in the current folder; it is not a recursive device-wide search.
 - **More options:** includes hidden files, Wi-Fi connection, and APK installation.
@@ -193,7 +194,7 @@ The full list is also in the app, under **Keyboard shortcuts** in the overflow m
 | `Ctrl+F` | Search the current folder |
 | `Esc` | Clear the selection |
 | `F5` | Refresh |
-| `F9` / `Ctrl+B` | Toggle the sidebar |
+| `F9` / `Ctrl+B` | Toggle the places column |
 | `Ctrl+U` | Send a file to the phone |
 | `Ctrl+I` | Install an APK |
 | `Ctrl+Shift+D` | Debloat phone |

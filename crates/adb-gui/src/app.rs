@@ -1,5 +1,5 @@
-//! The application root: top bar, sidebar, and everything that talks to the
-//! daemon.
+//! The application root: header, feature rail, and everything that talks to
+//! the daemon.
 //!
 //! The GTK build had one 3,500-line `app.rs` that owned the whole widget tree
 //! and dispatched every action. GPUI makes a better seam available: the file
@@ -7,6 +7,14 @@
 //! the conductor — it renders the chrome, owns the state the chrome needs
 //! (selected device, jobs, dialogs, menus), and turns events into D-Bus or local
 //! filesystem work.
+//!
+//! # Four destinations
+//!
+//! The chrome is built around the four jobs the app exists for — Transfer,
+//! Debloat, Mirror, Trackpad — as top-level destinations in a left rail.
+//! Devices live in the header pill and open as a popover; transfer progress
+//! lives in a persistent dock at the bottom. Device tools stay reachable from
+//! the overflow menu rather than claiming a rail slot.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,6 +52,7 @@ use crate::views::mirror::Mirror;
 use crate::views::textinput::{TextField, TextFieldEvent};
 use crate::views::toast::{ActionId, ToastStack, ToastTone};
 use crate::views::tools::Tools;
+use crate::views::trackpad::Trackpad;
 use crate::views::ui;
 
 /// The application's name, as it appears in a window title.
@@ -66,18 +75,11 @@ const TINY_BELOW: f32 = 520.0;
 /// Width of the transfers popover, which needs room for a job name, a pill, a
 /// progress bar and a monospace status line on one row each.
 const POPOVER_W: f32 = 340.0;
-/// How far a top-bar popover is inset from the window's right edge.
+/// How far a header popover is inset from the window's right edge.
 ///
-/// Both popovers hang under the top bar, whose last child — the overflow
-/// button — is `CAPSULE_H` wide and is separated from the capsule before it
-/// by the top bar's `gap`. The overflow menu anchors on the bar's own
-/// padding, and the transfers popover clears the overflow button as well, so
-/// it lands under its own button. Both insets are expressed in the same terms
-/// — bar padding, then button span plus gap — instead of one being a number
-/// plucked out of the layout, which is how the transfers menu ended up 44px
-/// in with nothing to explain the 44.
+/// The overflow menu anchors on the bar's own padding, so this is the bar
+/// padding expressed once.
 const POPOVER_RIGHT: f32 = 8.0;
-const POPOVER_RIGHT_UNDER_BUTTON: f32 = POPOVER_RIGHT + theme::CAPSULE_H + POPOVER_RIGHT;
 
 actions!(
     app,
@@ -179,22 +181,18 @@ impl Layout {
         }
     }
 
-    fn shows_ops(self) -> bool {
-        self == Layout::Full
-    }
-
-    fn shows_nav(self) -> bool {
-        self != Layout::Tiny
-    }
-
-    /// Whether the sidebar is on screen at all at this width.
+    /// Whether the Transfer pane's places column is on screen at this width.
     ///
-    /// Narrow deliberately sheds it — the pane is not worth 200px of a 600px
-    /// window. It also decides whether the sidebar can be *asked for*: the
-    /// toggle button and F9 both guard on this, so the chrome never offers a
-    /// control this layout will ignore.
-    fn shows_sidebar(self) -> bool {
-        self != Layout::Narrow
+    /// The column sheds first on narrow windows — the file canvas is worth
+    /// more than the shortcuts — and the toggle guards on this so the chrome
+    /// never offers a control this layout will ignore.
+    fn shows_places(self) -> bool {
+        self == Layout::Full || self == Layout::Compact
+    }
+
+    /// Whether the rail shows text labels, or icons only.
+    fn rail_labels(self) -> bool {
+        self != Layout::Tiny
     }
 }
 
@@ -259,7 +257,7 @@ pub struct AdbShareApp {
     /// Consecutive failed device polls. The first failure is usually just the
     /// daemon still starting; by the second, the user needs telling.
     daemon_failures: u32,
-    /// Set while the daemon is unreachable, so the sidebar can say so instead of
+    /// Set while the daemon is unreachable, so the header can say so instead of
     /// implying no phone is plugged in.
     daemon_error: Option<String>,
     focus: FocusHandle,
@@ -288,13 +286,17 @@ pub struct AdbShareApp {
     /// The debloat view: the phone's packages, and the curated list's advice
     /// on them.
     debloat: Entity<Debloat>,
-    /// The device tools view.
+    /// The device tools view (advanced, overflow-only).
     tools: Entity<Tools>,
     /// The screen mirror view.
     mirror: Entity<Mirror>,
+    /// The trackpad view (designed placeholder; backend to be added).
+    trackpad: Entity<Trackpad>,
+    /// Whether the header's device popover is open.
+    device_open: bool,
     /// What the main pane is showing.
     pane: Pane,
-    /// What the debloat list says about each phone, for the sidebar badge.
+    /// What the debloat list says about each phone, for the rail badge.
     ///
     /// Read once per phone, not polled: the numbers are a hint about what is
     /// there, and the pane is where the truth lives.
@@ -304,14 +306,29 @@ pub struct AdbShareApp {
 /// What the main pane is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
-    /// The file browser.
+    /// File transfer: the browser plus its places column.
     Browser,
     /// The debloat view.
     Debloat,
-    /// The device tools view.
+    /// The device tools view (overflow-only, not a rail destination).
     Tools,
     /// The screen mirror view.
     Mirror,
+    /// The phone-as-trackpad view.
+    Trackpad,
+}
+
+impl Pane {
+    /// Short header label for the active destination.
+    fn title(self) -> &'static str {
+        match self {
+            Pane::Browser => "Transfer files",
+            Pane::Debloat => "Debloat",
+            Pane::Tools => "Advanced tools",
+            Pane::Mirror => "Screen mirror",
+            Pane::Trackpad => "Trackpad",
+        }
+    }
 }
 
 /// What one in-flight install needs remembered between the start call and
@@ -400,6 +417,8 @@ impl AdbShareApp {
         if !matches!(self.dialog, Dialog::None) {
             self.dialog = Dialog::None;
         } else if self.context_menu.take().is_some() {
+        } else if self.device_open {
+            self.device_open = false;
         } else if self.overflow_open {
             self.overflow_open = false;
         } else if self.transfers_open {
@@ -484,6 +503,8 @@ impl AdbShareApp {
             debloat: cx.new(Debloat::new),
             tools: cx.new(Tools::new),
             mirror: cx.new(Mirror::new),
+            trackpad: cx.new(|_cx| Trackpad::new()),
+            device_open: false,
             pane: Pane::Browser,
             debloat_counts: HashMap::new(),
         }
@@ -534,14 +555,15 @@ impl AdbShareApp {
         cx.notify();
     }
 
-    /// Show or hide the sidebar, if this window width can show it at all.
+    /// Show or hide the Transfer places column, if this window width can show
+    /// it at all.
     ///
-    /// Narrow hides the sidebar outright, so a request made there is dropped
+    /// Narrow hides the column outright, so a request made there is dropped
     /// rather than remembered: flipping `sidebar_visible` with no visible
     /// effect made both the button and F9 look broken, and the flag would then
-    /// resurface as a surprise sidebar when the window was widened again.
+    /// resurface as a surprise column when the window was widened again.
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        if !self.layout.shows_sidebar() {
+        if !self.layout.shows_places() {
             return;
         }
         self.sidebar_visible = !self.sidebar_visible;
@@ -750,10 +772,10 @@ impl AdbShareApp {
                 self.selection = None;
                 self.browser.update(cx, |b, cx| b.set_idle(cx));
 
-                // The sidebar distinguishes "daemon unreachable" from "nothing
+                // The header distinguishes "daemon unreachable" from "nothing
                 // plugged in" by `daemon_error`, so it has to be set on the
                 // *first* failure: the device list has already been cleared
-                // above, and with it still None the sidebar renders the
+                // above, and with it still None the header renders the
                 // onboarding card — "No phone connected, plug in a USB cable" —
                 // while a phone is plugged in and the daemon is merely busy.
                 //
@@ -763,7 +785,7 @@ impl AdbShareApp {
                 self.daemon_error = Some(advice);
                 let repeated = self.daemon_failures >= 2;
                 if repeated || had_devices {
-                    // The raw D-Bus error tells the user nothing; the sidebar
+                    // The raw D-Bus error tells the user nothing; the header
                     // keeps it for detail but leads with what to do about it.
                     self.toasts.push_with_action(
                         "Cannot reach adb-daemon",
@@ -777,7 +799,7 @@ impl AdbShareApp {
         };
 
         // Fan out concurrently. The daemon answers `device_info` per serial, so
-        // awaiting them in sequence delayed the sidebar by one round trip per
+        // awaiting them in sequence delayed the header by one round trip per
         // connected device.
         let me = cx.entity();
         cx.spawn(async move |_this, cx| {
@@ -818,12 +840,12 @@ impl AdbShareApp {
         }
         // The list is polled every three seconds and rarely differs. Re-rendering
         // the whole window on an identical result is pure waste, and it is the
-        // reason the sidebar used to repaint while the user was reading a file
+        // reason the header used to repaint while the user was reading a file
         // name.
         if devices == self.devices {
             return;
         }
-        // Ask each phone how much is on it, so the sidebar can say so. Asked
+        // Ask each phone how much is on it, so the header can say so. Asked
         // once per phone, and the daemon caches the reading.
         for device in &devices {
             self.refresh_debloat_count(&device.serial, cx);
@@ -858,7 +880,7 @@ impl AdbShareApp {
         }
         // Pick the first phone for the user, once. The GTK build did this and the
         // rewrite dropped it, so a phone plugged in before launch still showed
-        // "Connect your phone" until the user found the sidebar.
+        // "Connect your phone" until the user noticed the header.
         if !self.auto_selected
             && self.selection.is_none()
             && let Some(first) = self.devices.first()
@@ -926,12 +948,14 @@ impl AdbShareApp {
         self.selection = Some(Selection::Device(serial.to_string()));
         self.last_device = Some(serial.to_string());
         self.context_menu = None;
+        self.device_open = false;
         self.browser.update(cx, |b, cx| {
             b.set_device(serial, &display, cx);
         });
-        // Keep the active pane on the same phone: the tools/mirror views only
-        // refresh on open otherwise, so switching devices while one is open
-        // would leave it reading a different phone than the sidebar shows.
+        // Keep the active pane on the same phone: the tools/mirror/trackpad
+        // views only refresh on open otherwise, so switching devices while
+        // one is open would leave it reading a different phone than the
+        // header shows.
         if self.pane == Pane::Tools {
             self.tools.update(cx, |t, cx| {
                 t.set_device_label(display.clone(), cx);
@@ -942,6 +966,11 @@ impl AdbShareApp {
                 m.stop(cx);
                 m.set_device_label(display.clone(), cx);
                 m.set_device(Some(serial.to_string()), cx);
+            });
+        } else if self.pane == Pane::Trackpad {
+            self.trackpad.update(cx, |t, cx| {
+                t.set_device_label(display.clone(), cx);
+                t.set_device(Some(serial.to_string()), cx);
             });
         }
         self.fetch_dir(serial.to_string(), cx);
@@ -1581,7 +1610,7 @@ impl AdbShareApp {
         if self.target_device().is_none() {
             self.dialog = Dialog::Message {
                 title: "No phone selected".into(),
-                body: "Pick a device in the sidebar first, then install to it.".into(),
+                body: "Pick a device in the header first, then install to it.".into(),
                 tone: MessageTone::Info,
                 extra: None,
             };
@@ -1609,7 +1638,7 @@ impl AdbShareApp {
         let Some(device) = self.target_device() else {
             self.dialog = Dialog::Message {
                 title: "No phone selected".into(),
-                body: "Pick a device in the sidebar first, then send files to it.".into(),
+                body: "Pick a device in the header first, then send files to it.".into(),
                 tone: MessageTone::Info,
                 extra: None,
             };
@@ -1677,7 +1706,7 @@ impl AdbShareApp {
         let Some(device) = self.last_device.clone() else {
             self.dialog = Dialog::Message {
                 title: "No phone selected".into(),
-                body: "Pick a device in the sidebar first, then send files to it.".into(),
+                body: "Pick a device in the header first, then send files to it.".into(),
                 tone: MessageTone::Info,
                 extra: None,
             };
@@ -2354,7 +2383,7 @@ impl AdbShareApp {
         let Some(device) = self.target_device() else {
             self.dialog = Dialog::Message {
                 title: "No phone selected".into(),
-                body: "Pick a device in the sidebar first, then debloat it.".into(),
+                body: "Pick a device in the header first, then debloat it.".into(),
                 tone: MessageTone::Info,
                 extra: None,
             };
@@ -2382,6 +2411,53 @@ impl AdbShareApp {
             })
             .unwrap_or_default();
         self.tools.update(cx, |t, cx| {
+            t.set_device_label(label, cx);
+            t.set_device(device, cx);
+        });
+        cx.notify();
+    }
+
+    /// Jump to one of the four rail destinations.
+    ///
+    /// Leaving the mirror stops the session, so a phone that is being
+    /// mirrored is never left streaming in the background once the user has
+    /// moved on.
+    fn select_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
+        if self.pane == Pane::Mirror && pane != Pane::Mirror {
+            self.mirror.update(cx, |m, cx| m.stop(cx));
+        }
+        match pane {
+            Pane::Browser | Pane::Debloat | Pane::Tools | Pane::Mirror | Pane::Trackpad => {}
+        }
+        match pane {
+            Pane::Browser => {
+                self.pane = Pane::Browser;
+                cx.notify();
+            }
+            Pane::Debloat => self.open_debloat(cx),
+            Pane::Tools => self.open_tools(cx),
+            Pane::Mirror => self.open_mirror(cx),
+            Pane::Trackpad => self.open_trackpad(cx),
+        }
+    }
+
+    /// Open the trackpad placeholder on the selected phone.
+    fn open_trackpad(&mut self, cx: &mut Context<Self>) {
+        if self.pane == Pane::Mirror {
+            self.mirror.update(cx, |m, cx| m.stop(cx));
+        }
+        self.pane = Pane::Trackpad;
+        let device = self.target_device();
+        let label = device
+            .as_ref()
+            .and_then(|serial| {
+                self.devices
+                    .iter()
+                    .find(|d| &d.serial == serial)
+                    .map(|d| d.display_name().to_string())
+            })
+            .unwrap_or_default();
+        self.trackpad.update(cx, |t, cx| {
             t.set_device_label(label, cx);
             t.set_device(device, cx);
         });
@@ -2438,8 +2514,8 @@ impl AdbShareApp {
 
     /// Open the debloat view on one particular phone.
     ///
-    /// The phone is named rather than taken from the selection, so the row in
-    /// the sidebar can open the right one whichever phone it belongs to.
+    /// The phone is named rather than taken from the selection, so the device
+    /// popover can open the right one whichever phone it belongs to.
     fn open_debloat_for(&mut self, device: &str, cx: &mut Context<Self>) {
         if self.pane == Pane::Mirror {
             self.mirror.update(cx, |m, cx| m.stop(cx));
@@ -2505,7 +2581,7 @@ impl AdbShareApp {
     ) {
         let Some(device) = self.target_device() else {
             self.toasts
-                .push("Pick a phone in the sidebar first", ToastTone::Info);
+                .push("Pick a phone in the header first", ToastTone::Info);
             return;
         };
         if packages.is_empty() {
@@ -2541,7 +2617,7 @@ impl AdbShareApp {
     fn confirm_undo(&mut self, cx: &mut Context<Self>) {
         let Some(device) = self.target_device() else {
             self.toasts
-                .push("Pick a phone in the sidebar first", ToastTone::Info);
+                .push("Pick a phone in the header first", ToastTone::Info);
             return;
         };
         let records = history::undoable(&device, DEBLOAT_USER);
@@ -2692,7 +2768,7 @@ impl AdbShareApp {
             d.note_states(&states, cx);
             d.set_status(Some(status), cx);
         });
-        // The phone now has a different number of apps on it, so the sidebar's
+        // The phone now has a different number of apps on it, so the rail badge's
         // figure is stale.
         if let Some(device) = self.target_device() {
             self.debloat_counts.remove(&device);
@@ -2830,7 +2906,7 @@ impl AdbShareApp {
             let local = self.browser.read(cx).full_path(&entry);
             let Some(device) = self.target_device() else {
                 self.toasts
-                    .push("Pick a phone in the sidebar to install on", ToastTone::Info);
+                    .push("Pick a phone in the header to install on", ToastTone::Info);
                 cx.notify();
                 return;
             };
@@ -3687,17 +3763,11 @@ impl AdbShareApp {
                 }
             }
             "diagnostics" => self.open_diagnostics(cx),
-            "debloat" => self.open_debloat(cx),
-            "tools" => self.open_tools(cx),
-            "mirror" => {
-                if self.pane == Pane::Mirror {
-                    self.mirror.update(cx, |m, cx| m.stop(cx));
-                    self.pane = Pane::Browser;
-                    cx.notify();
-                } else {
-                    self.open_mirror(cx);
-                }
-            }
+            "transfer" => self.select_pane(Pane::Browser, cx),
+            "debloat" => self.select_pane(Pane::Debloat, cx),
+            "tools" => self.select_pane(Pane::Tools, cx),
+            "mirror" => self.select_pane(Pane::Mirror, cx),
+            "trackpad" => self.select_pane(Pane::Trackpad, cx),
             "mirror-floating" => self.open_floating_mirror(cx),
             "shortcuts" => self.dialog = Dialog::Shortcuts,
             "about" => self.dialog = Dialog::About,
@@ -3780,32 +3850,52 @@ impl AdbShareApp {
             ),
             MenuItem::Separator,
             MenuItem::with_icon(
+                "transfer",
+                names::SEND_TO,
+                if self.pane == Pane::Browser {
+                    "Transfer — current"
+                } else {
+                    "Transfer"
+                },
+                None,
+            ),
+            MenuItem::with_icon(
                 "debloat",
                 names::PACKAGE,
                 if self.pane == Pane::Debloat {
-                    "Browse files"
+                    "Debloat — current"
                 } else {
                     "Debloat phone…"
                 },
                 Some("Ctrl+Shift+D"),
             ),
             MenuItem::with_icon(
-                "tools",
-                names::TERMINAL,
-                if self.pane == Pane::Tools {
-                    "Browse files"
+                "mirror",
+                names::PHONE,
+                if self.pane == Pane::Mirror {
+                    "Mirror — current"
                 } else {
-                    "Device tools…"
+                    "Mirror screen…"
                 },
                 None,
             ),
             MenuItem::with_icon(
-                "mirror",
-                names::PHONE,
-                if self.pane == Pane::Mirror {
-                    "Browse files"
+                "trackpad",
+                names::TRACKPAD,
+                if self.pane == Pane::Trackpad {
+                    "Trackpad — current"
                 } else {
-                    "Mirror screen…"
+                    "Trackpad…"
+                },
+                None,
+            ),
+            MenuItem::with_icon(
+                "tools",
+                names::TERMINAL,
+                if self.pane == Pane::Tools {
+                    "Advanced tools — current"
+                } else {
+                    "Advanced tools…"
                 },
                 None,
             ),
@@ -4077,60 +4167,586 @@ impl AdbShareApp {
 /// the title bar was hidden; GPUI gives us a real title bar, so the window keeps
 /// the platform's own decoration and the top bar starts after it.
 impl AdbShareApp {
-    /// The top bar: navigation, the path bar, and the action capsules.
-    fn topbar(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
-        let mut capsules: Vec<AnyElement> = Vec::new();
+    /// The app header: app mark, device pill, transfer summary, overflow.
+    ///
+    /// One bar for identity and connection state only. Feature navigation
+    /// lives in the rail, file actions live in the Transfer pane, and
+    /// transfer detail lives in the dock — this bar never grows a fourth job.
+    fn header(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .w_full()
+            .h(px(theme::HEADER_H))
+            .px(px(12.0))
+            .bg(t.topbar)
+            .border_b_1()
+            .border_color(t.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .size(px(28.0))
+                            .rounded(px(9.0))
+                            .bg(t.accent)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icons::icon(names::PHONE, 16.0, t.text_inverse)),
+                    )
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(t.text(13.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(t.text_header)
+                                    .child("ADBShare"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(t.text(10.0))
+                                    .text_color(t.text_muted)
+                                    .child(self.pane.title()),
+                            ),
+                    ),
+            )
+            .child(self.device_pill(t, cx))
+            .child(div().flex_1())
+            .child(self.header_transfers(t, cx))
+            .child(self.overflow_button(t, cx))
+            .child(self.device_popover(t, cx))
+            .child(self.overflow_popover(t, cx))
+            .into_any_element()
+    }
 
-        // Navigation.
-        let browser = self.browser.clone();
-        #[allow(unused_mut)]
-        let mut browser = browser;
-        if self.layout.shows_nav() {
-            // The sidebar toggle is only offered while the sidebar can be shown.
-            // Narrow hides it outright, so the button would do nothing there;
-            // hiding it in step keeps `show_sidebar` below honest.
-            let mut buttons: Vec<AnyElement> = Vec::new();
-            if self.layout.shows_sidebar() {
-                buttons.push(
-                    ui::icon_button_with_hint(
+    /// The device button: the connected phone, or a prompt to connect.
+    fn device_pill(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        let (name, sub, online) = match self.selection.clone() {
+            Some(Selection::Device(serial)) => {
+                let entry = self.devices.iter().find(|d| d.serial == serial);
+                match entry {
+                    Some(d) => (
+                        d.display_name().to_string(),
+                        d.transport_label().to_string(),
+                        true,
+                    ),
+                    None => (serial.clone(), "reconnecting…".to_string(), false),
+                }
+            }
+            Some(Selection::Local(_)) => {
+                ("This computer".to_string(), "local files".to_string(), true)
+            }
+            None => (
+                "No phone".to_string(),
+                "connect to start".to_string(),
+                false,
+            ),
+        };
+        div()
+            .id("device-pill")
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(40.0))
+            .px(px(10.0))
+            .rounded(px(theme::RADIUS_CAPSULE_BTN))
+            .bg(if self.device_open {
+                t.accent_soft
+            } else {
+                t.secondary_bg
+            })
+            .border_1()
+            .border_color(if self.device_open {
+                t.accent_border
+            } else {
+                t.border_soft
+            })
+            .cursor_pointer()
+            .hover(|s| s.bg(t.secondary_bg_hover))
+            .child(ui::led(if online { t.success } else { t.warning }))
+            .child(
+                div()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(t.text(12.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(t.text_header)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_size(t.text(10.0))
+                            .text_color(t.text_muted)
+                            .child(sub),
+                    ),
+            )
+            .child(icons::icon(names::GO_NEXT, 13.0, t.text_muted))
+            .on_click(cx.listener(|this, _e, _w, cx| {
+                this.device_open = !this.device_open;
+                this.transfers_open = false;
+                this.overflow_open = false;
+                cx.notify();
+            }))
+            .tooltip(ui::hover_hint("Choose a device"))
+            .into_any_element()
+    }
+
+    /// The device popover: every connected phone, plus Wi-Fi and diagnostics.
+    fn device_popover(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        if !self.device_open {
+            return div().into_any_element();
+        }
+        let selected = self.selection.clone();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if let Some(error) = self.daemon_error.clone() {
+            rows.push(
+                div()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(theme::RADIUS_CARD))
+                    .bg(t.danger_soft)
+                    .border_1()
+                    .border_color(t.danger_border)
+                    .child(
+                        div()
+                            .text_size(t.text(12.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(t.danger)
+                            .child("Cannot reach adb-daemon"),
+                    )
+                    .child(
+                        div()
+                            .mt(px(3.0))
+                            .text_size(t.text(10.5))
+                            .text_color(t.text_dim)
+                            .whitespace_normal()
+                            .child(error),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if self.devices.is_empty() && self.daemon_error.is_none() {
+            rows.push(onboarding_card(t).into_any_element());
+        } else {
+            for device in self.devices.clone() {
+                let active = matches!(&selected, Some(Selection::Device(s)) if *s == device.serial);
+                let serial = device.serial.clone();
+                rows.push(
+                    device_card(
                         t,
-                        "toggle-sidebar",
-                        names::SIDEBAR_SHOW,
-                        theme::CAPSULE_BTN,
-                        ui::icon_tint(names::SIDEBAR_SHOW, t),
-                        if self.sidebar_visible {
-                            "Hide sidebar (F9)"
-                        } else {
-                            "Show sidebar (F9)"
+                        device,
+                        active,
+                        self.debloat_counts.get(&serial).copied(),
+                        {
+                            let serial = serial.clone();
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.select_device(&serial, cx);
+                            })
                         },
-                        cx.listener(|this, _e, _w, cx| {
-                            this.toggle_sidebar(cx);
-                        }),
+                        {
+                            let serial = serial.clone();
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.open_debloat_for(&serial, cx);
+                            })
+                        },
                     )
                     .into_any_element(),
                 );
-                buttons.push(ui::capsule_separator(t).into_any_element());
             }
-            buttons.extend([
-                self.nav_button(t, "back", names::GO_PREVIOUS, &browser, cx),
-                self.nav_button(t, "forward", names::GO_NEXT, &browser, cx),
-                self.nav_button(t, "up", names::GO_UP, &browser, cx),
-                ui::capsule_separator(t).into_any_element(),
-                self.nav_button(t, "refresh", names::REFRESH, &browser, cx),
-            ]);
-            capsules.push(ui::capsule(t, buttons).into_any_element());
         }
+        rows.push(
+            div()
+                .id("connect-wifi")
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .h(px(32.0))
+                .rounded(px(theme::RADIUS_CAPSULE_BTN))
+                .cursor_pointer()
+                .text_size(t.text(12.0))
+                .text_color(t.text_dim)
+                .hover(|s| s.bg(t.hover).text_color(t.accent))
+                .child(icons::icon(
+                    names::WIRELESS,
+                    15.0,
+                    ui::icon_tint(names::WIRELESS, t),
+                ))
+                .child("Connect via Wi-Fi…")
+                .on_click(cx.listener(|this, _e, _w, cx| {
+                    this.on_menu_select("connect-wifi", cx);
+                }))
+                .into_any_element(),
+        );
+        ui::on_top(
+            div()
+                .absolute()
+                .top(px(theme::HEADER_H - 4.0))
+                .left(px(132.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .w(px(320.0))
+                        .p(px(8.0))
+                        .rounded(px(theme::RADIUS_CARD))
+                        .bg(t.card)
+                        .border_1()
+                        .border_color(t.border)
+                        .shadow_lg()
+                        .children(rows),
+                ),
+        )
+        .into_any_element()
+    }
 
-        // The path bar, which doubles as the search box and the Ctrl+L path
-        // editor. It is about files, so it steps aside for the debloat view,
-        // which has its own search box.
-        if self.pane == Pane::Browser {
-            capsules.push(self.omnibar(t, cx));
+    /// The transfer summary in the header: live count, or a quiet label.
+    fn header_transfers(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.jobs.iter().filter(|job| job.is_active()).count();
+        div()
+            .id("header-transfers")
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(36.0))
+            .px(px(10.0))
+            .rounded(px(theme::RADIUS_CAPSULE_BTN))
+            .cursor_pointer()
+            .hover(|s| s.bg(t.secondary_bg))
+            .child(icons::icon(
+                names::EMBLEM_SYNC,
+                14.0,
+                if active > 0 { t.accent } else { t.text_muted },
+            ))
+            .child(
+                div()
+                    .text_size(t.text(12.0))
+                    .text_color(if active > 0 {
+                        t.text_header
+                    } else {
+                        t.text_muted
+                    })
+                    .child(if active > 0 {
+                        format!("{active} transferring")
+                    } else {
+                        "Transfers".to_string()
+                    }),
+            )
+            .on_click(cx.listener(|this, _e, _w, cx| {
+                this.transfers_open = !this.transfers_open;
+                this.device_open = false;
+                this.overflow_open = false;
+                cx.notify();
+            }))
+            .tooltip(ui::hover_hint("Transfer queue"))
+            .into_any_element()
+    }
+
+    /// The left rail: the four destinations.
+    fn rail(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        let labels = self.layout.rail_labels();
+        let debloat_count = self.selected_debloat_count();
+        let items = [
+            (Pane::Browser, names::SEND_TO, "Transfer", None),
+            (Pane::Debloat, names::PACKAGE, "Debloat", debloat_count),
+            (Pane::Mirror, names::PHONE, "Mirror", None),
+            (Pane::Trackpad, names::TRACKPAD, "Trackpad", None),
+        ];
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (pane, icon, label, badge) in items {
+            let active = self.pane == pane || (pane == Pane::Browser && self.pane == Pane::Tools);
+            let seen = active;
+            let me = cx.entity();
+            rows.push(
+                div()
+                    .id(ui::el_id(format!("rail-{:?}", pane)))
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.0))
+                    .h(px(62.0))
+                    .mx(px(6.0))
+                    .rounded(px(theme::RADIUS_CARD))
+                    .cursor_pointer()
+                    .when(seen, |d| d.bg(t.accent_soft))
+                    .hover(move |s| s.bg(if seen { t.accent_soft } else { t.hover }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icons::icon(
+                                icon,
+                                19.0,
+                                if seen { t.accent } else { t.text_muted },
+                            )),
+                    )
+                    .when(labels, |d| {
+                        d.child(
+                            div()
+                                .text_size(t.text(10.5))
+                                .font_weight(if seen {
+                                    gpui::FontWeight::SEMIBOLD
+                                } else {
+                                    gpui::FontWeight::NORMAL
+                                })
+                                .text_color(if seen { t.text_header } else { t.text_muted })
+                                .child(label),
+                        )
+                    })
+                    .when_some(badge, |d, b| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top(px(6.0))
+                                .right(px(10.0))
+                                .min_w(px(18.0))
+                                .h(px(16.0))
+                                .px(px(5.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(theme::RADIUS_PILL))
+                                .bg(t.accent)
+                                .text_size(t.text(10.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(t.text_on_light)
+                                .child(b),
+                        )
+                    })
+                    .when(pane == Pane::Trackpad, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top(px(6.0))
+                                .right(px(6.0))
+                                .px(px(5.0))
+                                .h(px(14.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(theme::RADIUS_PILL))
+                                .bg(t.secondary_bg)
+                                .text_size(t.text(9.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(t.text_muted)
+                                .child("Soon"),
+                        )
+                    })
+                    .on_click(move |_, _w, cx| {
+                        me.update(cx, |this, cx| this.select_pane(pane, cx));
+                    })
+                    .tooltip(ui::hover_hint(label))
+                    .into_any_element(),
+            );
         }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .w(px(theme::RAIL_W))
+            .h_full()
+            .flex_shrink_0()
+            .py(px(8.0))
+            .bg(t.sidebar)
+            .border_r_1()
+            .border_color(t.border_soft)
+            .children(rows)
+            .child(div().flex_1())
+            .when(self.layout == Layout::Full, |d| {
+                d.child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .text_size(t.text(9.0))
+                        .text_color(t.text_muted)
+                        .whitespace_normal()
+                        .child("Tools in •••"),
+                )
+            })
+            .into_any_element()
+    }
 
-        if self.layout.shows_ops() {
-            let _browser = self.browser.clone();
-            capsules.push(
+    fn selected_debloat_count(&self) -> Option<String> {
+        let Some(Selection::Device(serial)) = &self.selection else {
+            return None;
+        };
+        let count = self.debloat_counts.get(serial)?;
+        if count.recommended > 0 {
+            Some(count.recommended.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// The persistent transfer dock at the window bottom.
+    fn dock(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        let active: Vec<&JobInfo> = self.jobs.iter().filter(|job| job.is_active()).collect();
+        let active_count = active.len();
+        let bytes_done: u64 = active.iter().map(|job| job.bytes_done).sum();
+        let bytes_total: u64 = active.iter().map(|job| job.bytes_total).sum();
+        let speed: u64 = active.iter().map(|job| job.speed_bps).sum();
+        let fraction = if bytes_total > 0 {
+            (bytes_done as f64 / bytes_total as f64).clamp(0.0, 1.0)
+        } else if active_count > 0 {
+            0.05
+        } else {
+            0.0
+        } as f32;
+        let label = if active_count > 0 {
+            let mut line = format!("{active_count} transferring");
+            if bytes_total > 0 {
+                line.push_str(&format!(
+                    " · {} of {}",
+                    crate::protocol::human_size(bytes_done),
+                    crate::protocol::human_size(bytes_total)
+                ));
+            }
+            if speed > 0 {
+                line.push_str(&format!(" · {}/s", crate::protocol::human_size(speed)));
+            }
+            line
+        } else if self.jobs.is_empty() {
+            "Ready — drag files here to send them to the phone".to_string()
+        } else {
+            format!("{} transfer(s) in queue", self.jobs.len())
+        };
+        let me = cx.entity();
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .h(px(theme::DOCK_H))
+            .w_full()
+            .px(px(12.0))
+            .bg(t.statusbar)
+            .border_t_1()
+            .border_color(t.border_soft)
+            .child(icons::icon(
+                names::EMBLEM_SYNC,
+                13.0,
+                if active_count > 0 {
+                    t.accent
+                } else {
+                    t.text_muted
+                },
+            ))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(t.text(11.5))
+                    .text_color(if active_count > 0 {
+                        t.text_primary
+                    } else {
+                        t.text_muted
+                    })
+                    .child(label),
+            )
+            .when(active_count > 0, |d| {
+                d.child(div().w(px(140.0)).child(ui::progress_bar(t, fraction, 4.0)))
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("dock-queue")
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h(px(26.0))
+                    .px(px(8.0))
+                    .rounded(px(theme::RADIUS_CAPSULE_BTN))
+                    .cursor_pointer()
+                    .text_size(t.text(11.5))
+                    .text_color(t.text_secondary)
+                    .hover(|s| s.bg(t.hover).text_color(t.text_header))
+                    .child(if self.transfers_open {
+                        "Hide queue"
+                    } else {
+                        "View queue"
+                    })
+                    .on_click(move |_, _w, cx| {
+                        me.update(cx, |this, cx| {
+                            this.transfers_open = !this.transfers_open;
+                            this.device_open = false;
+                            this.overflow_open = false;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(self.transfers_popover(t, cx))
+            .into_any_element()
+    }
+
+    /// The Transfer pane: places column + browser under a slim file toolbar.
+    fn transfer_pane(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        let places = if self.layout.shows_places() && self.sidebar_visible {
+            Some(self.places(t, cx))
+        } else {
+            None
+        };
+        let divider = places.as_ref().map(|_| self.sidebar_divider(t, cx));
+        let toolbar = self.file_toolbar(t, cx);
+        let body = div()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .when_some(places, |d, p| d.child(p))
+            .when_some(divider, |d, dvr| d.child(dvr))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(toolbar)
+                    .child(self.browser.clone()),
+            );
+        body.into_any_element()
+    }
+
+    /// The file toolbar inside the Transfer pane: navigation, path, actions.
+    fn file_toolbar(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+        let browser = self.browser.clone();
+        let grid = self.browser.read(cx).view_mode() == ViewMode::Grid;
+        let search_on = self.browser.read(cx).search_active();
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(48.0))
+            .px(px(10.0))
+            .w_full()
+            .bg(t.topbar)
+            .border_b_1()
+            .border_color(t.border_soft)
+            .child(
+                ui::capsule(
+                    t,
+                    [
+                        self.nav_button(t, "back", names::GO_PREVIOUS, &browser, cx),
+                        self.nav_button(t, "forward", names::GO_NEXT, &browser, cx),
+                        self.nav_button(t, "up", names::GO_UP, &browser, cx),
+                        self.nav_button(t, "refresh", names::REFRESH, &browser, cx),
+                    ],
+                )
+                .into_any_element(),
+            )
+            .child(self.omnibar(t, cx))
+            .child(
                 ui::capsule(
                     t,
                     [
@@ -4146,13 +4762,9 @@ impl AdbShareApp {
                             }),
                         )
                         .into_any_element(),
-                        ui::capsule_separator(t).into_any_element(),
                         ui::icon_button_with_hint(
                             t,
                             "upload",
-                            // A paper plane, not `folder-up`. Paired with a
-                            // `folder-down` next to it the two read as one icon
-                            // mirrored, and a plane is unmistakable at 14px.
                             names::SEND_TO,
                             theme::CAPSULE_BTN,
                             ui::icon_tint(names::SEND_TO, t),
@@ -4173,20 +4785,11 @@ impl AdbShareApp {
                     ],
                 )
                 .into_any_element(),
-            );
-
-            // Grid/list switch plus search, the way the old view capsule did.
-            let grid = self.browser.read(cx).view_mode() == ViewMode::Grid;
-            let search_on = self.browser.read(cx).search_active();
-            let browser = self.browser.clone();
-            capsules.push(
+            )
+            .child(
                 ui::capsule(
                     t,
                     [
-                        // Each button sets the layout it names. They used to both
-                        // dispatch the toggle action, which meant the list button
-                        // switched to the grid when pressed while already in the
-                        // list.
                         ui::icon_button_active_with_hint(
                             t,
                             "view-grid",
@@ -4217,7 +4820,6 @@ impl AdbShareApp {
                             },
                         )
                         .into_any_element(),
-                        ui::capsule_separator(t).into_any_element(),
                         ui::icon_button_active_with_hint(
                             t,
                             "search",
@@ -4228,119 +4830,15 @@ impl AdbShareApp {
                             {
                                 let browser = browser.clone();
                                 move |_, _w, cx| {
-                                    // `flip_search`, not `set_search_active`:
-                                    // the key and the overflow row both hand
-                                    // the caret to the field they just opened,
-                                    // and this button used to leave it in the
-                                    // pane, so the strip appeared and typing
-                                    // went nowhere until you clicked into it.
                                     browser.update(cx, |b, cx| b.flip_search(cx));
                                 }
                             },
                         )
                         .into_any_element(),
-                        ui::capsule_separator(t).into_any_element(),
-                        // The debloat view is a *view*, not an action, so it
-                        // gets a word rather than another glyph in a row of
-                        // them: a row of glyphs can only be read by hovering
-                        // each one, which is no way to find a feature you
-                        // have never heard of. It is also the only way back
-                        // out of the debloat pane, so it lives in the
-                        // toolbar rather than only in a menu.
-                        ui::capsule_button(
-                            t,
-                            "debloat",
-                            if self.pane == Pane::Debloat {
-                                names::FILE_MANAGER
-                            } else {
-                                names::PACKAGE
-                            },
-                            if self.pane == Pane::Debloat {
-                                "Files"
-                            } else {
-                                "Debloat"
-                            },
-                            self.pane == Pane::Debloat,
-                            cx.listener(|this, _e, _w, cx| this.toggle_pane(cx)),
-                        )
-                        .into_any_element(),
-                        ui::capsule_separator(t).into_any_element(),
-                        // The tools view, the same deal as debloat: a word,
-                        // not a glyph, and the way back out.
-                        ui::capsule_button(
-                            t,
-                            "tools",
-                            if self.pane == Pane::Tools {
-                                names::FILE_MANAGER
-                            } else {
-                                names::TERMINAL
-                            },
-                            if self.pane == Pane::Tools {
-                                "Files"
-                            } else {
-                                "Tools"
-                            },
-                            self.pane == Pane::Tools,
-                            cx.listener(|this, _e, _w, cx| {
-                                if this.pane == Pane::Tools {
-                                    this.pane = Pane::Browser;
-                                    cx.notify();
-                                } else {
-                                    this.open_tools(cx);
-                                }
-                            }),
-                        )
-                        .into_any_element(),
-                        ui::capsule_separator(t).into_any_element(),
-                        // Mirror view, same deal: word + way back out.
-                        ui::capsule_button(
-                            t,
-                            "mirror",
-                            if self.pane == Pane::Mirror {
-                                names::FILE_MANAGER
-                            } else {
-                                names::PHONE
-                            },
-                            if self.pane == Pane::Mirror {
-                                "Files"
-                            } else {
-                                "Mirror"
-                            },
-                            self.pane == Pane::Mirror,
-                            cx.listener(|this, _e, _w, cx| {
-                                if this.pane == Pane::Mirror {
-                                    this.mirror.update(cx, |m, cx| m.stop(cx));
-                                    this.pane = Pane::Browser;
-                                    cx.notify();
-                                } else {
-                                    this.open_mirror(cx);
-                                }
-                            }),
-                        )
-                        .into_any_element(),
                     ],
                 )
                 .into_any_element(),
-            );
-        }
-
-        capsules.push(self.transfers_button(t, cx));
-        capsules.push(self.overflow_button(t, cx));
-
-        div()
-            .relative()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .w_full()
-            .h(px(theme::TOPBAR_H))
-            .px(px(8.0))
-            .bg(t.topbar)
-            .border_b_1()
-            .border_color(t.border)
-            .children(capsules)
-            .child(self.transfers_popover(t, cx))
-            .child(self.overflow_popover(t, cx))
+            )
             .into_any_element()
     }
 
@@ -4515,64 +5013,6 @@ impl AdbShareApp {
             .into_any_element()
     }
 
-    /// The transfers button, with an activity dot when work is in flight.
-    fn transfers_button(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
-        let active = self.jobs.iter().filter(|job| job.is_active()).count();
-        div()
-            .id("transfers")
-            .flex()
-            .items_center()
-            .h(px(theme::CAPSULE_H))
-            .px(px(12.0))
-            .rounded(px(theme::RADIUS_CAPSULE))
-            .when(active > 0, |d| {
-                d.bg(t.accent_soft).border_1().border_color(t.accent_border)
-            })
-            .cursor_pointer()
-            .text_size(t.text(14.0))
-            .text_color(if active > 0 {
-                t.text_header
-            } else {
-                t.text_dim
-            })
-            .hover(|s| s.bg(t.hover).text_color(t.text_header))
-            .child(icons::icon(
-                names::EMBLEM_SYNC,
-                15.0,
-                if active > 0 {
-                    t.accent
-                } else {
-                    ui::icon_tint(names::EMBLEM_SYNC, t)
-                },
-            ))
-            .child(div().ml(px(5.0)).child("Transfers"))
-            .when(active > 0, |d| {
-                d.child(
-                    div()
-                        .ml(px(7.0))
-                        .min_w(px(18.0))
-                        .h(px(18.0))
-                        .px(px(5.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(theme::RADIUS_PILL))
-                        .bg(t.accent)
-                        .text_size(t.text(10.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(t.text_on_light)
-                        .child(active.to_string()),
-                )
-            })
-            .on_click(cx.listener(|this, _e, _w, cx| {
-                this.transfers_open = !this.transfers_open;
-                this.overflow_open = false;
-                cx.notify();
-            }))
-            .tooltip(ui::hover_hint("Transfers"))
-            .into_any_element()
-    }
-
     /// The overflow menu button.
     fn overflow_button(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
         div()
@@ -4598,7 +5038,11 @@ impl AdbShareApp {
             .into_any_element()
     }
 
-    /// The transfers popover, anchored under its button.
+    /// The transfer queue, anchored above the dock.
+    ///
+    /// Both the header summary and the dock's "View queue" toggle this one
+    /// popover, so the queue has a single home no matter where it is opened
+    /// from.
     fn transfers_popover(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
         if !self.transfers_open {
             return div().into_any_element();
@@ -4664,8 +5108,8 @@ impl AdbShareApp {
         ui::on_top(
             div()
                 .absolute()
-                .top(px(theme::TOPBAR_H - 2.0))
-                .right(px(POPOVER_RIGHT_UNDER_BUTTON))
+                .bottom(px(theme::DOCK_H + 8.0))
+                .right(px(12.0))
                 .child(
                     div()
                         .flex()
@@ -4790,128 +5234,15 @@ impl AdbShareApp {
             .into_any_element()
     }
 
-    /// The sidebar: devices, then phone places, then local places.
-    fn sidebar(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
+    /// The Transfer places column: phone places, then local places.
+    ///
+    /// Devices used to live here; they now live in the header pill and open
+    /// as a popover, so this column is only about *where* you are browsing.
+    fn places(&mut self, t: &theme::Palette, cx: &mut Context<Self>) -> AnyElement {
         let has_device = self.target_device().is_some();
-        let selected = self.selection.clone();
         let mut rows: Vec<AnyElement> = Vec::new();
 
-        rows.push(ui::section_heading("Phones & tablets", t).into_any_element());
-        if let Some(error) = self.daemon_error.clone() {
-            // An unreachable daemon and an unplugged phone look identical from
-            // the device list alone, so say which one it is.
-            rows.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .px(px(10.0))
-                    .py(px(9.0))
-                    .rounded(px(theme::RADIUS_CARD))
-                    .bg(t.danger_soft)
-                    .border_1()
-                    .border_color(t.danger_border)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .text_size(t.text(12.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(t.danger)
-                            .child(icons::icon(
-                                names::DIALOG_WARNING,
-                                14.0,
-                                ui::icon_tint(names::DIALOG_WARNING, t),
-                            ))
-                            .child("Cannot reach adb-daemon"),
-                    )
-                    .child(
-                        div()
-                            .text_size(t.text(10.5))
-                            .text_color(t.text_dim)
-                            .whitespace_normal()
-                            .child(error),
-                    )
-                    .child(
-                        div()
-                            .id("sidebar-diagnose")
-                            .mt(px(4.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            .text_size(t.text(11.0))
-                            .text_color(t.text_header)
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(t.danger))
-                            .child(icons::icon(
-                                names::DIALOG_INFORMATION,
-                                12.0,
-                                ui::icon_tint(names::DIALOG_INFORMATION, t),
-                            ))
-                            .child("Run connection diagnostics")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.open_diagnostics(cx);
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if self.devices.is_empty() && self.daemon_error.is_none() {
-            rows.push(onboarding_card(t).into_any_element());
-        } else if !self.devices.is_empty() {
-            for device in self.devices.clone() {
-                let active = matches!(&selected, Some(Selection::Device(s)) if *s == device.serial);
-                let serial = device.serial.clone();
-                rows.push(
-                    device_card(
-                        t,
-                        device,
-                        active,
-                        self.debloat_counts.get(&serial).copied(),
-                        {
-                            let serial = serial.clone();
-                            cx.listener(move |this, _e, _w, cx| {
-                                this.select_device(&serial, cx);
-                            })
-                        },
-                        cx.listener(move |this, _e, _w, cx| {
-                            this.open_debloat_for(&serial, cx);
-                        }),
-                    )
-                    .into_any_element(),
-                );
-            }
-        }
-
-        rows.push(
-            div()
-                .id("connect-wifi")
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(8.0))
-                .h(px(32.0))
-                .my(px(4.0))
-                .rounded(px(theme::RADIUS_CAPSULE_BTN))
-                .cursor_pointer()
-                .text_size(t.text(12.0))
-                .text_color(t.text_dim)
-                .hover(|s| s.bg(t.hover).text_color(t.accent))
-                .child(icons::icon(
-                    names::WIRELESS,
-                    15.0,
-                    ui::icon_tint(names::WIRELESS, t),
-                ))
-                .child("Connect via Wi-Fi")
-                .on_click(cx.listener(|this, _e, _w, cx| {
-                    this.on_menu_select("connect-wifi", cx);
-                }))
-                .tooltip(ui::hover_hint("Pair with a phone over wireless debugging"))
-                .into_any_element(),
-        );
-
-        rows.push(ui::section_heading("Phone folders", t).into_any_element());
+        rows.push(ui::section_heading("On this phone", t).into_any_element());
         if !has_device {
             rows.push(
                 div()
@@ -4920,7 +5251,7 @@ impl AdbShareApp {
                     .text_size(t.text(11.0))
                     .text_color(t.text_muted)
                     .whitespace_normal()
-                    .child("Select a phone above to browse its folders.")
+                    .child("Pick a device in the header to browse its folders.")
                     .into_any_element(),
             );
         } else {
@@ -4943,12 +5274,6 @@ impl AdbShareApp {
         }
 
         rows.push(ui::section_heading("This computer", t).into_any_element());
-        // The browser is already pointed at the disk here, so ask it which
-        // folder is open rather than assuming none is. Every one of these rows
-        // used to pass `active: false`, which left the whole group unlit while
-        // browsing the disk: the phone places above lit up as you moved through
-        // them and the local ones stayed inert, so the sidebar never said where
-        // you were.
         let local_path = self.browser.read(cx).path().to_path_buf();
         let browsing_local = self.browser.read(cx).is_local();
         for (label, icon, kind) in [
@@ -4993,7 +5318,7 @@ impl AdbShareApp {
 
 /// The most height a menu can take, so it fits the window it hangs from.
 ///
-/// Both menus open downwards — the overflow list from the top bar, the
+/// Both menus open downwards — the overflow list from the header, the
 /// context menu from the pointer — so the room they have is the viewport
 /// height less where they start, and less a margin so the last row is not
 /// flush against the bottom edge. Without this a long menu simply ran off
@@ -5012,7 +5337,7 @@ const MENU_MARGIN: f32 = 24.0;
 /// was opened: a few rows are better than none.
 const MENU_MIN_H: f32 = 120.0;
 
-/// A local place from the sidebar.
+/// A local place from the places column.
 #[derive(Debug, Clone, Copy)]
 enum LocalPlace {
     Home,
@@ -5039,7 +5364,7 @@ fn onboarding_card(t: &theme::Palette) -> gpui::Div {
         .px(px(10.0))
         .py(px(10.0))
         .rounded(px(theme::RADIUS_CARD))
-        // The sidebar is pure black, one step below the canvas, so a card on it
+        // The popover card is one step below the canvas, so a card on it
         // has to use the raised step to read as sitting above the pane.
         .bg(t.card)
         .border_1()
@@ -5142,7 +5467,7 @@ fn device_card(
         .py(px(9.0))
         .rounded(px(theme::RADIUS_CARD))
         .cursor_pointer()
-        // A device card sits on the elevated sidebar, so it takes the raised
+        // A device card sits on the popover card, so it takes the raised
         // control surface, and the accent identity of the current device when
         // it is the active one.
         .bg(if active { t.device_active_bg } else { t.card })
@@ -5225,7 +5550,7 @@ fn device_card(
     card.on_click(on_click)
 }
 
-/// An icon + label row in the sidebar.
+/// An icon + label row in the places column.
 fn place_row(
     t: &theme::Palette,
     icon: &'static str,
@@ -5524,6 +5849,7 @@ impl Render for AdbShareApp {
         // keyboard itself, and taking it here would pull the caret straight back
         // out of the search box on the next frame.
         if matches!(self.dialog, Dialog::None)
+            && self.pane == Pane::Browser
             && !self.search_field.read(cx).focus_handle().is_focused(window)
             && !self.path_field.read(cx).focus_handle().is_focused(window)
             && !self.browser.read(cx).has_key_focus(window)
@@ -5549,31 +5875,36 @@ impl Render for AdbShareApp {
             self.last_title = Some(target);
         }
 
-        let show_sidebar = self.layout.shows_sidebar() && self.sidebar_visible;
-        // The browser is told where its item area is, so rubber-band selection
-        // hit-tests against real geometry.
-        let sidebar_width = if show_sidebar {
-            self.sidebar_width
-        } else {
-            0.0
-        };
-        let content_x = sidebar_width + if show_sidebar { 4.0 } else { 0.0 };
-        // The search strip is a sibling above the browser, so the browser's
-        // reported box starts below it and loses that height. Reporting the
-        // wrong top while searching put every hit test one strip too high.
+        // The Transfer pane's places column is the only resizable part of the
+        // new chrome; the rail is fixed-width so destinations never move.
+        let show_places =
+            self.pane == Pane::Browser && self.layout.shows_places() && self.sidebar_visible;
+        let places_w = if show_places { self.sidebar_width } else { 0.0 };
+        let rail_w = theme::RAIL_W;
+        let file_toolbar_h = 48.0;
         let search_h = if self.pane == Pane::Browser && self.browser.read(cx).search_active() {
             SEARCH_ROW_H
         } else {
             0.0
         };
-        let content_y = theme::TOPBAR_H + search_h;
+        // The browser is told where its item area is, so rubber-band selection
+        // hit-tests against real geometry. The browser lives inside the
+        // Transfer pane, which sits under the header, the file toolbar, the
+        // search strip and the dock.
+        let content_x = rail_w + places_w + if show_places { 4.0 } else { 0.0 };
+        // Only the Transfer pane draws a file toolbar; other panes start
+        // directly under the header, so their viewport origin is higher.
+        let content_y = if self.pane == Pane::Browser {
+            theme::HEADER_H + file_toolbar_h + search_h
+        } else {
+            theme::HEADER_H
+        };
         let viewport = window.viewport_size();
         // The menus measure the room left beneath them against this, and they
         // are built later in the same render.
         self.viewport_h = f32::from(viewport.height);
-        let content_w: f32 = f32::from(viewport.width) - sidebar_width;
-        let content_h =
-            f32::from(viewport.height) - theme::TOPBAR_H - theme::STATUSBAR_H - search_h;
+        let content_w: f32 = f32::from(viewport.width) - rail_w - places_w;
+        let content_h = f32::from(viewport.height) - content_y - theme::DOCK_H - theme::STATUSBAR_H;
         self.browser.update(cx, |b, cx| {
             b.set_viewport(content_x, content_y, content_w, content_h, cx)
         });
@@ -5581,18 +5912,14 @@ impl Render for AdbShareApp {
             m.set_viewport(content_x, content_y, content_w, content_h, cx)
         });
 
-        // The divider sits between the sidebar and the browser, so the file area
-        // starts after it.
-        let divider = show_sidebar.then(|| self.sidebar_divider(&t, cx));
-
-        // The main pane is either the file browser or the debloat view. The
-        // browser is kept alive either way, so switching back is instant and
-        // its geometry does not go stale.
+        // The active pane. Every pane is kept alive so switching back is
+        // instant and its geometry does not go stale; only one is drawn.
         let pane: AnyElement = match self.pane {
-            Pane::Browser => self.browser.clone().into_any_element(),
+            Pane::Browser => self.transfer_pane(&t, cx),
             Pane::Debloat => self.debloat.clone().into_any_element(),
             Pane::Tools => self.tools.clone().into_any_element(),
             Pane::Mirror => self.mirror.clone().into_any_element(),
+            Pane::Trackpad => self.trackpad.clone().into_any_element(),
         };
 
         let body = div()
@@ -5601,8 +5928,7 @@ impl Render for AdbShareApp {
             .min_h_0()
             .w_full()
             .bg(t.canvas)
-            .when(show_sidebar, |d| d.child(self.sidebar(&t, cx)))
-            .when_some(divider, |d, divider| d.child(divider))
+            .child(self.rail(&t, cx))
             .child(pane);
 
         // `cx.listener` borrows the context, which the render tree below also
@@ -5631,13 +5957,17 @@ impl Render for AdbShareApp {
         // One backdrop for every non-modal overlay, drawn before them: paint
         // order is tree order, so the popovers — which go through `on_top` and
         // so paint after everything here — still sit above it.
-        let overlays = self.transfers_open || self.overflow_open || self.context_menu.is_some();
+        let overlays = self.transfers_open
+            || self.overflow_open
+            || self.device_open
+            || self.context_menu.is_some();
         let dismiss_overlays = {
             let me = me.clone();
             move |_event: &gpui::ClickEvent, _w: &mut Window, app: &mut App| {
                 me.update(app, |this, cx| {
                     this.transfers_open = false;
                     this.overflow_open = false;
+                    this.device_open = false;
                     this.context_menu = None;
                     cx.notify();
                 });
@@ -5664,9 +5994,10 @@ impl Render for AdbShareApp {
             // carries it to every child text run; only monospace overrides.
             .font_family(theme::font_family(cx))
             .track_focus(&self.focus)
-            .child(self.topbar(&t, cx))
+            .child(self.header(&t, cx))
             .child(self.search_row(&t, cx, content_x))
             .child(body)
+            .child(self.dock(&t, cx))
             // Before the overlays, so it paints under them and they stay
             // clickable.
             .when_some(backdrop, |d, backdrop| d.child(backdrop))
@@ -5684,12 +6015,9 @@ impl Render for AdbShareApp {
 impl AdbShareApp {
     /// The search strip, shown only while search is active.
     ///
-    /// `left_inset` is the content pane's left edge (sidebar width plus the
-    /// divider, or 0 when the sidebar is hidden): the strip belongs to the
-    /// file pane, so it starts there rather than running the full window
-    /// width over the sidebar. A full-width strip put "Search this folder"
-    /// in the top-left corner, visually a second top bar, with the sidebar
-    /// headings pushed below it.
+    /// `left_inset` is the file pane's left edge (rail width plus the places
+    /// column and divider): the strip belongs to the file pane, so it starts
+    /// there rather than running the full window width over the rail.
     fn search_row(
         &mut self,
         t: &theme::Palette,

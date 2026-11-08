@@ -4,31 +4,25 @@
 //! system lives here as tokens, installed as an [`gpui::Global`] that views read
 //! without threading it through every call.
 //!
-//! # A deep slate workbench
+//! # An Apple-fluid workbench for four jobs
 //!
-//! The file canvas is a deep ink-slate (`#0B0E12`) rather than pure black, so
-//! the whole window reads as one graphite instrument instead of a void with
-//! floating controls. Chrome steps up through `#10141A` and `#161C24`, cards
-//! and popovers sit at `#171D26`, and hairlines at `#232C37` give every pane a
-//! precise edge. Structure reads from fill first, border second.
+//! The app is built around four features — Transfer, Debloat, Mirror,
+//! Trackpad — as top-level destinations in a left rail, with one device
+//! header and a persistent transfer dock. That structure is why the tokens
+//! below read like macOS: neutral graphitic surfaces, one system-blue
+//! accent, larger radii, generous spacing, and translucent-style chrome
+//! steps (rail / header sit a step above the canvas so panes read as
+//! distinct surfaces).
 //!
-//! The accent is a restrained cool cyan-blue (`#5CB6D9`): it marks the active
-//! device, the current location and live transfers, and nowhere else. States
-//! are kept off the accent ramp, so a selected row, a hovered control and a
-//! running job cannot be mistaken for one another.
+//! The accent is Apple's system blue: `#64A5FF` in dark, `#0071E3` in light.
+//! It marks the active destination, the connected device and live transfers,
+//! and nowhere else. Status hues follow Apple's system ramp so a batch, a
+//! warning and an error keep their meanings in both appearances.
 //!
-//! Text avoids pure white. The strongest ink is `#F3F6F8`, body copy
-//! `#E6EBF0`, secondary labels `#D3DAE1`, metadata `#97A3B0`, and section
-//! headers `#66717E`. That ladder keeps sizes, dates and storage stats
-//! scannable without letting them compete with file names.
-//!
-//! Surfaces are *opaque* steps, because near-black greys a browser cannot
-//! round-trip would band. Interaction fills are percentages of white instead:
-//! one value stays legible over the canvas, the chrome and a card alike.
-//!
-//! One token is deliberately absent: `scrollbar.thumb.background`. GPUI 0.2.2
-//! has no scrollbar colour API at all, so a palette entry for it would be a
-//! value nothing could read.
+//! Text follows the supporting-text ladder: header near-white, body off-white,
+//! metadata greys that still clear 4.5:1 at 11px on the dark canvas
+//! (`text_muted` is the lightest failure point and is kept at `~4.7:1`),
+//! and brand ink only on accent fills.
 //!
 //! Both appearances exist ([`Palette::t3_dark`] and [`Palette::t3_light`]),
 //! following the system via GPUI's window appearance, with a forced choice
@@ -190,22 +184,22 @@ impl Palette {
         Self {
             // Surfaces. A deep ink-slate canvas; chrome and cards climb a
             // visible step so the window reads as panes on one instrument.
-            canvas: rgba(0x0B0E12FF),
-            topbar: rgba(0x10141AFF),
-            statusbar: rgba(0x0E1217FF),
-            sidebar: rgba(0x0E1217FF),
-            card: rgba(0x171D26FF),
-            card_hover: rgba(0x1E2631FF),
-            sidebar_active: rgba(0x1B2530FF),
-            row_hover: rgba(0x151B22FF),
-            divider: rgba(0x232C37FF),
-            row_divider: rgba(0x171E26FF),
+            canvas: rgba(0x0B0B0FFF),
+            topbar: rgba(0x121215FF),
+            statusbar: rgba(0x101013FF),
+            sidebar: rgba(0x121215FF),
+            card: rgba(0x1C1C1EFF),
+            card_hover: rgba(0x242427FF),
+            sidebar_active: rgba(0x2C2C2EFF),
+            row_hover: rgba(0x1E1E20FF),
+            divider: rgba(0x2C2C2EFF),
+            row_divider: rgba(0x1D1D20FF),
             // The active device keeps its cyan identity: a 10% tint under a
             // 70% accent border, crisp enough to pick out at a glance.
-            device_active_bg: rgba(0x5CB6D91A),
-            device_active_border: rgba(0x5CB6D9B3),
-            accent_soft: rgba(0x5CB6D91F),
-            accent_border: rgba(0x5CB6D98C),
+            device_active_bg: rgba(0x64A5FF1A),
+            device_active_border: rgba(0x64A5FFB3),
+            accent_soft: rgba(0x64A5FF1F),
+            accent_border: rgba(0x64A5FF8C),
 
             // Interaction, as percentages of white. 5% is a hover step that
             // clears the slate canvas without bleaching a card; selection and
@@ -223,38 +217,38 @@ impl Palette {
             // Text. Off-white at the top of the ladder rather than #FFFFFF,
             // which blooms on a dark panel; metadata and headers walk down
             // through the cool greys so filenames stay dominant.
-            text_header: rgba(0xF3F6F8FF),
-            text_primary: rgba(0xE6EBF0FF),
-            text_secondary: rgba(0xD3DAE1FF),
-            text_dim: rgba(0x97A3B0FF),
-            text_muted: rgba(0x66717EFF),
+            text_header: rgba(0xFFFFFFFF),
+            text_primary: rgba(0xF2F2F7FF),
+            text_secondary: rgba(0xC7C7CCFF),
+            text_dim: rgba(0x9E9EA4FF),
+            text_muted: rgba(0x84848CFF),
             text_inverse: rgba(0xFFFFFFFF),
-            text_on_light: rgba(0x081016FF),
+            text_on_light: rgba(0x0B0D10FF),
 
             // Strokes. A visible cool grey: #232C37 is the line between the
             // sidebar and the canvas, and around every popover.
-            border: rgba(0x26303BFF),
-            border_soft: rgba(0x1E262FFF),
+            border: rgba(0x2E2E33FF),
+            border_soft: rgba(0x232328FF),
 
             // Semantic. The accent is one restrained cyan-blue, used only for
             // identity and live work. Status hues stay legible on the slate.
-            accent: rgba(0x5CB6D9FF),
-            success: rgba(0x41D6A3FF),
-            warning: rgba(0xE9B45AFF),
-            danger: rgba(0xEE6673FF),
+            accent: rgba(0x64A5FFFF),
+            success: rgba(0x30D158FF),
+            warning: rgba(0xFF9F0AFF),
+            danger: rgba(0xFF453AFF),
             // Every tone surface is its hue at 16%, so a badge of any tone
             // carries the same weight against the same dark background.
-            success_soft: rgba(0x41D6A329),
-            warning_soft: rgba(0xE9B45A29),
-            danger_soft: rgba(0xEE667329),
+            success_soft: rgba(0x30D15829),
+            warning_soft: rgba(0xFF9F0A29),
+            danger_soft: rgba(0xFF453A29),
             // The panel border is one step denser than its fill, so a warning
             // panel keeps a visible edge.
-            danger_border: rgba(0xEE667380),
+            danger_border: rgba(0xFF453A80),
 
             // A tooltip is an overlay, so it sits above every surface.
-            tooltip: rgba(0x1A222CF2),
-            tooltip_text: rgba(0xF3F6F8FF),
-            tooltip_border: rgba(0x2A3642FF),
+            tooltip: rgba(0x2C2C2EF2),
+            tooltip_text: rgba(0xFFFFFFFF),
+            tooltip_border: rgba(0x3A3A3EFF),
 
             // No scale until a preference says otherwise; see [`set_font_scale`].
             font_scale: TEXT_SCALES[TEXT_DEFAULT_STEP],
@@ -272,20 +266,20 @@ impl Palette {
     /// modes, as GNOME's do.
     pub fn t3_light() -> Self {
         Self {
-            canvas: rgba(0xF4F6F9FF),
-            topbar: rgba(0xE9EDF2FF),
-            statusbar: rgba(0xEDF0F4FF),
-            sidebar: rgba(0xEDF0F4FF),
+            canvas: rgba(0xF5F5F7FF),
+            topbar: rgba(0xFFFFFFFF),
+            statusbar: rgba(0xF5F5F7FF),
+            sidebar: rgba(0xF5F5F7FF),
             card: rgba(0xFFFFFFFF),
-            card_hover: rgba(0xF0F3F7FF),
-            sidebar_active: rgba(0xDCE5EEFF),
+            card_hover: rgba(0xFAFAFCFF),
+            sidebar_active: rgba(0xE4E4E8FF),
             row_hover: rgba(0xEEF1F5FF),
-            divider: rgba(0xD6DDE5FF),
-            row_divider: rgba(0xE3E8EEFF),
-            device_active_bg: rgba(0x1F7FA81A),
-            device_active_border: rgba(0x1F7FA8B3),
-            accent_soft: rgba(0x1F7FA81F),
-            accent_border: rgba(0x1F7FA88C),
+            divider: rgba(0xD1D1D6FF),
+            row_divider: rgba(0xE4E4E8FF),
+            device_active_bg: rgba(0x0071E31A),
+            device_active_border: rgba(0x0071E3B3),
+            accent_soft: rgba(0x0071E31F),
+            accent_border: rgba(0x0071E38C),
 
             hover: rgba(0x0000000D),
             selected: rgba(0x00000014),
@@ -300,21 +294,21 @@ impl Palette {
             text_primary: rgba(0x1C242EFF),
             text_secondary: rgba(0x3A4552FF),
             text_dim: rgba(0x5C6875FF),
-            text_muted: rgba(0x8A95A1FF),
+            text_muted: rgba(0x6E6E73FF),
             text_inverse: rgba(0xFFFFFFFF),
             text_on_light: rgba(0xFFFFFFFF),
 
             border: rgba(0xC3CDD7FF),
             border_soft: rgba(0xDDE3EAFF),
 
-            accent: rgba(0x1F7FA8FF),
-            success: rgba(0x0E9F6EFF),
-            warning: rgba(0xB7791FFF),
-            danger: rgba(0xD64550FF),
-            success_soft: rgba(0x0E9F6E29),
-            warning_soft: rgba(0xB7791F29),
-            danger_soft: rgba(0xD6455029),
-            danger_border: rgba(0xD6455080),
+            accent: rgba(0x0071E3FF),
+            success: rgba(0x248A3DFF),
+            warning: rgba(0xB25B00FF),
+            danger: rgba(0xD70015FF),
+            success_soft: rgba(0x248A3D29),
+            warning_soft: rgba(0xB25B0029),
+            danger_soft: rgba(0xD7001529),
+            danger_border: rgba(0xD7001580),
 
             tooltip: rgba(0x1A222CF2),
             tooltip_text: rgba(0xF3F6F8FF),
@@ -543,33 +537,40 @@ pub fn text_scale_step(scale: f32) -> usize {
 // consistent with each other.
 
 /// The window the app opens at, and the basis for the benchmarks' geometry.
-pub const WINDOW_W: f32 = 1000.0;
-pub const WINDOW_H: f32 = 680.0;
+pub const WINDOW_W: f32 = 1180.0;
+pub const WINDOW_H: f32 = 760.0;
 /// The smallest useful window.
 pub const WINDOW_MIN_W: f32 = 360.0;
 pub const WINDOW_MIN_H: f32 = 400.0;
-/// Height of the top bar.
-pub const TOPBAR_H: f32 = 45.0;
+/// Height of the app header (device bar).
+/// Kept as `TOPBAR_H` because dialogs, menus and viewports still key off it.
+pub const TOPBAR_H: f32 = 56.0;
+/// Height of the app header, aliased for new chrome.
+pub const HEADER_H: f32 = TOPBAR_H;
+/// Width of the left feature rail.
+pub const RAIL_W: f32 = 92.0;
+/// Height of the persistent transfer dock at the window bottom.
+pub const DOCK_H: f32 = 36.0;
 /// Height of the top-bar controls: the path bar and the button groups.
-pub const CAPSULE_H: f32 = 34.0;
+pub const CAPSULE_H: f32 = 36.0;
 /// Edge length of a square icon button in the top bar.
-pub const CAPSULE_BTN: f32 = 30.0;
+pub const CAPSULE_BTN: f32 = 32.0;
 /// Corner radius of a button group container. Groups are flat now (no fill,
 /// no outline — see `ui::capsule`), so this only rounds the group's box.
-pub const RADIUS_CAPSULE: f32 = 9.0;
+pub const RADIUS_CAPSULE: f32 = 12.0;
 /// Corner radius of a control: a button, a menu row, a text field. One
 /// radius for every control in the app.
-pub const RADIUS_CAPSULE_BTN: f32 = 6.0;
+pub const RADIUS_CAPSULE_BTN: f32 = 8.0;
 /// Corner radius of a dialog, one step past a card: a modal sits above the
 /// popovers and reads as the topmost surface by its radius as well as its
 /// backdrop.
-pub const RADIUS_DIALOG: f32 = 12.0;
+pub const RADIUS_DIALOG: f32 = 16.0;
 /// Corner radius of a sidebar row.
-pub const RADIUS_ROW: f32 = 6.0;
+pub const RADIUS_ROW: f32 = 8.0;
 /// Corner radius of a device card.
-pub const RADIUS_CARD: f32 = 10.0;
+pub const RADIUS_CARD: f32 = 16.0;
 /// Height of the bottom status strip.
-pub const STATUSBAR_H: f32 = 30.0;
+pub const STATUSBAR_H: f32 = 32.0;
 /// Full-pill radius, used for badges and LEDs.
 pub const RADIUS_PILL: f32 = 9999.0;
 /// Monospace stack used for paths, counts and status lines.

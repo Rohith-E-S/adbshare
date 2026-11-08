@@ -76,6 +76,7 @@ MAPPING = {
     "system-lock": "lock",
     "system-software-install": "download",
     "text-x-generic": "description",
+    "trackpad": "touch_app",
     # The four text-size rows read as a ladder: smaller, the middle the
     # palette is built at, larger, and one past that. `format_size` is the
     # two-sided arrow, so it names the default rather than a direction.
