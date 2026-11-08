@@ -27,7 +27,15 @@ const DEFAULT_PHONE_H: f32 = 2400.0;
 const PORTRAIT_TARGET_H: f32 = 760.0;
 const LANDSCAPE_TARGET_W: f32 = 800.0;
 
+/// Devices that already have a floating mirror window open (dedupes N clicks).
+fn floating_mirror_open() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OPEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    OPEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 /// Open a new floating window dedicated to mirroring the specified phone.
+/// No-op if a window is already open for this device.
 pub fn open_floating_mirror(
     device: String,
     device_label: String,
@@ -36,6 +44,14 @@ pub fn open_floating_mirror(
     init_h: u32,
     app: &mut App,
 ) {
+    {
+        let mut open = floating_mirror_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !open.insert(device.clone()) {
+            return;
+        }
+    }
     let (dw, dh) = if init_w > 0 && init_h > 0 {
         (init_w as f32, init_h as f32)
     } else {
@@ -247,23 +263,41 @@ impl FloatingMirror {
         }
 
         let frame_len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        // Tear check: skip the frame if the writer is mid-publish.
+        if let Some(snap) = reader.try_snapshot()
+            && (snap.seq != notif.seq || snap.slot != notif.slot)
+        {
+            return;
+        }
         let Ok(slot_bytes) = reader.read_slot_exact(notif.slot, frame_len) else {
             return;
         };
-
-        // Construct image::RgbaImage from BGRA bytes (which GPUI Vulkan texture expects)
-        if let Some(rgba) = image::RgbaImage::from_raw(w, h, slot_bytes.to_vec()) {
-            let frame = image::Frame::new(rgba);
-            let img = Arc::new(RenderImage::new(vec![frame]));
-            if self.width != w || self.height != h {
-                self.width = w;
-                self.height = h;
-            }
-            self.previous_frame = self.current_frame.take();
-            self.current_frame = Some(img);
-            self.frames = self.frames.saturating_add(1);
-            cx.notify();
-        }
+        // Copy out, then decode off the GPUI thread.
+        // No R/B swap: ffmpeg emits BGRA (-pix_fmt bgra) for GPUI's Bgra8Unorm.
+        let pixels = slot_bytes.to_vec();
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let img = cx
+                .background_executor()
+                .spawn(async move {
+                    image::RgbaImage::from_raw(w, h, pixels)
+                        .map(|rgba| Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+                })
+                .await;
+            let _ = me.update(cx, |this, cx| {
+                if let Some(img) = img {
+                    if this.width != w || this.height != h {
+                        this.width = w;
+                        this.height = h;
+                    }
+                    this.previous_frame = this.current_frame.take();
+                    this.current_frame = Some(img);
+                    this.frames = this.frames.saturating_add(1);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn toggle_screen_off(&mut self, cx: &mut Context<Self>) {
@@ -393,7 +427,8 @@ impl FloatingMirror {
             return;
         };
         let preset = self.preset.clone();
-        let options = serde_json::json!({ "preset": preset, "audio": false }).to_string();
+        // Audio defaults on (daemon default); no toggle is exposed yet.
+        let options = serde_json::json!({ "preset": preset, "audio": true }).to_string();
         let me = cx.entity();
 
         cx.spawn(async move |_this, cx| {
@@ -813,6 +848,10 @@ impl Drop for FloatingMirror {
             let _ = tx.try_send(ControlMessage::SetDisplayPower { on: true });
         }
         if let Some(device) = self.device.take() {
+            floating_mirror_open()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&device);
             daemon::spawn_stop_remote(device);
         }
     }
@@ -926,7 +965,12 @@ impl Render for FloatingMirror {
                 let w = (h * aspect).round();
                 (w, h)
             };
-            window.resize(size(px(target_w), px(target_h)));
+            // Never resize synchronously inside render() (reflow loop). Defer
+            // to the next frame; last_device_dims is already updated above so
+            // this fires at most once per orientation change.
+            window.defer(cx, move |window, _cx| {
+                window.resize(size(px(target_w), px(target_h)));
+            });
         }
 
         // Calculate seamless fitted screen bounds

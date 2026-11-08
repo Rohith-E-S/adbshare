@@ -285,23 +285,43 @@ impl Mirror {
         }
 
         let frame_len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        // Tear check: skip the frame if the writer is mid-publish (the next
+        // notification will carry a consistent frame).
+        if let Some(snap) = reader.try_snapshot()
+            && (snap.seq != notif.seq || snap.slot != notif.slot)
+        {
+            return;
+        }
         let Ok(slot_bytes) = reader.read_slot_exact(notif.slot, frame_len) else {
             return;
         };
-
-        // Construct image::RgbaImage from BGRA bytes (which GPUI Vulkan texture expects)
-        if let Some(rgba) = image::RgbaImage::from_raw(w, h, slot_bytes.to_vec()) {
-            let frame = image::Frame::new(rgba);
-            let img = Arc::new(RenderImage::new(vec![frame]));
-            if self.width != w || self.height != h {
-                self.width = w;
-                self.height = h;
-            }
-            self.previous_frame = self.current_frame.take();
-            self.current_frame = Some(img);
-            self.frames = self.frames.saturating_add(1);
-            cx.notify();
-        }
+        // Copy out (must happen before the writer overwrites the slot), then
+        // decode off the GPUI thread.
+        // No R/B swap: ffmpeg emits BGRA (-pix_fmt bgra) for GPUI's Bgra8Unorm.
+        let pixels = slot_bytes.to_vec();
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let img = cx
+                .background_executor()
+                .spawn(async move {
+                    image::RgbaImage::from_raw(w, h, pixels)
+                        .map(|rgba| Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+                })
+                .await;
+            let _ = me.update(cx, |this, cx| {
+                if let Some(img) = img {
+                    if this.width != w || this.height != h {
+                        this.width = w;
+                        this.height = h;
+                    }
+                    this.previous_frame = this.current_frame.take();
+                    this.current_frame = Some(img);
+                    this.frames = this.frames.saturating_add(1);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn toggle_screen_off(&mut self, cx: &mut Context<Self>) {
@@ -391,9 +411,22 @@ impl Mirror {
         let Some(device) = self.device.clone() else {
             return;
         };
-        let options = serde_json::json!({ "preset": self.preset, "audio": false }).to_string();
+        // Audio defaults on (daemon default); no toggle is exposed yet.
+        let options = serde_json::json!({ "preset": self.preset, "audio": true }).to_string();
         let me = cx.entity();
         cx.spawn(async move |_this, cx| {
+            // Attach to an already-running session instead of killing it
+            // (e.g. a floating window on the same device).
+            if let Ok(st) = daemon::remote_status(&device).await
+                && st.get("running").and_then(|r| r.as_bool()) == Some(true)
+            {
+                let _ = me.update(cx, |this, cx| {
+                    apply_status(this, &st, cx);
+                    this.note("Mirror attached to running session", cx);
+                    this.start_poll(cx);
+                });
+                return;
+            }
             let result = daemon::start_remote(&device, &options).await;
             let _ = me.update(cx, |this, cx| match result {
                 Ok(info) => {

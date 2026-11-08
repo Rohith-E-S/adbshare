@@ -153,6 +153,35 @@ pub enum ShmError {
 
     #[error("shared memory pool is mapped read-only")]
     ReadOnly,
+
+    #[error("invalid slot configuration: slot_size {slot_size}, num_slots {num_slots}")]
+    InvalidSlotConfig { slot_size: u32, num_slots: u32 },
+
+    #[error("invalid sequence number {seq}: must be > 0")]
+    InvalidSeq { seq: u64 },
+}
+
+/// Validate slot configuration read from an untrusted header / arguments.
+fn validate_slot_config(slot_size: u32, num_slots: u32) -> Result<(), ShmError> {
+    if !(1..=64).contains(&num_slots) || slot_size == 0 || slot_size > 64 * 1024 * 1024 {
+        return Err(ShmError::InvalidSlotConfig {
+            slot_size,
+            num_slots,
+        });
+    }
+    Ok(())
+}
+
+/// `SHM_HEADER_SIZE + num_slots * slot_size` with overflow checking.
+fn expected_len(num_slots: u32, slot_size: u32) -> Result<usize, ShmError> {
+    (num_slots as u64)
+        .checked_mul(slot_size as u64)
+        .and_then(|slots| (SHM_HEADER_SIZE as u64).checked_add(slots))
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or(ShmError::InvalidSlotConfig {
+            slot_size,
+            num_slots,
+        })
 }
 
 #[allow(dead_code)]
@@ -177,6 +206,7 @@ unsafe impl Sync for ShmPool {}
 impl ShmPool {
     /// Create a new shared memory pool file backing a writable triple-buffer region.
     pub fn create(path: &Path, slot_size: u32, num_slots: u32) -> Result<Self, ShmError> {
+        validate_slot_config(slot_size, num_slots)?;
         let total_size = (SHM_HEADER_SIZE as u64)
             .checked_add(
                 (num_slots as u64)
@@ -271,9 +301,8 @@ impl ShmPool {
 
         let slot_size = header.slot_size;
         let num_slots = header.num_slots;
-        let expected = SHM_HEADER_SIZE
-            .checked_add((num_slots as usize) * (slot_size as usize))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
+        validate_slot_config(slot_size, num_slots)?;
+        let expected = expected_len(num_slots, slot_size)?;
 
         if len < expected {
             return Err(ShmError::FileTooSmall {
@@ -326,9 +355,8 @@ impl ShmPool {
 
         let slot_size = header.slot_size;
         let num_slots = header.num_slots;
-        let expected = SHM_HEADER_SIZE
-            .checked_add((num_slots as usize) * (slot_size as usize))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "overflow"))?;
+        validate_slot_config(slot_size, num_slots)?;
+        let expected = expected_len(num_slots, slot_size)?;
 
         if len < expected {
             return Err(ShmError::FileTooSmall {
@@ -375,6 +403,9 @@ impl ShmPool {
     /// Calculate next writable slot index for triple-buffering.
     #[inline]
     pub fn next_writable_slot(&self) -> u32 {
+        if self.num_slots == 0 {
+            return 0;
+        }
         let current = self.header().head_slot.load(Ordering::Relaxed);
         (current + 1) % self.num_slots
     }
@@ -387,7 +418,23 @@ impl ShmPool {
                 num_slots: self.num_slots,
             });
         }
-        let offset = SHM_HEADER_SIZE + (slot as usize) * (self.slot_size as usize);
+        let offset = (slot as usize)
+            .checked_mul(self.slot_size as usize)
+            .and_then(|o| SHM_HEADER_SIZE.checked_add(o))
+            .ok_or(ShmError::InvalidSlotConfig {
+                slot_size: self.slot_size,
+                num_slots: self.num_slots,
+            })?;
+        if offset
+            .checked_add(self.slot_size as usize)
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(ShmError::FileTooSmall {
+                expected: offset + self.slot_size as usize,
+                actual: self.len,
+                num_slots: self.num_slots,
+            });
+        }
         std::sync::atomic::fence(Ordering::Acquire);
         let slice =
             unsafe { std::slice::from_raw_parts(self.ptr.add(offset), self.slot_size as usize) };
@@ -423,7 +470,23 @@ impl ShmPool {
                 num_slots: self.num_slots,
             });
         }
-        let offset = SHM_HEADER_SIZE + (slot as usize) * (self.slot_size as usize);
+        let offset = (slot as usize)
+            .checked_mul(self.slot_size as usize)
+            .and_then(|o| SHM_HEADER_SIZE.checked_add(o))
+            .ok_or(ShmError::InvalidSlotConfig {
+                slot_size: self.slot_size,
+                num_slots: self.num_slots,
+            })?;
+        if offset
+            .checked_add(self.slot_size as usize)
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(ShmError::FileTooSmall {
+                expected: offset + self.slot_size as usize,
+                actual: self.len,
+                num_slots: self.num_slots,
+            });
+        }
         let slice = unsafe {
             std::slice::from_raw_parts_mut(self.ptr.add(offset), self.slot_size as usize)
         };
@@ -462,8 +525,13 @@ impl ShmPool {
         }
         let header = self.header();
 
-        let complete_ver = seq.checked_mul(2).unwrap_or(u64::MAX - 1);
-        let in_progress_ver = if seq == 0 { 1 } else { complete_ver - 1 };
+        if seq == 0 {
+            return Err(ShmError::InvalidSeq { seq });
+        }
+        // Even completion version, odd in-progress version. Saturate at
+        // u64::MAX-1 (even) so u64::MAX does not wrap to even/even.
+        let complete_ver = seq.checked_mul(2).unwrap_or(u64::MAX - 1) & !1;
+        let in_progress_ver = complete_ver.saturating_sub(1);
 
         // 1. Mark update in progress with odd version
         header.head_seq.store(in_progress_ver, Ordering::Release);
@@ -487,46 +555,57 @@ impl ShmPool {
     /// Obtain an atomic, tear-free snapshot of current frame metadata via a seqlock loop.
     ///
     /// Retries if an update is actively in progress (odd sequence counter) or if
-    /// the sequence counter changed while reading fields.
+    /// the sequence counter changed while reading fields. Bounded: if the
+    /// writer died mid-publish (permanently odd), returns the last readable
+    /// metadata instead of spinning forever.
     pub fn snapshot(&self) -> FrameSnapshot {
-        let header = self.header();
-        let mut spins = 0u32;
-        loop {
-            let v1 = header.head_seq.load(Ordering::Acquire);
-            if (v1 & 1) != 0 {
-                spins = spins.wrapping_add(1);
-                if spins > 32 {
-                    std::thread::yield_now();
-                } else {
-                    std::hint::spin_loop();
-                }
-                continue;
+        for i in 0..10_000u32 {
+            if let Some(s) = self.try_snapshot() {
+                return s;
             }
-            std::sync::atomic::fence(Ordering::Acquire);
-
-            let slot = header.head_slot.load(Ordering::Relaxed);
-            let width = header.width.load(Ordering::Relaxed);
-            let height = header.height.load(Ordering::Relaxed);
-            let stride = header.stride.load(Ordering::Relaxed);
-
-            std::sync::atomic::fence(Ordering::Acquire);
-
-            let v2 = header.head_seq.load(Ordering::Acquire);
-            if v1 == v2 {
-                return FrameSnapshot {
-                    seq: v1 / 2,
-                    slot,
-                    width,
-                    height,
-                    stride,
-                };
-            }
-            spins = spins.wrapping_add(1);
-            if spins > 32 {
+            if i > 32 {
                 std::thread::yield_now();
             } else {
                 std::hint::spin_loop();
             }
+        }
+        self.snapshot_stale()
+    }
+
+    /// Non-blocking seqlock attempt. Returns `None` if the writer is mid-publish.
+    pub fn try_snapshot(&self) -> Option<FrameSnapshot> {
+        let header = self.header();
+        let v1 = header.head_seq.load(Ordering::Acquire);
+        if (v1 & 1) != 0 {
+            return None;
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        let slot = header.head_slot.load(Ordering::Relaxed);
+        let width = header.width.load(Ordering::Relaxed);
+        let height = header.height.load(Ordering::Relaxed);
+        let stride = header.stride.load(Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Acquire);
+        let v2 = header.head_seq.load(Ordering::Acquire);
+        if v1 != v2 {
+            return None;
+        }
+        Some(FrameSnapshot {
+            seq: v1 / 2,
+            slot,
+            width,
+            height,
+            stride,
+        })
+    }
+
+    fn snapshot_stale(&self) -> FrameSnapshot {
+        let header = self.header();
+        FrameSnapshot {
+            seq: header.head_seq.load(Ordering::Acquire) / 2,
+            slot: header.head_slot.load(Ordering::Relaxed),
+            width: header.width.load(Ordering::Relaxed),
+            height: header.height.load(Ordering::Relaxed),
+            stride: header.stride.load(Ordering::Relaxed),
         }
     }
 
@@ -691,6 +770,12 @@ impl ShmReader {
     #[inline]
     pub fn snapshot(&self) -> FrameSnapshot {
         self.pool.snapshot()
+    }
+
+    /// Non-blocking snapshot; `None` if the writer is mid-publish (torn).
+    #[inline]
+    pub fn try_snapshot(&self) -> Option<FrameSnapshot> {
+        self.pool.try_snapshot()
     }
 
     /// Latest published head tuple: `(seq, slot)`.
@@ -895,6 +980,28 @@ mod tests {
         assert_eq!(valid_snap.frame_bytes(), 1080 * 7680);
         assert_eq!(valid_snap.dimensions(), (1920, 1080, 7680));
         assert_eq!(valid_snap.head(), (15, 2));
+    }
+
+    #[test]
+    fn create_rejects_invalid_slot_config() {
+        let path = std::env::temp_dir().join(format!("test_shm_bad_{}.shm", std::process::id()));
+        assert!(ShmWriter::create(&path, 1024, 0).is_err());
+        assert!(ShmWriter::create(&path, 1024, 65).is_err());
+        assert!(ShmWriter::create(&path, 0, 3).is_err());
+        assert!(ShmWriter::create(&path, u32::MAX, 3).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn publish_rejects_seq_zero_and_max() {
+        let path = std::env::temp_dir().join(format!("test_shm_seq_{}.shm", std::process::id()));
+        let writer = ShmWriter::create(&path, 1024, 3).expect("create");
+        assert!(writer.publish_frame(0, 640, 480, 0).is_err());
+        assert!(writer.publish_frame(0, 640, 480, u64::MAX).is_ok());
+        // complete version must stay odd/even-disciplined (not even/even)
+        let snap = writer.snapshot();
+        assert!(snap.is_valid());
+        let _ = writer.pool().unlink();
     }
 
     #[test]

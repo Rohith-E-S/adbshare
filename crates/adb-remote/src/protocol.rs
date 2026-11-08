@@ -172,6 +172,8 @@ impl PacketReader {
             }
             let size = u32::from_be_bytes([self.buf[8], self.buf[9], self.buf[10], self.buf[11]]);
             if size > MAX_PACKET_SIZE {
+                // Drain the bad header so the reader is not permanently wedged.
+                self.buf.clear();
                 return Err(ProtocolError::PacketTooLarge(size));
             }
             if self.buf.len() < 12 + size as usize {
@@ -447,6 +449,20 @@ mod tests {
             got.extend(reader.feed(chunk).unwrap());
         }
         assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn oversize_packet_resets_reader() {
+        let mut reader = PacketReader::new();
+        let mut hdr = vec![0u8; 12];
+        hdr[8..12].copy_from_slice(&(MAX_PACKET_SIZE + 1).to_be_bytes());
+        assert_eq!(
+            reader.feed(&hdr),
+            Err(ProtocolError::PacketTooLarge(MAX_PACKET_SIZE + 1))
+        );
+        // Reader must accept fresh valid packets (not wedged).
+        let packets = reader.feed(&media_packet(1, false, true, b"ok")).unwrap();
+        assert_eq!(packets.len(), 1);
     }
 
     #[test]

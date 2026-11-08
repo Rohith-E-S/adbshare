@@ -130,6 +130,9 @@ struct State {
     logcat: HashMap<String, LogcatStream>,
     /// Real-time remote-control sessions, serial -> session. At most one per device.
     remote: HashMap<String, RemoteSession>,
+    /// Serials with a `start_remote` in flight (placeholder reservation taken
+    /// before any `await` so concurrent starts cannot race).
+    remote_starting: std::collections::HashSet<String>,
     /// Last error recorded for a device's remote session, serial -> error message.
     remote_errors: HashMap<String, String>,
     /// Screen recordings in progress, serial -> remote path + start time.
@@ -193,6 +196,9 @@ struct RemoteSession {
     device_name: String,
     preset: String,
     audio: bool,
+    /// Pid of the local `adb shell` server child, so `stop_remote` can
+    /// SIGTERM it even if the device is disconnected (monitor owns the wait).
+    server_pid: Option<u32>,
 }
 
 /// Live counters updated by the proxy task, read by `remote_status`.
@@ -1223,17 +1229,19 @@ fn parse_remote_options(options_json: &str) -> adb_remote::SessionOptions {
     };
     let mut opts = adb_remote::SessionOptions::new(preset);
     opts.audio = v.get("audio").and_then(|a| a.as_bool()).unwrap_or(true);
-    if let Some(shm_path) = v.get("shm_path").and_then(|s| s.as_str()) {
-        opts.shm_path = Some(shm_path.to_string());
-    }
+    // `shm_path` from the client is deliberately ignored: the path is always
+    // derived under $XDG_RUNTIME_DIR (see run_server_and_connect). Accepting
+    // it would allow arbitrary file truncate/delete via symlink following.
     if let Some(max_size) = v.get("max_size").and_then(|n| n.as_u64()) {
-        opts.preset.max_size = max_size as u32;
+        opts.preset.max_size = u32::try_from(max_size).unwrap_or(1920).clamp(320, 2560);
     }
     if let Some(max_fps) = v.get("max_fps").and_then(|n| n.as_u64()) {
-        opts.preset.max_fps = max_fps as u32;
+        opts.preset.max_fps = u32::try_from(max_fps).unwrap_or(60).clamp(0, 120);
     }
     if let Some(bitrate) = v.get("bit_rate").and_then(|n| n.as_u64()) {
-        opts.preset.bit_rate = bitrate as u32;
+        opts.preset.bit_rate = u32::try_from(bitrate)
+            .unwrap_or(8_000_000)
+            .clamp(0, 32_000_000);
     }
     opts
 }
@@ -1404,10 +1412,27 @@ async fn start_remote_session_inner(
     serial: &str,
     opts: adb_remote::SessionOptions,
 ) -> anyhow::Result<serde_json::Value> {
-    // One session per device.
-    if state.lock().remote.contains_key(serial) {
-        anyhow::bail!("remote control is already running for this device");
+    // One session per device, with reservation taken before any await so two
+    // concurrent starts cannot both pass the check and orphan the first.
+    {
+        let mut s = state.lock();
+        if s.remote.contains_key(serial) || s.remote_starting.contains(serial) {
+            anyhow::bail!("remote control is already running for this device");
+        }
+        s.remote_starting.insert(serial.to_string());
     }
+    // Clear the reservation on every exit path (success transfers ownership to
+    // `remote.insert` at the end of run_server_and_connect; failure must free it).
+    let res = start_remote_session_inner_inner(state, serial, opts).await;
+    state.lock().remote_starting.remove(serial);
+    res
+}
+
+async fn start_remote_session_inner_inner(
+    state: &Arc<Mutex<State>>,
+    serial: &str,
+    opts: adb_remote::SessionOptions,
+) -> anyhow::Result<serde_json::Value> {
     // The device must be set up (proxy reachable) before we start.
     client_for(state, serial).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -1494,12 +1519,23 @@ async fn start_remote_session_inner(
         &version,
         preset,
         opts.audio,
-        opts.shm_path,
     )
     .await;
 
     if run_res.is_err() {
         teardown_remote_tunnel(serial, host_port, tunnel_forward, scid).await;
+        // Scoped pkill: only our session's server (scid-scoped), not every
+        // scrcpy instance on the device.
+        let _ = adb_run(
+            &[
+                "-s",
+                serial,
+                "shell",
+                &format!("pkill -f 'scid={scid:08x}'"),
+            ],
+            Duration::from_secs(5),
+        )
+        .await;
         let safe = sanitize_mount_name(serial).unwrap_or_else(|| "device".to_string());
         if let Some(remote_dir) = dirs::runtime_dir()
             .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
@@ -1574,7 +1610,6 @@ async fn run_server_and_connect(
     version: &str,
     preset: adb_remote::QualityPreset,
     audio: bool,
-    shm_path_override: Option<String>,
 ) -> anyhow::Result<serde_json::Value> {
     let audio_args = if audio {
         "audio=true audio_codec=raw"
@@ -1797,10 +1832,8 @@ async fn run_server_and_connect(
     std::fs::create_dir_all(&remote_dir)?;
     let safe = sanitize_mount_name(serial).unwrap_or_else(|| "device".to_string());
     let socket_path = remote_dir.join(format!("{safe}.sock"));
-    let shm_path = match shm_path_override {
-        Some(p) => PathBuf::from(p),
-        None => remote_dir.join(format!("{safe}-frame.shm")),
-    };
+    // Always daemon-derived under $XDG_RUNTIME_DIR; never client-supplied.
+    let shm_path = remote_dir.join(format!("{safe}-frame.shm"));
     let frame_path = shm_path.clone();
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&shm_path);
@@ -1863,6 +1896,7 @@ async fn run_server_and_connect(
     };
 
     // Monitor the server process: when it exits, tear the session down.
+    let server_pid = child.id();
     let state_for_monitor = state.clone();
     let serial_owned = serial.to_string();
     let last_stderr_monitor = last_stderr.clone();
@@ -1921,6 +1955,7 @@ async fn run_server_and_connect(
             device_name: device_name.clone(),
             preset: preset.name.to_string(),
             audio: audio_active,
+            server_pid,
         },
     );
 
@@ -2177,10 +2212,11 @@ async fn remote_proxy_task(
         Ok(w) => w,
         Err(e) => {
             error!(serial, error = %e, "failed to create shared memory pool");
-            state.lock().remote_errors.insert(
-                serial.clone(),
-                format!("failed to create shared memory pool: {e}"),
-            );
+            let msg = format!("failed to create shared memory pool: {e}");
+            // Clear the session so remote_status does not report running forever.
+            state.lock().remote.remove(&serial);
+            state.lock().remote_errors.insert(serial.clone(), msg);
+            let _ = std::fs::remove_file(&shm_path);
             return;
         }
     };
@@ -2257,10 +2293,19 @@ async fn remote_proxy_task(
         }
     } else {
         error!("ffmpeg failed to spawn or is not installed on PATH");
+        // Clear the session so remote_status does not report running forever.
+        let session = state.lock().remote.remove(&serial);
         state.lock().remote_errors.insert(
             serial.clone(),
             "ffmpeg failed to spawn (is ffmpeg installed on PATH?)".into(),
         );
+        if let Some(s) = session {
+            teardown_remote_tunnel(&serial, s.host_port, s.tunnel_forward, s.scid).await;
+            let _ = std::fs::remove_file(&s.socket_path);
+            let _ = std::fs::remove_file(&s.shm_path);
+        }
+        drop(stdout_tx);
+        let _ = reader_handle.await;
         return;
     }
     let mut cached_config: Option<Vec<u8>> = None;
@@ -2321,7 +2366,9 @@ async fn remote_proxy_task(
                                                     }
                                                 }
                                             }
-                                            cached_config = Some(data.clone());
+                                            if data.len() <= (1 << 20) {
+                                                cached_config = Some(data.clone());
+                                            }
                                         }
 
                                         if ffmpeg.is_none()
@@ -2358,6 +2405,12 @@ async fn remote_proxy_task(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         control_buf.extend_from_slice(&control_read_buf[..n]);
+                        // Bound the buffer: largest valid device message is a
+                        // 1 MiB clipboard; anything bigger is malformed.
+                        if control_buf.len() > (1 << 20) + 5 {
+                            control_buf.clear();
+                            break;
+                        }
                         loop {
                             if control_buf.is_empty() {
                                 break;
@@ -2554,6 +2607,16 @@ async fn stop_remote_session(state: &Arc<Mutex<State>>, serial: &str) {
     if let Some(session) = session {
         info!(serial, "remote session stopping");
         let _ = session.stop.send(());
+        // Kill the local `adb shell` child first so the monitor's wait()
+        // returns even if the device is disconnected. Best-effort SIGTERM.
+        if let Some(pid) = session.server_pid {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         teardown_remote_tunnel(
             serial,
             session.host_port,
@@ -2564,12 +2627,13 @@ async fn stop_remote_session(state: &Arc<Mutex<State>>, serial: &str) {
         let _ = std::fs::remove_file(&session.socket_path);
         let _ = std::fs::remove_file(&session.shm_path);
         let _ = std::fs::remove_file(&session.frame_path);
+        // Scoped to this session's scid, not every scrcpy instance.
         let _ = adb_run(
             &[
                 "-s",
                 serial,
                 "shell",
-                &format!("pkill -f {}", adb_remote::SERVER_REMOTE_PATH),
+                &format!("pkill -f 'scid={:08x}'", session.scid),
             ],
             Duration::from_secs(5),
         )
@@ -4924,5 +4988,21 @@ mod tests {
         let err = extract_scrcpy_error(&lines).unwrap();
         assert!(err.contains("AbstractMethodError"));
         assert!(!err.starts_with("Aborted"));
+    }
+
+    #[test]
+    fn test_parse_remote_options_ignores_client_shm_path_and_clamps() {
+        // Client-supplied shm_path must never be honoured (arbitrary file
+        // truncate via symlink following). Untrusted ints must be clamped.
+        let opts = parse_remote_options(
+            r#"{"preset":"balanced","audio":true,"shm_path":"/home/user/.bashrc","max_size":999999,"max_fps":9999,"bit_rate":999999999}"#,
+        );
+        assert_eq!(opts.preset.max_size, 2560);
+        assert_eq!(opts.preset.max_fps, 120);
+        assert_eq!(opts.preset.bit_rate, 32_000_000);
+        assert!(opts.audio);
+        // Even a valid-looking path is ignored; SessionOptions has no field.
+        let opts2 = parse_remote_options(r#"{"shm_path":"/run/user/1000/x.shm","max_size":1}"#);
+        assert_eq!(opts2.preset.max_size, 320);
     }
 }

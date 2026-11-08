@@ -168,8 +168,13 @@ impl FrameReader {
         Self::default()
     }
 
-    /// Feed bytes; returns every complete frame.
+    /// Feed bytes; returns every complete frame. Oversize headers clear the
+    /// buffer (un-wedge) so one bad frame does not DoS the connection.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        if self.buf.len().saturating_add(chunk.len()) > (MAX_FRAME as usize) + 4 {
+            // Unbounded growth from incomplete/oversize frames: drop it.
+            self.buf.clear();
+        }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         loop {
@@ -177,7 +182,11 @@ impl FrameReader {
                 break;
             }
             let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
-            if len > MAX_FRAME || self.buf.len() < 4 + len as usize {
+            if len > MAX_FRAME {
+                self.buf.clear();
+                break;
+            }
+            if self.buf.len() < 4 + len as usize {
                 break;
             }
             out.push(self.buf[4..4 + len as usize].to_vec());

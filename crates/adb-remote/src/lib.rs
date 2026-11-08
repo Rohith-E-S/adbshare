@@ -132,12 +132,17 @@ pub const PRESET_UNLIMITED: QualityPreset = QualityPreset {
 pub const PRESETS: &[QualityPreset] = &[PRESET_PERFORMANCE, PRESET_BALANCED, PRESET_QUALITY];
 
 /// Options for starting a remote session (serialised as JSON over D-Bus).
+///
+/// The shared-memory path is intentionally not part of these options: it is
+/// always derived by the daemon under `$XDG_RUNTIME_DIR/adbshare/remote/`.
+/// Accepting a client-supplied path would let any session-bus caller point
+/// the writer at an arbitrary user file (symlink-following `truncate`).
+//  Note: no `shm_path` field — path is daemon-derived only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionOptions {
     pub preset: QualityPreset,
     pub audio: bool,
     pub server_version: String,
-    pub shm_path: Option<String>,
 }
 
 impl SessionOptions {
@@ -146,19 +151,12 @@ impl SessionOptions {
             preset,
             audio: true,
             server_version: server_version(),
-            shm_path: None,
         }
     }
 
     /// Enable or disable audio forwarding.
     pub fn with_audio(mut self, audio: bool) -> Self {
         self.audio = audio;
-        self
-    }
-
-    /// Set an explicit shared memory file path.
-    pub fn with_shm_path(mut self, shm_path: impl Into<String>) -> Self {
-        self.shm_path = Some(shm_path.into());
         self
     }
 
@@ -185,7 +183,15 @@ pub fn server_version() -> String {
 
 /// Generate a random 31-bit session id (`scid`), as scrcpy does, so several
 /// sessions can target the same device without socket-name collisions.
+/// Reads 4 bytes from `/dev/urandom` (fallback: xorshift on time+pid).
 pub fn random_scid() -> i32 {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+        && f.read_exact(&mut buf).is_ok()
+    {
+        return ((u32::from_ne_bytes(buf)) & 0x7fff_ffff) as i32;
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -202,7 +208,7 @@ pub fn random_scid() -> i32 {
 
 /// Abstract socket name for a session (`scrcpy_<scid>` as 8 hex digits).
 pub fn socket_name(scid: i32) -> String {
-    format!("{SOCKET_NAME_PREFIX}_{scid:08x}")
+    format!("{SOCKET_NAME_PREFIX}_{:08x}", (scid as u32) & 0x7fff_ffff)
 }
 
 /// Live stream statistics reported by the daemon.
@@ -250,18 +256,21 @@ mod tests {
     fn session_options_builders() {
         let default_opts = SessionOptions::new(PRESET_PERFORMANCE);
         assert!(default_opts.audio);
-        assert_eq!(default_opts.shm_path, None);
 
         let opts = SessionOptions::new(PRESET_PERFORMANCE)
             .with_audio(false)
-            .with_shm_path("/run/user/1000/custom.shm")
             .with_max_fps(90);
         assert_eq!(opts.preset.max_fps, 90);
         assert!(!opts.audio);
-        assert_eq!(opts.shm_path.as_deref(), Some("/run/user/1000/custom.shm"));
         assert!(!opts.is_unlimited_fps());
 
         let opts_unlimited = opts.with_max_fps(0);
         assert!(opts_unlimited.is_unlimited_fps());
+    }
+    #[test]
+    fn session_options_have_no_shm_path_field() {
+        // `shm_path` is daemon-derived only; there is no client override.
+        let opts = SessionOptions::new(PRESET_BALANCED);
+        assert_eq!(opts.server_version, server_version());
     }
 }

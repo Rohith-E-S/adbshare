@@ -619,14 +619,11 @@ fn test_frame_reader_corrupt_length_prefix_behavior() {
     let bad_len = (MAX_FRAME + 1).to_be_bytes();
     assert!(reader.feed(&bad_len).is_empty());
 
-    // Subsequent valid frames fed into the reader will wait because the reader's
-    // internal buffer holds the oversized length at offset 0
+    // Oversize headers now clear the buffer (un-wedge), so subsequent
+    // valid frames are processed normally.
     let valid_frame = frame(b"valid message");
     let got = reader.feed(&valid_frame);
-    assert!(
-        got.is_empty(),
-        "Reader should stall on oversized length header without crashing"
-    );
+    assert_eq!(got, vec![b"valid message".to_vec()]);
 
     // Fresh reader processes valid frames normally
     let mut fresh_reader = FrameReader::new();
