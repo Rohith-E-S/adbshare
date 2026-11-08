@@ -6,19 +6,30 @@
 
 ```sh
 # Arch
-sudo pacman -S vulkan-icd-loader libxkbcommon wayland libx11 libxext fontconfig fuse3 libusb base-devel
+sudo pacman -S vulkan-icd-loader libxkbcommon wayland libx11 libxext fontconfig fuse3 libusb ffmpeg base-devel
 
 # Debian/Ubuntu
-sudo apt install libvulkan-dev libxkbcommon-dev libwayland-dev libx11-dev libxext-dev libfontconfig1-dev libfuse3-dev libusb-1.0-0-dev build-essential
+sudo apt install libvulkan-dev libxkbcommon-dev libwayland-dev libx11-dev libxext-dev libfontconfig1-dev libfuse3-dev libusb-1.0-0-dev ffmpeg build-essential
 
 # Fedora
-sudo dnf install vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel libX11-devel libXext-devel fontconfig-devel freetype-devel fuse3-devel libusb1-devel gcc
+sudo dnf install vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel libX11-devel libXext-devel fontconfig-devel freetype-devel fuse3-devel libusb1-devel ffmpeg-free gcc
 ```
 
 `libxkbcommon-x11-devel` is not optional on Fedora: `gpui` enables
 xkbcommon's `x11` feature, and the link fails with
 `unable to find library -lxkbcommon-x11` without it. The Arch and Debian
 packages ship that library in the main `libxkbcommon` package.
+
+### Screen mirroring requirements
+
+Screen mirroring requires `ffmpeg` on PATH and `scrcpy-server 3.3`:
+
+```sh
+# Place scrcpy-server version 3.3 jar into user data directory:
+mkdir -p ~/.local/share/adbshare
+curl -L -o ~/.local/share/adbshare/scrcpy-server.jar \
+  https://github.com/Genymobile/scrcpy/releases/download/v3.3/scrcpy-server-v3.3
+```
 
 ### Rust
 

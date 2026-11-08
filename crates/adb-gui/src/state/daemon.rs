@@ -117,7 +117,6 @@ pub trait Manager {
     async fn start_remote(&self, device: &str, options_json: &str) -> zbus::Result<String>;
     async fn stop_remote(&self, device: &str) -> zbus::Result<bool>;
     async fn remote_status(&self, device: &str) -> zbus::Result<String>;
-    async fn remote_frame(&self, device: &str) -> zbus::Result<String>;
 }
 
 /// Handle to the pinned tokio runtime.
@@ -842,6 +841,15 @@ pub async fn stop_remote(device: &str) -> Result<bool, String> {
     .await
 }
 
+/// Fire-and-forget stop of the remote session on the tokio runtime (e.g. from drop handlers).
+pub fn spawn_stop_remote(device: String) {
+    if let Ok(handle) = runtime() {
+        handle.spawn(async move {
+            let _ = stop_remote(&device).await;
+        });
+    }
+}
+
 /// Live status of the remote-control session as JSON.
 pub async fn remote_status(device: &str) -> Result<serde_json::Value, String> {
     let device = device.to_string();
@@ -853,64 +861,27 @@ pub async fn remote_status(device: &str) -> Result<serde_json::Value, String> {
     .await
 }
 
-/// Capture a preview frame into the runtime directory without polluting ~/Pictures.
-#[allow(dead_code)]
-pub async fn remote_frame(device: &str) -> Result<String, String> {
-    let device = device.to_string();
-    dispatch(move || async move {
-        let proxy = get_manager().await?;
-        Ok(proxy.remote_frame(&device).await?)
-    })
-    .await
+/// Incoming remote event from the daemon over the control socket.
+#[derive(Clone, Debug)]
+pub enum RemoteEvent {
+    Frame(adb_remote::proxy::FrameNotification),
+    Clipboard(String),
 }
 
-/// Send a sequence of high-frequency control messages over a single Unix socket connection.
-pub async fn send_remote_controls(
-    socket_path: std::path::PathBuf,
-    msgs: Vec<adb_remote::input::ControlMessage>,
-    delay_between_ms: u64,
-) -> Result<(), String> {
-    dispatch(move || async move {
-        use tokio::io::AsyncWriteExt;
-        let mut stream = tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect to {}: {e}", socket_path.display()))?;
-        let len = msgs.len();
-        for (i, msg) in msgs.into_iter().enumerate() {
-            let payload = msg.serialize();
-            let frame = adb_remote::proxy::frame(&payload);
-            stream
-                .write_all(&frame)
-                .await
-                .map_err(|e| anyhow::anyhow!("write to control socket: {e}"))?;
-            if delay_between_ms > 0 && i + 1 < len {
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_between_ms)).await;
-            }
-        }
-        let _ = stream.flush().await;
-        Ok(())
-    })
-    .await
-}
-
-/// Send a high-frequency control message directly to the device's Unix socket proxy.
-#[allow(dead_code)]
-pub async fn send_remote_control(
-    socket_path: std::path::PathBuf,
-    msg: adb_remote::input::ControlMessage,
-) -> Result<(), String> {
-    send_remote_controls(socket_path, vec![msg], 0).await
+/// Handle to the active remote control worker.
+pub struct RemoteControlHandle {
+    pub tx: async_channel::Sender<adb_remote::input::ControlMessage>,
+    pub rx: async_channel::Receiver<RemoteEvent>,
 }
 
 /// Open a persistent background worker connected to the remote control Unix socket.
 ///
-/// Returns an unbounded sender that can be used from GPUI handlers without blocking.
+/// Returns a [`RemoteControlHandle`] with a control message sender and incoming event receiver.
 /// Closing or dropping the sender terminates the worker task and closes the socket.
-pub fn open_remote_control(
-    socket_path: std::path::PathBuf,
-) -> Result<async_channel::Sender<adb_remote::input::ControlMessage>, String> {
+pub fn open_remote_control(socket_path: std::path::PathBuf) -> Result<RemoteControlHandle, String> {
     let handle = runtime().map_err(|err| err.to_string())?;
     let (tx, rx) = async_channel::unbounded::<adb_remote::input::ControlMessage>();
+    let (event_tx, event_rx) = async_channel::bounded::<RemoteEvent>(16);
     handle.spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tracing::info!(path = %socket_path.display(), "remote control worker starting");
@@ -920,7 +891,8 @@ pub fn open_remote_control(
         } else {
             tracing::warn!("remote control worker failed initial socket connect");
         }
-        let mut drain_buf = [0u8; 4096];
+        let mut drain_buf = [0u8; 8192];
+        let mut frame_reader = adb_remote::proxy::FrameReader::new();
         loop {
             if let Some(ref mut s) = stream {
                 tokio::select! {
@@ -939,8 +911,27 @@ pub fn open_remote_control(
                                 tracing::warn!("remote control socket closed by peer");
                                 stream = None;
                             }
-                            Ok(_n) => {
-                                // Drained metadata/clipboard from daemon without blocking
+                            Ok(n) => {
+                                for payload in frame_reader.feed(&drain_buf[..n]) {
+                                    if payload.is_empty() {
+                                        continue;
+                                    }
+                                    match payload[0] {
+                                        adb_remote::proxy::TAG_FRAME => {
+                                            if let Some(notif) = adb_remote::proxy::FrameNotification::parse(&payload) {
+                                                let _ = event_tx.try_send(RemoteEvent::Frame(notif));
+                                            }
+                                        }
+                                        adb_remote::proxy::TAG_CONTROL => {
+                                            if let Some((adb_remote::protocol::DeviceMessage::Clipboard(text), _)) =
+                                                adb_remote::protocol::parse_device_message(&payload[1..])
+                                            {
+                                                let _ = event_tx.try_send(RemoteEvent::Clipboard(text));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
                     }
@@ -968,7 +959,7 @@ pub fn open_remote_control(
         }
         tracing::info!("remote control worker terminated");
     });
-    Ok(tx)
+    Ok(RemoteControlHandle { tx, rx: event_rx })
 }
 
 // ── Wireless pairing ─────────────────────────────────────────────────────────

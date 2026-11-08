@@ -7,3 +7,5 @@ description = "Wire protocol for real-time phone remote control (video/audio/con
 
 [dependencies]
 thiserror.workspace = true
+memmap2 = "0.9"
+
