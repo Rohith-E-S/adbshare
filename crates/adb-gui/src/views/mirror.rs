@@ -163,7 +163,7 @@ impl Mirror {
         }
     }
 
-    /// Content origin from the app root (sidebar + topbar offset), used to
+    /// Content origin from the app root (rail + header offset), used to
     /// turn a window-relative click into frame-relative coordinates.
     pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, _cx: &mut Context<Self>) {
         self.viewport_x = x;

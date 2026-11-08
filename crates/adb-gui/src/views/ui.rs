@@ -128,10 +128,10 @@ pub fn icon_button_disabled(t: &Palette, icon: &'static str, size: f32) -> Div {
         .child(icons::icon(icon, size * 0.53, icon_tint(icon, t)))
 }
 
-/// A flat group of 2–4 icon buttons on the top bar.
+/// A flat group of 2–4 icon buttons in the file toolbar.
 ///
 /// No fill, no outline: a bordered pill around every group is what made the
-/// top bar read as a web dashboard rather than a file manager's toolbar,
+/// file toolbar read as a web dashboard rather than a file manager's toolbar,
 /// where Nautilus and its peers put bare buttons separated by hairlines.
 /// Grouping reads from the separators between buttons and the gaps between
 /// groups, so the palette's capsule tokens are gone. The height and the
@@ -144,46 +144,6 @@ pub fn capsule(_t: &Palette, children: impl IntoIterator<Item = AnyElement>) -> 
         .px(px(2.0))
         .rounded(px(theme::RADIUS_CAPSULE))
         .children(children)
-}
-
-/// A 1px vertical rule between buttons in a group.
-pub fn capsule_separator(t: &Palette) -> Div {
-    div().w(px(1.0)).h(px(18.0)).my(px(8.0)).bg(t.divider)
-}
-
-/// A capsule button with a word on it, not just a glyph.
-///
-/// A row of glyphs can only be read by hovering each one, which is no way to
-/// find a feature you have never heard of. The debloat view is one the user
-/// is meant to discover, so it gets a word.
-pub fn capsule_button(
-    t: &Palette,
-    id: impl Into<ElementId>,
-    icon: &'static str,
-    label: impl Into<gpui::SharedString>,
-    active: bool,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .h(px(theme::CAPSULE_BTN))
-        .px(px(8.0))
-        .rounded(px(theme::RADIUS_CAPSULE_BTN))
-        .cursor_pointer()
-        .text_size(t.text(12.5))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(if active {
-            t.text_header
-        } else {
-            t.text_secondary
-        })
-        .hover(|s| s.bg(t.hover).text_color(t.text_header))
-        .child(icons::icon(icon, 14.0, icon_tint(icon, t)))
-        .child(label.into())
-        .on_click(on_click)
 }
 
 /// The destructive variant of a dialog button.
@@ -291,7 +251,7 @@ pub fn pill(t: &Palette, text: impl Into<gpui::SharedString>, fg: Rgba, bg: Rgba
         .px(px(7.0))
         .rounded(px(theme::RADIUS_PILL))
         .bg(bg)
-        .text_size(t.text(9.0))
+        .text_size(t.text(10.0))
         .font_weight(FontWeight::BOLD)
         .text_color(fg)
         .child(text.into())
