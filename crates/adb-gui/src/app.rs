@@ -2409,6 +2409,33 @@ impl AdbShareApp {
         cx.notify();
     }
 
+    /// Open a standalone floating phone mirror window.
+    fn open_floating_mirror(&mut self, cx: &mut Context<Self>) {
+        let device = self.target_device();
+        let Some(serial) = device else {
+            self.toasts.push("No device connected", ToastTone::Warning);
+            cx.notify();
+            return;
+        };
+        let label = self
+            .devices
+            .iter()
+            .find(|d| d.serial == serial)
+            .map(|d| d.display_name().to_string())
+            .unwrap_or_default();
+        if self.pane == Pane::Mirror {
+            self.mirror.update(cx, |m, cx| m.stop(cx));
+        }
+        crate::views::floating_mirror::open_floating_mirror(
+            serial,
+            label,
+            "balanced".to_string(),
+            0,
+            0,
+            cx,
+        );
+    }
+
     /// Open the debloat view on one particular phone.
     ///
     /// The phone is named rather than taken from the selection, so the row in
@@ -3671,6 +3698,7 @@ impl AdbShareApp {
                     self.open_mirror(cx);
                 }
             }
+            "mirror-floating" => self.open_floating_mirror(cx),
             "shortcuts" => self.dialog = Dialog::Shortcuts,
             "about" => self.dialog = Dialog::About,
             "connect-wifi" => {
@@ -3779,6 +3807,12 @@ impl AdbShareApp {
                 } else {
                     "Mirror screen…"
                 },
+                None,
+            ),
+            MenuItem::with_icon(
+                "mirror-floating",
+                names::PHONE,
+                "Mirror in floating window…",
                 None,
             ),
             MenuItem::with_icon("open-external", names::FILE_MANAGER, "Open in Files", None),

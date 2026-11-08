@@ -121,6 +121,7 @@ dependencies = [
 name = "adb-remote"
 version = "0.1.0"
 dependencies = [
+ "memmap2",
  "thiserror 2.0.20",
 ]
 

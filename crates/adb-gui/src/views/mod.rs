@@ -2,6 +2,7 @@ pub mod browser;
 pub mod debloat;
 pub mod dialogs;
 pub mod filechooser;
+pub mod floating_mirror;
 pub mod menu;
 pub mod mirror;
 pub mod textinput;

@@ -162,6 +162,8 @@ impl ControlMessage {
                 action_button,
                 buttons,
             } => {
+                let x = (*x).clamp(0, (*screen_w as i32).saturating_sub(1).max(0));
+                let y = (*y).clamp(0, (*screen_h as i32).saturating_sub(1).max(0));
                 let mut b = vec![2u8, *action as u8];
                 b.extend_from_slice(&pointer_id.to_be_bytes());
                 b.extend_from_slice(&x.to_be_bytes());
@@ -182,6 +184,8 @@ impl ControlMessage {
                 vscroll,
                 buttons,
             } => {
+                let x = (*x).clamp(0, (*screen_w as i32).saturating_sub(1).max(0));
+                let y = (*y).clamp(0, (*screen_h as i32).saturating_sub(1).max(0));
                 // scrcpy accepts [-16,16] and normalises to [-1,1] before fp conversion.
                 let h = float_to_i16fp((hscroll / 16.0).clamp(-1.0, 1.0));
                 let v = float_to_i16fp((vscroll / 16.0).clamp(-1.0, 1.0));
@@ -205,7 +209,7 @@ impl ControlMessage {
                 paste,
                 text,
             } => {
-                let bytes = text.as_bytes();
+                let bytes = truncate_utf8(text, 1 << 20);
                 let mut b = vec![9u8];
                 b.extend_from_slice(&sequence.to_be_bytes());
                 b.push(u8::from(*paste));

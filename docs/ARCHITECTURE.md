@@ -8,9 +8,9 @@ acyclic.
 
 ```
                     adb-gui  ────►  adb-daemon (over D-Bus)
-                       │                 │
-                       └──────┐  ┌──────┘
-                              ▼  ▼
+                       │                 │         │
+                       └──────┐  ┌───────┘         ▼
+                              ▼  ▼            adb-remote (scrcpy-server 3.3 protocol)
                            transfer-engine
                                │
                                ▼
@@ -59,10 +59,18 @@ A queue with `DEFAULT_PARALLELISM = 4` workers for one-off transfers
 `ProxyFile::read_at/write_at`. Tracks progress with a sliding window
 for current speed, average, and ETA. Optional SHA-256 verification.
 
+### `adb-remote`
+Protocol framing and control serializer compatible with `scrcpy-server 3.3`.
+Decodes media packet headers (H.264/H.265 video stream packets) and serializes
+binary touch, mouse motion, scroll, and keycode injection messages over the
+control stream. Does not depend on GPUI or zbus; operates strictly on byte
+buffers and standard types.
+
 ### `adb-daemon`
 The background service. Discovers devices, pushes the proxy binary,
-sets up `adb forward`, mounts the FUSE FS, and exposes a D-Bus interface
-(`org.adbshare.Manager`) for the GUI.
+sets up `adb forward`, mounts the FUSE FS, manages screen mirroring and
+control sessions via `scrcpy-server 3.3` + `ffmpeg`, and exposes a D-Bus
+interface (`org.adbshare.Manager`) for the GUI.
 
 ### `adb-gui`
 GPUI (the framework behind Zed), rendering with Vulkan. A top bar over a
@@ -203,6 +211,16 @@ before it knows whether the call succeeded. Both are little-endian.
 Op codes: OPEN, CLOSE, READ, WRITE, STAT, LSTAT, LISTDIR, MKDIR, UNLINK,
 RMDIR, RENAME, TRUNCATE, READLINK, SYMLINK, UTIME, DISKUSAGE, COPYFILE,
 FSTAT. `0x0C` is unassigned; the numbering skips it.
+
+## Screen mirroring & remote control
+
+Screen mirroring uses `scrcpy-server 3.3` on the phone, managed by `adb-daemon`:
+
+1. **Server deployment**: Daemon pushes `scrcpy-server.jar` to `/data/local/tmp/` on the phone.
+2. **Tunneling**: A single port is bound on `127.0.0.1` and an `adb reverse` tunnel (falling back to `adb forward`) connects the server back to the host daemon. On failure or shutdown, the tunnel is automatically deregistered.
+3. **Execution**: Server starts with `app_process / com.genymobile.scrcpy.Server 3.3 ...` passing preset parameters (bitrate, fps, codec). Child processes are spawned with `kill_on_drop(true)` to avoid orphan processes on the phone.
+4. **Stream decoding**: Video stream packets received by `adb-daemon` are framed via `adb-remote` and piped into a managed child `ffmpeg` instance that decodes frames into an atomic tmpfs JPEG file. Child failures are caught and surfaced immediately to the GUI.
+5. **Control channel**: A persistent Unix domain socket is served by `adb-daemon` at `$XDG_RUNTIME_DIR/adbshare/remote/<serial>.sock`. The GPUI `Mirror` view opens a background worker channel sending binary touch, scroll, and key messages (`adb_remote::ControlMessage`) directly into the phone's control socket without shelling out.
 
 ## Concurrency model
 

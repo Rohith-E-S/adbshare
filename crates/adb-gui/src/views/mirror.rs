@@ -17,12 +17,13 @@ use std::sync::Arc;
 use adb_remote::input::{ControlMessage, POINTER_ID_FINGER, key_action, motion_action};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, RenderImage, ScrollWheelEvent, Window, div, px,
+    AnyElement, Context, ExternalPaths, FocusHandle, ImageSource, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollWheelEvent,
+    Window, div, px,
 };
 
 use crate::icons::{self, names};
-use crate::state::daemon;
+use crate::state::daemon::{self, RemoteControlHandle, RemoteEvent};
 use crate::theme::{self, Palette, Themed};
 use crate::views::ui;
 
@@ -48,19 +49,25 @@ pub struct Mirror {
     status: Option<String>,
     /// Path to the Unix control socket provided by the daemon.
     socket_path: Option<PathBuf>,
+    /// Backing path to the shared memory frame pool.
+    shm_path: Option<PathBuf>,
+    /// Reader handle mapping the shared memory frame pool.
+    shm_reader: Option<adb_remote::shm::ShmReader>,
     /// Persistent sender to the remote control socket task.
     control_tx: Option<async_channel::Sender<ControlMessage>>,
+    /// Whether the device physical screen has been turned off to save power.
+    screen_off: bool,
     /// Active drag / swipe state.
     is_dragging: bool,
-    drag_start: Option<(u32, u32)>,
     last_drag: Option<(u32, u32)>,
-    drag_moved: bool,
     /// Current rendered frame in memory, cache-safe across rapid updates.
     current_frame: Option<Arc<RenderImage>>,
     /// Previous frame dropped from atlas during next paint.
     previous_frame: Option<Arc<RenderImage>>,
     /// Latest screenshot path for the `img()` frame; `None` until one lands.
     screenshot_path: Option<String>,
+    /// Direct path to the current frame JPEG written by the daemon.
+    frame_file: Option<PathBuf>,
     /// Video dimensions from `remote_status` (zeros until known).
     width: u32,
     height: u32,
@@ -74,10 +81,12 @@ pub struct Mirror {
     viewport_y: f32,
     viewport_w: f32,
     viewport_h: f32,
+    /// Focus handle for keyboard input passthrough.
+    focus_handle: FocusHandle,
 }
 
 impl Mirror {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             device: None,
             device_label: String::new(),
@@ -87,14 +96,16 @@ impl Mirror {
             error: None,
             status: None,
             socket_path: None,
+            shm_path: None,
+            shm_reader: None,
             control_tx: None,
+            screen_off: false,
             is_dragging: false,
-            drag_start: None,
             last_drag: None,
-            drag_moved: false,
             current_frame: None,
             previous_frame: None,
             screenshot_path: None,
+            frame_file: None,
             width: 0,
             height: 0,
             codec: String::new(),
@@ -105,6 +116,7 @@ impl Mirror {
             viewport_y: 0.0,
             viewport_w: 0.0,
             viewport_h: 0.0,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -115,19 +127,26 @@ impl Mirror {
             }
             return;
         }
+        if self.screen_off {
+            if let Some(ref tx) = self.control_tx {
+                let _ = tx.try_send(ControlMessage::SetDisplayPower { on: true });
+            }
+            self.screen_off = false;
+        }
         self.device = device;
         self.running = false;
         self.polling = false;
         self.error = None;
         self.socket_path = None;
+        self.shm_path = None;
+        self.shm_reader = None;
         self.control_tx = None;
         self.is_dragging = false;
-        self.drag_start = None;
         self.last_drag = None;
-        self.drag_moved = false;
         self.current_frame = None;
         self.previous_frame = None;
         self.screenshot_path = None;
+        self.frame_file = None;
         self.frames = 0;
         self.width = 0;
         self.height = 0;
@@ -146,59 +165,48 @@ impl Mirror {
 
     /// Content origin from the app root (sidebar + topbar offset), used to
     /// turn a window-relative click into frame-relative coordinates.
-    pub fn set_viewport(
-        &mut self,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        cx: &mut Context<Self>,
-    ) {
-        let moved = (self.viewport_x - x).abs() > f32::EPSILON
-            || (self.viewport_y - y).abs() > f32::EPSILON
-            || (self.viewport_w - width).abs() > f32::EPSILON
-            || (self.viewport_h - height).abs() > f32::EPSILON;
+    pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, _cx: &mut Context<Self>) {
         self.viewport_x = x;
         self.viewport_y = y;
-        self.viewport_w = width;
-        self.viewport_h = height;
-        if moved {
-            cx.notify();
+        self.viewport_w = w;
+        self.viewport_h = h;
+    }
+
+    fn aspect(&self) -> f32 {
+        if self.width > 0 && self.height > 0 {
+            self.width as f32 / self.height as f32
+        } else {
+            1080.0 / 2400.0
         }
     }
 
-    /// Calculate inner screen and outer chassis dimensions.
-    /// Returns `(inner_w, inner_h, outer_w, outer_h)`.
+    /// (inner_w, inner_h, outer_w, outer_h)
     fn phone_dims(&self) -> (f32, f32, f32, f32) {
-        let (dw, dh) = match (self.width, self.height) {
-            (w, h) if w > 0 && h > 0 => (w as f32, h as f32),
-            _ => (1080.0, 2400.0),
-        };
-        let aspect = dw / dh;
-        let avail_h = (self.viewport_h - HEADER_H - PADDING_Y * 2.0 - BEZEL * 2.0).max(300.0);
-        let avail_w = (self.viewport_w - RAIL_W - GAP - PADDING_X * 2.0 - BEZEL * 2.0).max(160.0);
+        let avail_w = (self.viewport_w - PADDING_X * 2.0 - RAIL_W - GAP).max(100.0);
+        let avail_h = (self.viewport_h - HEADER_H - PADDING_Y * 2.0).max(100.0);
 
-        let mut inner_h = avail_h;
-        let mut inner_w = (inner_h * aspect).round();
-        if inner_w > avail_w {
-            inner_w = avail_w;
-            inner_h = (inner_w / aspect).round();
-        }
+        let aspect = self.aspect();
+        let max_inner_w = (avail_w - BEZEL * 2.0).max(50.0);
+        let max_inner_h = (avail_h - BEZEL * 2.0).max(50.0);
+
+        let (inner_w, inner_h) = if max_inner_w / max_inner_h > aspect {
+            ((max_inner_h * aspect).round(), max_inner_h.round())
+        } else {
+            (max_inner_w.round(), (max_inner_w / aspect).round())
+        };
+
         let outer_w = inner_w + BEZEL * 2.0;
         let outer_h = inner_h + BEZEL * 2.0;
         (inner_w, inner_h, outer_w, outer_h)
     }
 
-    /// Returns `(inner_x, inner_y)` of the inner screen in window coordinates.
     fn inner_screen_origin(&self) -> (f32, f32) {
-        let (_inner_w, _inner_h, outer_w, outer_h) = self.phone_dims();
-        let total_group_w = outer_w + GAP + RAIL_W;
-        let group_x = self.viewport_x + ((self.viewport_w - total_group_w) / 2.0).max(12.0);
-        let group_y = (self.viewport_y + HEADER_H)
-            + (((self.viewport_h - HEADER_H) - outer_h) / 2.0).max(8.0);
-        let inner_x = group_x + BEZEL;
-        let inner_y = group_y + BEZEL;
-        (inner_x, inner_y)
+        let (_, _, outer_w, outer_h) = self.phone_dims();
+        let total_w = outer_w + GAP + RAIL_W;
+        let ox = self.viewport_x + (self.viewport_w - total_w) / 2.0 + BEZEL;
+        let stage_avail_h = self.viewport_h - HEADER_H;
+        let oy = self.viewport_y + HEADER_H + (stage_avail_h - outer_h) / 2.0 + BEZEL;
+        (ox, oy)
     }
 
     fn window_to_device(&self, pos: Point<Pixels>) -> Option<(u32, u32)> {
@@ -220,11 +228,116 @@ impl Mirror {
         Some((tx.min(dw as u32), ty.min(dh as u32)))
     }
 
-    fn ensure_control_channel(&mut self) {
-        if self.control_tx.is_none()
-            && let Some(ref sock) = self.socket_path
+    fn setup_control_channel(&mut self, sock: PathBuf, cx: &mut Context<Self>) {
+        self.socket_path = Some(sock.clone());
+        match daemon::open_remote_control(sock) {
+            Ok(RemoteControlHandle { tx, rx }) => {
+                self.control_tx = Some(tx);
+                let me = cx.entity();
+                cx.spawn(async move |_this, cx| {
+                    while let Ok(event) = rx.recv().await {
+                        let res = me.update(cx, |this, cx| {
+                            this.handle_remote_event(event, cx);
+                        });
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(e) => {
+                self.fail(format!("Control channel error: {e}"), cx);
+            }
+        }
+    }
+
+    fn handle_remote_event(&mut self, event: RemoteEvent, cx: &mut Context<Self>) {
+        match event {
+            RemoteEvent::Frame(notif) => {
+                self.on_frame_notification(notif, cx);
+            }
+            RemoteEvent::Clipboard(text) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                self.note("Clipboard synced from phone", cx);
+            }
+        }
+    }
+
+    fn on_frame_notification(
+        &mut self,
+        notif: adb_remote::proxy::FrameNotification,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shm_reader.is_none()
+            && let Some(ref p) = self.shm_path
         {
-            self.control_tx = daemon::open_remote_control(sock.clone()).ok();
+            self.shm_reader = adb_remote::shm::ShmReader::open(p).ok();
+        }
+
+        let Some(ref reader) = self.shm_reader else {
+            return;
+        };
+        let w = notif.width;
+        let h = notif.height;
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        let frame_len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        // Tear check: skip the frame if the writer is mid-publish (the next
+        // notification will carry a consistent frame).
+        if let Some(snap) = reader.try_snapshot()
+            && (snap.seq != notif.seq || snap.slot != notif.slot)
+        {
+            return;
+        }
+        let Ok(slot_bytes) = reader.read_slot_exact(notif.slot, frame_len) else {
+            return;
+        };
+        // Copy out (must happen before the writer overwrites the slot), then
+        // decode off the GPUI thread.
+        // No R/B swap: ffmpeg emits BGRA (-pix_fmt bgra) for GPUI's Bgra8Unorm.
+        let pixels = slot_bytes.to_vec();
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            let img = cx
+                .background_executor()
+                .spawn(async move {
+                    image::RgbaImage::from_raw(w, h, pixels)
+                        .map(|rgba| Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+                })
+                .await;
+            let _ = me.update(cx, |this, cx| {
+                if let Some(img) = img {
+                    if this.width != w || this.height != h {
+                        this.width = w;
+                        this.height = h;
+                    }
+                    this.previous_frame = this.current_frame.take();
+                    this.current_frame = Some(img);
+                    this.frames = this.frames.saturating_add(1);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_screen_off(&mut self, cx: &mut Context<Self>) {
+        if !self.running {
+            return;
+        }
+        let new_state = !self.screen_off;
+        self.screen_off = new_state;
+        let power_on = !new_state;
+        if let Some(ref tx) = self.control_tx {
+            let _ = tx.try_send(ControlMessage::SetDisplayPower { on: power_on });
+        }
+        if new_state {
+            self.note("Phone display off (mirror active)", cx);
+        } else {
+            self.note("Phone display on", cx);
         }
     }
 
@@ -232,7 +345,6 @@ impl Mirror {
         if !self.running {
             return;
         }
-        self.ensure_control_channel();
         let (dw, dh) = match (self.width, self.height) {
             (w, h) if w > 0 && h > 0 => (w as f32, h as f32),
             _ => (1080.0, 2400.0),
@@ -257,7 +369,6 @@ impl Mirror {
         if !self.running {
             return;
         }
-        self.ensure_control_channel();
         let (dw, dh) = match (self.width, self.height) {
             (w, h) if w > 0 && h > 0 => (w as f32, h as f32),
             _ => (1080.0, 2400.0),
@@ -280,7 +391,6 @@ impl Mirror {
         if !self.running {
             return;
         }
-        self.ensure_control_channel();
         if let Some(ref tx) = self.control_tx {
             let _ = tx.try_send(ControlMessage::RotateDevice);
         }
@@ -301,17 +411,37 @@ impl Mirror {
         let Some(device) = self.device.clone() else {
             return;
         };
-        let options = serde_json::json!({ "preset": self.preset, "audio": false }).to_string();
+        // Audio defaults on (daemon default); no toggle is exposed yet.
+        let options = serde_json::json!({ "preset": self.preset, "audio": true }).to_string();
         let me = cx.entity();
         cx.spawn(async move |_this, cx| {
+            // Attach to an already-running session instead of killing it
+            // (e.g. a floating window on the same device).
+            if let Ok(st) = daemon::remote_status(&device).await
+                && st.get("running").and_then(|r| r.as_bool()) == Some(true)
+            {
+                let _ = me.update(cx, |this, cx| {
+                    apply_status(this, &st, cx);
+                    this.note("Mirror attached to running session", cx);
+                    this.start_poll(cx);
+                });
+                return;
+            }
             let result = daemon::start_remote(&device, &options).await;
             let _ = me.update(cx, |this, cx| match result {
                 Ok(info) => {
                     this.running = true;
+                    if let Some(shm) = info.get("shm_path").and_then(|s| s.as_str()) {
+                        let p = PathBuf::from(shm);
+                        this.shm_path = Some(p.clone());
+                        this.shm_reader = adb_remote::shm::ShmReader::open(&p).ok();
+                    }
+                    if let Some(frame) = info.get("frame").and_then(|f| f.as_str()) {
+                        this.frame_file = Some(PathBuf::from(frame));
+                    }
                     if let Some(sock) = info.get("socket").and_then(|s| s.as_str()) {
                         let p = PathBuf::from(sock);
-                        this.socket_path = Some(p.clone());
-                        this.control_tx = daemon::open_remote_control(p).ok();
+                        this.setup_control_channel(p, cx);
                     }
                     if let Some(w) = info.get("width").and_then(|w| w.as_u64()) {
                         this.width = w as u32;
@@ -329,16 +459,22 @@ impl Mirror {
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
+        if self.screen_off {
+            if let Some(ref tx) = self.control_tx {
+                let _ = tx.try_send(ControlMessage::SetDisplayPower { on: true });
+            }
+            self.screen_off = false;
+        }
         self.running = false;
         self.polling = false;
         self.control_tx = None;
+        self.shm_reader = None;
         self.is_dragging = false;
-        self.drag_start = None;
         self.last_drag = None;
-        self.drag_moved = false;
         self.current_frame = None;
         self.previous_frame = None;
         self.screenshot_path = None;
+        self.frame_file = None;
         cx.notify();
         let Some(device) = self.device.clone() else {
             return;
@@ -366,7 +502,7 @@ impl Mirror {
             let result = daemon::remote_status(&device).await;
             let _ = me.update(cx, |this, cx| {
                 if let Ok(v) = result {
-                    apply_status(this, &v);
+                    apply_status(this, &v, cx);
                     if this.running && !this.polling {
                         this.start_poll(cx);
                     }
@@ -387,69 +523,18 @@ impl Mirror {
         self.polling = true;
         let me = cx.entity();
         cx.spawn(async move |_this, cx| {
-            let safe: String = device
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            let frame_jpg = dirs::runtime_dir()
-                .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
-                .map(|d| {
-                    d.join("adbshare")
-                        .join("remote")
-                        .join(format!("{safe}-frame.jpg"))
-                });
-            let mut last_mtime = None;
-            let mut tick = 0u32;
-
             loop {
-                // Poll at ~60 FPS (16ms) for ultra-low latency (<20ms) and smooth motion
-                gpui::Timer::after(std::time::Duration::from_millis(16)).await;
+                // Heartbeat status poll every 1s (minimal CPU footprint, zero lag)
+                gpui::Timer::after(std::time::Duration::from_millis(1000)).await;
                 let still = me.read_with(cx, |this, _c| this.polling).unwrap_or(false);
                 if !still {
                     break;
                 }
-                tick += 1;
 
-                // Query D-Bus status every 60 ticks (~1s) to keep bitrate and frame counters fresh
-                let status = if tick % 60 == 1 {
-                    daemon::remote_status(&device).await.ok()
-                } else {
-                    None
-                };
-
-                // Read and decode live frame from tmpfs in worker task directly to RenderImage
-                let mut new_image = None;
-                if let Some(ref p) = frame_jpg {
-                    let mtime = std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
-                    if mtime.is_some() && mtime != last_mtime {
-                        last_mtime = mtime;
-                        if let Ok(bytes) = std::fs::read(p) {
-                            let fmt = if bytes.starts_with(&[0xff, 0xd8]) {
-                                image::ImageFormat::Jpeg
-                            } else {
-                                image::ImageFormat::Png
-                            };
-                            if let Ok(dyn_img) = image::load_from_memory_with_format(&bytes, fmt) {
-                                let mut rgba = dyn_img.into_rgba8();
-                                for pixel in rgba.as_chunks_mut::<4>().0 {
-                                    pixel.swap(0, 2); // RGBA -> BGRA
-                                }
-                                let frame = image::Frame::new(rgba);
-                                new_image = Some(Arc::new(RenderImage::new(vec![frame])));
-                            }
-                        }
-                    }
-                }
-
+                let status = daemon::remote_status(&device).await.ok();
                 let _ = me.update(cx, |this, cx| {
                     if let Some(v) = status {
-                        apply_status(this, &v);
+                        apply_status(this, &v, cx);
                         if !this.running && v.get("running").and_then(|r| r.as_bool()) == Some(true)
                         {
                             this.running = true;
@@ -461,10 +546,6 @@ impl Mirror {
                             this.current_frame = None;
                             this.previous_frame = None;
                         }
-                    }
-                    if let Some(img) = new_image {
-                        this.previous_frame = this.current_frame.take();
-                        this.current_frame = Some(img);
                         cx.notify();
                     }
                 });
@@ -497,9 +578,12 @@ impl Mirror {
     fn on_frame_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Give keyboard focus to mirror view
+        self.focus_handle.focus(window);
+
         if !self.running {
             return;
         }
@@ -510,9 +594,7 @@ impl Mirror {
             return;
         };
         self.is_dragging = true;
-        self.drag_start = Some((tx, ty));
         self.last_drag = Some((tx, ty));
-        self.drag_moved = false;
         self.send_touch(motion_action::DOWN, tx, ty, 1.0);
         cx.notify();
     }
@@ -532,7 +614,6 @@ impl Mirror {
         if self.last_drag == Some((tx, ty)) {
             return;
         }
-        self.drag_moved = true;
         self.last_drag = Some((tx, ty));
         self.send_touch(motion_action::MOVE, tx, ty, 1.0);
     }
@@ -555,45 +636,9 @@ impl Mirror {
             .window_to_device(event.position)
             .or(self.last_drag)
             .unwrap_or((0, 0));
-        let start = self.drag_start.take();
         self.last_drag = None;
         self.send_touch(motion_action::UP, tx, ty, 0.0);
-
-        if self.control_tx.is_none() {
-            if let Some(device) = self.device.clone() {
-                let moved = self.drag_moved;
-                let me = cx.entity();
-                cx.spawn(async move |_this, cx| {
-                    if moved && let Some((sx, sy)) = start {
-                        let _ = daemon::run_shell(
-                            &device,
-                            &[
-                                "input",
-                                "swipe",
-                                &sx.to_string(),
-                                &sy.to_string(),
-                                &tx.to_string(),
-                                &ty.to_string(),
-                                "200",
-                            ],
-                        )
-                        .await;
-                    } else {
-                        let _ = daemon::run_shell(
-                            &device,
-                            &["input", "tap", &tx.to_string(), &ty.to_string()],
-                        )
-                        .await;
-                    }
-                    let _ = me.update(cx, |this, cx| {
-                        this.note(format!("Touch at {tx}, {ty}"), cx);
-                    });
-                })
-                .detach();
-            }
-        } else {
-            self.note(format!("Touch at {tx}, {ty}"), cx);
-        }
+        self.note(format!("Touch at {tx}, {ty}"), cx);
     }
 
     fn on_frame_mouse_up_out(
@@ -611,7 +656,6 @@ impl Mirror {
         }
         self.is_dragging = false;
         let (tx, ty) = self.last_drag.take().unwrap_or((0, 0));
-        self.drag_start = None;
         self.send_touch(motion_action::UP, tx, ty, 0.0);
         self.note(format!("Release at {tx}, {ty}"), cx);
     }
@@ -641,7 +685,6 @@ impl Mirror {
             return;
         }
         let numeric_keycode = keycode.parse::<i32>().ok();
-        self.ensure_control_channel();
         if let (Some(tx), Some(code)) = (&self.control_tx, numeric_keycode) {
             let down = ControlMessage::InjectKeycode {
                 action: key_action::DOWN,
@@ -658,30 +701,209 @@ impl Mirror {
             let _ = tx.try_send(down);
             let _ = tx.try_send(up);
             self.note(format!("Sent {label}"), cx);
+        } else {
+            self.fail("control channel unavailable", cx);
+        }
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.running {
             return;
         }
-        if let Some(device) = self.device.clone() {
-            let label = label.to_string();
-            let keycode = keycode.to_string();
-            let me = cx.entity();
-            cx.spawn(async move |_this, cx| {
-                let _ = daemon::run_shell(&device, &["input", "keyevent", &keycode]).await;
-                let _ = me.update(cx, |this, cx| this.note(format!("Sent {label}"), cx));
-            })
-            .detach();
+        let key = &event.keystroke.key;
+        let mods = &event.keystroke.modifiers;
+
+        // Clipboard shortcut handling: Ctrl+V (paste) & Ctrl+C (copy) & Ctrl+A
+        if mods.control && !mods.alt && !mods.platform {
+            if key.eq_ignore_ascii_case("v") {
+                if let Some(item) = cx.read_from_clipboard()
+                    && let Some(text) = item.text()
+                    && let Some(ref tx) = self.control_tx
+                {
+                    let _ = tx.try_send(ControlMessage::SetClipboard {
+                        sequence: 0,
+                        paste: true,
+                        text: text.to_string(),
+                    });
+                    self.note("Pasted clipboard to phone", cx);
+                }
+                return;
+            } else if key.eq_ignore_ascii_case("c") {
+                if let Some(ref tx) = self.control_tx {
+                    let _ = tx.try_send(ControlMessage::GetClipboard { copy: true });
+                    self.note("Requested phone clipboard", cx);
+                }
+                return;
+            } else if key.eq_ignore_ascii_case("a") {
+                if let Some(ref tx) = self.control_tx {
+                    let _ = tx.try_send(ControlMessage::InjectKeycode {
+                        action: key_action::DOWN,
+                        keycode: 29, // AKEYCODE_A
+                        repeat: 0,
+                        metastate: 0x1000, // META_CTRL_ON
+                    });
+                    let _ = tx.try_send(ControlMessage::InjectKeycode {
+                        action: key_action::UP,
+                        keycode: 29,
+                        repeat: 0,
+                        metastate: 0,
+                    });
+                }
+                return;
+            }
+        }
+
+        // Standard Android navigation and action keys
+        let keycode = match key.as_str() {
+            "backspace" => Some(67), // AKEYCODE_DEL
+            "enter" => Some(66),     // AKEYCODE_ENTER
+            "tab" => Some(61),       // AKEYCODE_TAB
+            "escape" => Some(4),     // AKEYCODE_BACK
+            "delete" => Some(112),   // AKEYCODE_FORWARD_DEL
+            "up" => Some(19),        // AKEYCODE_DPAD_UP
+            "down" => Some(20),      // AKEYCODE_DPAD_DOWN
+            "left" => Some(21),      // AKEYCODE_DPAD_LEFT
+            "right" => Some(22),     // AKEYCODE_DPAD_RIGHT
+            "space" => Some(62),     // AKEYCODE_SPACE
+            "home" => Some(3),       // AKEYCODE_HOME
+            "pageup" => Some(92),    // AKEYCODE_PAGE_UP
+            "pagedown" => Some(93),  // AKEYCODE_PAGE_DOWN
+            _ => None,
+        };
+
+        if let Some(code) = keycode {
+            if let Some(ref tx) = self.control_tx {
+                let _ = tx.try_send(ControlMessage::InjectKeycode {
+                    action: key_action::DOWN,
+                    keycode: code,
+                    repeat: 0,
+                    metastate: 0,
+                });
+                let _ = tx.try_send(ControlMessage::InjectKeycode {
+                    action: key_action::UP,
+                    keycode: code,
+                    repeat: 0,
+                    metastate: 0,
+                });
+            }
+            return;
+        }
+
+        // Text injection for printable characters
+        if !mods.control && !mods.alt && !mods.platform {
+            let text_to_inject = if let Some(ref text) = event.keystroke.key_char {
+                if !text.is_empty() && text.chars().all(|c| !c.is_control()) {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            } else if key.chars().count() == 1 {
+                let ch = key.chars().next().unwrap();
+                if !ch.is_control() {
+                    Some(ch.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(text) = text_to_inject
+                && let Some(ref tx) = self.control_tx
+            {
+                let _ = tx.try_send(ControlMessage::InjectText(text));
+            }
+        }
+    }
+
+    fn on_external_drop(
+        &mut self,
+        dropped: &ExternalPaths,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(device) = self.device.clone() else {
+            return;
+        };
+        let paths = dropped.paths().to_vec();
+        if paths.is_empty() {
+            return;
+        }
+        let me = cx.entity();
+        cx.spawn(async move |_this, cx| {
+            for path in paths {
+                let is_apk = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("apk"))
+                    .unwrap_or(false);
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+
+                if is_apk {
+                    let _ = me.update(cx, |this, cx| {
+                        this.note(format!("Installing {name}…"), cx);
+                    });
+                    let res = daemon::start_install(&device, &path.to_string_lossy()).await;
+                    let _ = me.update(cx, |this, cx| match res {
+                        Ok(_) => this.note(format!("Installed {name}"), cx),
+                        Err(e) => this.fail(format!("Install failed: {e}"), cx),
+                    });
+                } else {
+                    let _ = me.update(cx, |this, cx| {
+                        this.note(format!("Pushing {name} to /sdcard/Download/…"), cx);
+                    });
+                    let remote_dest = format!("/sdcard/Download/{name}");
+                    let policy = ("skip".to_string(), false);
+                    let res = daemon::enqueue_push(
+                        &device,
+                        &path.to_string_lossy(),
+                        &remote_dest,
+                        policy,
+                    )
+                    .await;
+                    let _ = me.update(cx, |this, cx| match res {
+                        Ok(_) => this.note(format!("Pushed {name} to Download"), cx),
+                        Err(e) => this.fail(format!("Push failed: {e}"), cx),
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+}
+
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        if self.screen_off
+            && let Some(ref tx) = self.control_tx
+        {
+            let _ = tx.try_send(ControlMessage::SetDisplayPower { on: true });
         }
     }
 }
 
-fn apply_status(this: &mut Mirror, v: &serde_json::Value) {
+fn apply_status(this: &mut Mirror, v: &serde_json::Value, cx: &mut Context<Mirror>) {
     let running = v.get("running").and_then(|r| r.as_bool()).unwrap_or(false);
     if running {
         this.running = true;
+        if let Some(shm) = v.get("shm_path").and_then(|s| s.as_str()) {
+            let p = PathBuf::from(shm);
+            if this.shm_path.as_ref() != Some(&p) {
+                this.shm_path = Some(p.clone());
+                this.shm_reader = adb_remote::shm::ShmReader::open(&p).ok();
+            }
+        }
+        if let Some(frame) = v.get("frame").and_then(|f| f.as_str()) {
+            this.frame_file = Some(PathBuf::from(frame));
+        }
         if let Some(sock) = v.get("socket").and_then(|s| s.as_str()) {
             let p = PathBuf::from(sock);
             if this.socket_path.as_ref() != Some(&p) || this.control_tx.is_none() {
-                this.socket_path = Some(p.clone());
-                this.control_tx = daemon::open_remote_control(p).ok();
+                this.setup_control_channel(p, cx);
             }
         }
         this.codec = v
@@ -689,17 +911,30 @@ fn apply_status(this: &mut Mirror, v: &serde_json::Value) {
             .and_then(|c| c.as_str())
             .unwrap_or_default()
             .to_string();
-        this.frames = v.get("frames").and_then(|n| n.as_u64()).unwrap_or(0);
+        this.frames = v
+            .get("frames")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(this.frames);
         this.bytes = v.get("bytes").and_then(|n| n.as_u64()).unwrap_or(0);
-        this.width = v.get("width").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
-        this.height = v.get("height").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+        let w = v.get("width").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+        let h = v.get("height").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+        if w > 0 && h > 0 {
+            this.width = w;
+            this.height = h;
+        }
         this.fps_x10 = v.get("fps_x10").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+        this.error = None;
     } else {
         this.running = false;
         this.socket_path = None;
         this.control_tx = None;
+        this.shm_reader = None;
         this.current_frame = None;
         this.previous_frame = None;
+        this.frame_file = None;
+        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+            this.error = Some(err.to_string());
+        }
     }
 }
 
@@ -901,9 +1136,16 @@ impl Render for Mirror {
             .relative();
 
         if self.running {
+            let me_bk = cx.entity();
             inner_screen = inner_screen
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Left, cx.listener(Mirror::on_frame_mouse_down))
+                .on_mouse_down(MouseButton::Right, {
+                    let me = me_bk;
+                    move |_, _w, cx| {
+                        me.update(cx, |this, cx| this.send_key(cx, "Back", "4"));
+                    }
+                })
                 .on_mouse_move(cx.listener(Mirror::on_frame_mouse_move))
                 .on_mouse_up(MouseButton::Left, cx.listener(Mirror::on_frame_mouse_up))
                 .on_mouse_up_out(
@@ -994,6 +1236,35 @@ impl Render for Mirror {
             .into_any_element();
 
         let me2 = cx.entity();
+        let me_flt = me2.clone();
+        let dev_opt = self.device.clone();
+        let lbl_flt = self.device_label.clone();
+        let preset_flt = self.preset.clone();
+        let (init_w, init_h) = (self.width, self.height);
+        let float_btn = ui::button(
+            &t,
+            "mirror-float",
+            "Float window",
+            false,
+            move |_, _w, cx| {
+                if let Some(dev) = dev_opt.clone() {
+                    me_flt.update(cx, |this, cx| {
+                        if this.running {
+                            this.stop(cx);
+                        }
+                    });
+                    crate::views::floating_mirror::open_floating_mirror(
+                        dev,
+                        lbl_flt.clone(),
+                        preset_flt.clone(),
+                        init_w,
+                        init_h,
+                        cx,
+                    );
+                }
+            },
+        );
+
         let start_stop: AnyElement = if self.running {
             ui::danger_button(&t, "mirror-stop", "Stop mirror", {
                 let me = me2.clone();
@@ -1011,14 +1282,6 @@ impl Render for Mirror {
             })
             .into_any_element()
         };
-
-        let me3 = cx.entity();
-        let shot_btn = ui::button(&t, "mirror-shot", "Refresh", false, {
-            let me = me3.clone();
-            move |_, _w, cx| {
-                me.update(cx, |this, cx| this.take_screenshot(cx));
-            }
-        });
 
         let stats = if self.running {
             format!(
@@ -1064,6 +1327,7 @@ impl Render for Mirror {
         };
 
         let rail_enabled = self.running;
+        let screen_off = self.screen_off;
         // Vertical action rail docked to the right of the phone chassis
         let rail = div()
             .flex()
@@ -1115,6 +1379,23 @@ impl Render for Mirror {
                     }
                 },
             ))
+            .child(rail_btn(
+                &t,
+                "rail-screen-off",
+                names::PHONE,
+                if screen_off {
+                    "Turn phone screen on"
+                } else {
+                    "Turn phone screen off (mirror stays active)"
+                },
+                rail_enabled,
+                {
+                    let me = me2.clone();
+                    move |_, _w, cx| {
+                        me.update(cx, |this, cx| this.toggle_screen_off(cx));
+                    }
+                },
+            ))
             .child(div().w(px(20.0)).h(px(1.0)).bg(t.border).my(px(2.0)))
             .child(rail_btn(
                 &t,
@@ -1163,7 +1444,7 @@ impl Render for Mirror {
                 "Take Screenshot",
                 rail_enabled,
                 {
-                    let me = me3.clone();
+                    let me = me2.clone();
                     move |_, _w, cx| {
                         me.update(cx, |this, cx| this.take_screenshot(cx));
                     }
@@ -1190,12 +1471,15 @@ impl Render for Mirror {
             .flex_col()
             .size_full()
             .bg(t.canvas)
+            .track_focus(&self.focus_handle)
             .on_mouse_move(cx.listener(Mirror::on_frame_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Mirror::on_frame_mouse_up))
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(Mirror::on_frame_mouse_up_out),
             )
+            .on_key_down(cx.listener(Mirror::on_key_down))
+            .on_drop::<ExternalPaths>(cx.listener(Mirror::on_external_drop))
             // Header bar
             .child(
                 div()
@@ -1233,7 +1517,7 @@ impl Render for Mirror {
                     .when_some(status_badge, |d, badge| d.child(badge))
                     .child(div().flex_1())
                     .child(preset_row)
-                    .child(shot_btn)
+                    .child(float_btn)
                     .child(start_stop)
                     .into_any_element(),
             )

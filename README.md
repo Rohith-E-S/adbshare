@@ -19,6 +19,7 @@ Browse your Android phone and move files between it and your Linux computer over
 - Debloat a phone: see what is preinstalled, what it is for, and how safe it is to remove, then disable or uninstall it.
 - Pair a phone and connect to it over Wi-Fi.
 - Open phone files in external applications through FUSE.
+- Mirror and control your phone screen with mouse clicks, drag swipes, and hardware button shortcuts.
 
 No companion Android app is needed. The daemon automatically deploys a small executable helper to the phone. Access is limited to what Android's ADB shell can read or write; this does not unlock protected app data.
 
@@ -30,6 +31,8 @@ You need:
 - Rust and Cargo. The workspace declares Rust 1.88 or newer; current stable is recommended.
 - A **Vulkan** capable GPU and driver, **xkbcommon** (including the x11 part), the **Wayland** (or X11) client libraries, FUSE 3, a C build toolchain, and `pkg-config`. GPUI has no OpenGL fallback, so a Vulkan driver is mandatory. Without a hardware GPU, install Mesa's **lavapipe** software driver — `mesa-vulkan-drivers` on Fedora and Debian/Ubuntu — and check it with `vulkaninfo --summary`; it reports an `llvmpipe` device and satisfies GPUI the same way a real driver does. Arch ships its Vulkan drivers as separate `vulkan-*` packages, so take the one matching your GPU (or `vulkan-radeon` and friends) rather than the `mesa` package.
 - Android platform tools: the `adb` command must be on your `PATH`.
+- **ffmpeg**: the `ffmpeg` command on your `PATH` (used for live screen mirror decoding).
+- **scrcpy-server 3.3**: screen mirroring requires the `scrcpy-server` version 3.3 jar file. Download `scrcpy-server-v3.3` from [scrcpy releases](https://github.com/Genymobile/scrcpy/releases/tag/v3.3) and place it at `~/.local/share/adbshare/scrcpy-server.jar` (or set `ADBSHARE_SCRCPY_SERVER` to its path).
 - An Android phone with USB debugging or Wireless debugging enabled. A USB cable is optional for Wi-Fi setup.
 - A helper binary built for your **phone's architecture**, as explained below.
 
@@ -38,16 +41,16 @@ You need:
 On Arch Linux:
 
 ```sh
-sudo pacman -S --needed base-devel pkgconf vulkan-icd-loader libxkbcommon wayland libx11 libxext fontconfig fuse3 libusb android-tools
+sudo pacman -S --needed base-devel pkgconf vulkan-icd-loader libxkbcommon wayland libx11 libxext fontconfig fuse3 libusb android-tools ffmpeg
 ```
 
 On Fedora (CI currently builds on Fedora 44):
 
 ```sh
-sudo dnf install gcc pkgconf-pkg-config vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel libX11-devel libXext-devel fontconfig-devel freetype-devel fuse3-devel libusbx-devel android-tools
+sudo dnf install gcc pkgconf-pkg-config vulkan-loader-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel libX11-devel libXext-devel fontconfig-devel freetype-devel fuse3-devel libusbx-devel android-tools ffmpeg-free
 ```
 
-On Debian/Ubuntu, development packages are named `build-essential`, `pkg-config`, `libvulkan-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libxext-dev`, `libfontconfig1-dev`, `libfuse3-dev`, and `libusb-1.0-0-dev`; also install `adb` and `fuse3`.
+On Debian/Ubuntu, development packages are named `build-essential`, `pkg-config`, `libvulkan-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libxext-dev`, `libfontconfig1-dev`, `libfuse3-dev`, and `libusb-1.0-0-dev`; also install `adb`, `fuse3`, and `ffmpeg`.
 
 These packages do not install the Rust toolchain. Check your environment before building:
 
@@ -261,6 +264,9 @@ A system app is never really removed: it stays on the phone's read-only partitio
 | Transfer says skipped | The destination already exists. Save under another name or handle the existing file yourself. |
 | File not visible after upload | Wait for completion and press `F5`. |
 | External opening or drag-out fails | Check FUSE, `fusermount3`, `/dev/fuse`, and `xdg-open`. In-app browsing may work even when mounting fails. |
+| Screen mirror says "scrcpy-server.jar not found" | Download `scrcpy-server-v3.3` from [scrcpy releases](https://github.com/Genymobile/scrcpy/releases/tag/v3.3), place it at `~/.local/share/adbshare/scrcpy-server.jar` (or set `ADBSHARE_SCRCPY_SERVER`). |
+| Screen mirror says "ffmpeg not found" or fails to decode | Ensure `ffmpeg` is installed and reachable on system `$PATH`. |
+| Screen mirror crashes on Android 17 preview | `scrcpy-server 3.3` relies on `IDisplayWindowListener` which upstream Android 17 changed; wait for an upstream scrcpy release supporting API 37+. |
 | GUI cannot reach the daemon | Start `adb-daemon` in a terminal in the same desktop session and inspect its output. |
 
 To isolate FUSE problems, start the daemon without mounts (stop an already running instance first):
